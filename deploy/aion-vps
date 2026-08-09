@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+"""Local operator CLI for the fixed AION VPS."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any, Iterable
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+VPS_HOST = "vps.example.invalid"
+VPS_USER = "root"
+VPS_KEY = Path("<ssh-key-path>")
+KNOWN_HOSTS = PROJECT_ROOT / "deploy" / "vps_known_hosts"
+SSH_TARGET = f"{VPS_USER}@{VPS_HOST}"
+APP_ROOT = Path("/opt/aion")
+RUN_ROOT = Path("/var/lib/aion/runs")
+VPN_CONFIG = Path("/etc/aion/vpn/benchmark.ovpn")
+LOCAL_LOG_ROOT = PROJECT_ROOT / ".aion" / "remote-logs"
+SOURCE_NAMES = (
+    "agent",
+    "tools",
+    "challenges_sdk",
+    "third_party",
+    "scripts",
+    "deploy",
+    "pyproject.toml",
+    "requirements.lock",
+)
+EXCLUDED_NAMES = {"__pycache__", ".DS_Store"}
+RELEASE_PATTERN = re.compile(r"^[0-9]{14}-[a-f0-9]{12}$")
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+class OperatorError(RuntimeError):
+    pass
+
+
+def _ssh_base() -> list[str]:
+    return [
+        "ssh",
+        "-i",
+        str(VPS_KEY),
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"UserKnownHostsFile={KNOWN_HOSTS}",
+    ]
+
+
+def _rsync_shell() -> str:
+    return shlex.join(_ssh_base())
+
+
+def _run(
+    command: list[str],
+    *,
+    check: bool = True,
+    capture_output: bool = False,
+    input_data: bytes | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        command,
+        check=check,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        input=input_data,
+        cwd=cwd,
+    )
+
+
+def _ssh(
+    remote_command: Iterable[str],
+    *,
+    check: bool = True,
+    capture_output: bool = False,
+    input_data: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    command = [*_ssh_base(), SSH_TARGET, shlex.join(list(remote_command))]
+    return _run(
+        command,
+        check=check,
+        capture_output=capture_output,
+        input_data=input_data,
+    )
+
+
+def _decode(completed: subprocess.CompletedProcess[bytes]) -> str:
+    return (completed.stdout or b"").decode("utf-8", errors="replace")
+
+
+def _validate_local_access() -> None:
+    if os.geteuid() == 0:
+        raise OperatorError("run aion-vps as the local workspace user, not root")
+    if not VPS_KEY.is_file() or not os.access(VPS_KEY, os.R_OK):
+        raise OperatorError(f"SSH key is not readable: {VPS_KEY}")
+    if not KNOWN_HOSTS.is_file() or not os.access(KNOWN_HOSTS, os.R_OK):
+        raise OperatorError(f"pinned known-hosts file is not readable: {KNOWN_HOSTS}")
+
+
+def _iter_source_files() -> list[Path]:
+    files: list[Path] = []
+    for name in SOURCE_NAMES:
+        source = PROJECT_ROOT / name
+        if not source.exists():
+            raise OperatorError(f"required deployment source is missing: {name}")
+        if source.is_file():
+            files.append(source)
+            continue
+        for item in source.rglob("*"):
+            relative_parts = item.relative_to(PROJECT_ROOT).parts
+            if any(part in EXCLUDED_NAMES for part in relative_parts):
+                continue
+            if item.is_file() and item.suffix != ".pyc":
+                files.append(item)
+    return sorted(files, key=lambda item: item.relative_to(PROJECT_ROOT).as_posix())
+
+
+def _source_digest() -> str:
+    digest = hashlib.sha256()
+    for path in _iter_source_files():
+        relative = path.relative_to(PROJECT_ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _release_id(source_digest: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"{timestamp}-{source_digest[:12]}"
+
+
+def _requirements_digest() -> str:
+    return hashlib.sha256((PROJECT_ROOT / "requirements.lock").read_bytes()).hexdigest()
+
+
+def _local_verify() -> None:
+    python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not python.is_file():
+        raise OperatorError("local .venv Python was not found")
+    print("[local] running full pytest", flush=True)
+    _run([str(python), "-m", "pytest", "-q"], cwd=PROJECT_ROOT)
+    print("[local] compiling deployment entry points", flush=True)
+    _run(
+        [
+            str(python),
+            "-m",
+            "py_compile",
+            str(PROJECT_ROOT / "deploy" / "aion-vps"),
+            str(PROJECT_ROOT / "deploy" / "aionctl"),
+            str(PROJECT_ROOT / "deploy" / "release_manager.py"),
+            str(PROJECT_ROOT / "scripts" / "online_runtime.py"),
+            str(PROJECT_ROOT / "scripts" / "export_run_bundle.py"),
+        ],
+        cwd=PROJECT_ROOT,
+    )
+
+
+REMOTE_STATE_SCRIPT = r"""
+import json, os, pathlib, socket, sqlite3, subprocess
+root = pathlib.Path('/var/lib/aion/runs')
+marker = pathlib.Path('/var/lib/aion/current-run-id')
+run_id = marker.read_text().strip() if marker.is_file() else ''
+def record(candidate):
+    database = root / candidate / 'state.sqlite3'
+    if not database.is_file(): return None
+    try:
+        connection = sqlite3.connect(f'file:{database}?mode=ro', uri=True)
+        row = connection.execute('SELECT run_id,status,started_at,last_sequence FROM runs WHERE run_id=?',(candidate,)).fetchone()
+        challenges = [item[0] for item in connection.execute("SELECT unique_code FROM challenges WHERE container_status='running'").fetchall()]
+        connection.close()
+        value = dict(zip(('run_id','status','started_at','last_sequence'), row)) if row else None
+        if value is not None: value['running_challenges'] = challenges
+        return value
+    except sqlite3.Error: return None
+current = record(run_id) if run_id else None
+if current is None:
+    values = [value for value in (record(path.parent.name) for path in root.glob('*/state.sqlite3')) if value]
+    current = max(values, key=lambda value: str(value['started_at'])) if values else None
+active = subprocess.run(['systemctl','is-active','--quiet','aion-online.service']).returncode == 0
+show = subprocess.run(['systemctl','show','aion-online.service','--property=ActiveState,SubState,MainPID','--no-pager'],capture_output=True,text=True).stdout
+service = dict(line.split('=',1) for line in show.splitlines() if '=' in line)
+link = pathlib.Path('/opt/aion/current')
+release = pathlib.Path(os.readlink(link)).name if link.is_symlink() else None
+try:
+    connection = socket.create_connection(('127.0.0.1',8765),timeout=.5); connection.close(); monitor = True
+except OSError: monitor = False
+vpn = subprocess.run(['pgrep','-a','openvpn'],capture_output=True,text=True).stdout.splitlines()
+route = subprocess.run(['ip','-4','route','show','default'],capture_output=True,text=True).stdout.strip()
+runs = sorted(path.parent.name for path in root.glob('*/state.sqlite3'))
+print(json.dumps({'active':active,'service':service,'run':current,'release':release,'monitor':monitor,'vpn':vpn,'default_route':route,'runs':runs,'running_challenges':(current or {}).get('running_challenges',[])},sort_keys=True))
+"""
+
+
+def _remote_state() -> dict[str, Any]:
+    result = _ssh(
+        ["python3", "-"],
+        capture_output=True,
+        input_data=REMOTE_STATE_SCRIPT.encode("utf-8"),
+    )
+    try:
+        return json.loads(_decode(result))
+    except json.JSONDecodeError as exc:
+        raise OperatorError("remote state response was invalid") from exc
+
+
+def _remote_doctor() -> None:
+    script = (
+        "set -euo pipefail; "
+        "python3 -c 'import sys; raise SystemExit(sys.version_info[:2] != (3,11))'; "
+        "command -v openvpn >/dev/null; command -v bwrap >/dev/null; "
+        "command -v nginx >/dev/null; ! command -v nmap >/dev/null; "
+        "test -d /etc/aion; test -d /var/lib/aion/workspace; "
+        "test -d /var/lib/aion/runs; nginx -t >/dev/null"
+    )
+    _ssh(["bash", "-lc", script])
+
+
+def _stage_release(release_id: str, venv_id: str) -> None:
+    incoming = f"/opt/aion/releases/.incoming-{release_id}"
+    _ssh(["install", "-d", "-m", "0755", incoming])
+    command = [
+        "rsync",
+        "-a",
+        "--delete",
+        "--exclude",
+        "__pycache__/",
+        "--exclude",
+        "*.pyc",
+        "--exclude",
+        ".DS_Store",
+        "-e",
+        _rsync_shell(),
+        *[str(PROJECT_ROOT / name) for name in SOURCE_NAMES],
+        f"{SSH_TARGET}:{incoming}/",
+    ]
+    try:
+        dry_run = [*command[:2], "--dry-run", "--itemize-changes", *command[2:]]
+        preview = _run(dry_run, capture_output=True, cwd=PROJECT_ROOT)
+        print(_decode(preview), end="", flush=True)
+        _run(command, cwd=PROJECT_ROOT)
+        _ssh(["chown", "-R", "root:root", incoming])
+        manager = f"{incoming}/deploy/release_manager.py"
+        _ssh(
+            [
+                "python3",
+                manager,
+                "prepare",
+                "--release-id",
+                release_id,
+                "--incoming",
+                incoming,
+                "--venv-id",
+                venv_id,
+            ]
+        )
+    except Exception:
+        _ssh(["rm", "-rf", incoming], check=False)
+        raise
+
+
+def _validate_vpn(path: Path) -> None:
+    if path.suffix.lower() != ".ovpn" or not path.is_file():
+        raise OperatorError("--vpn must reference a readable .ovpn file")
+    if path.stat().st_size == 0 or path.stat().st_size > 1_000_000:
+        raise OperatorError("OpenVPN profile size is invalid")
+    forbidden = {
+        "up",
+        "down",
+        "route-up",
+        "route-pre-down",
+        "ipchange",
+        "learn-address",
+        "client-connect",
+        "client-disconnect",
+        "auth-user-pass-verify",
+        "tls-verify",
+        "plugin",
+        "script-security",
+        "daemon",
+        "writepid",
+        "log",
+        "log-append",
+    }
+    directives: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";", "<")):
+            continue
+        directives.add(line.split(maxsplit=1)[0].lstrip("-").lower())
+    blocked = sorted(directives & forbidden)
+    if blocked:
+        raise OperatorError(
+            "OpenVPN profile contains host-execution directives: " + ", ".join(blocked)
+        )
+    if "remote" not in directives or not ({"client", "pull"} & directives):
+        raise OperatorError("OpenVPN profile does not look like a client profile")
+    if "redirect-gateway" in directives:
+        raise OperatorError("OpenVPN profile may not replace the host default route")
+
+
+def _stage_vpn(path: Path, release_id: str) -> str:
+    _validate_vpn(path)
+    remote = f"/etc/aion/vpn/.incoming-{release_id}.ovpn"
+    _run(["scp", *_ssh_base()[1:], str(path), f"{SSH_TARGET}:{remote}"])
+    _ssh(["chown", "root:root", remote])
+    _ssh(["chmod", "0600", remote])
+    return remote
+
+
+def _switch_vpn(staged: str) -> None:
+    script = (
+        "import os,pathlib,shutil; "
+        f"source=pathlib.Path({staged!r}); target=pathlib.Path({str(VPN_CONFIG)!r}); "
+        "backup=target.with_name('benchmark.ovpn.previous'); "
+        "shutil.copy2(target,backup) if target.exists() else None; "
+        "os.chmod(source,0o600); os.replace(source,target); os.chmod(target,0o600)"
+    )
+    _ssh(["python3", "-c", script])
+
+
+def _restore_vpn() -> None:
+    script = (
+        "import os,pathlib; "
+        f"target=pathlib.Path({str(VPN_CONFIG)!r}); "
+        "backup=target.with_name('benchmark.ovpn.previous'); "
+        "os.replace(backup,target) if backup.exists() else None"
+    )
+    _ssh(["python3", "-c", script], check=False)
+
+
+def _start_remote(mode: str, token: str, run_id: str | None = None) -> str:
+    if mode == "fresh" and run_id is None:
+        run_id = f"online-{secrets.token_hex(6)}"
+    command = ["aionctl", "start" if mode == "fresh" else "resume"]
+    if mode == "fresh":
+        command.extend(["--fresh", "--benchmark-token-stdin"])
+        command.extend(["--run-id", str(run_id)])
+    else:
+        command.extend(["--run-id", run_id or "latest", "--benchmark-token-stdin"])
+    _ssh(command, input_data=token.encode("utf-8"))
+    return str(run_id or "latest")
+
+
+def _wait_healthy(
+    run_id: str,
+    default_route: str,
+    timeout: float = 90.0,
+    required_running_challenges: set[str] | None = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = _remote_state()
+        if not last.get("active"):
+            state = last.get("service", {}).get("ActiveState")
+            if state == "failed":
+                break
+        current = last.get("run") or {}
+        if (
+            last.get("active")
+            and current.get("run_id") == run_id
+            and last.get("monitor")
+            and last.get("vpn")
+            and (
+                required_running_challenges is None
+                or required_running_challenges.issubset(
+                    set(current.get("running_challenges", []))
+                )
+            )
+        ):
+            if last.get("default_route") != default_route:
+                raise OperatorError("VPN changed the host default route")
+            return last
+        time.sleep(1)
+    _ssh(["journalctl", "-u", "aion-online.service", "-n", "80", "--no-pager"], check=False)
+    raise OperatorError(f"AION did not become healthy for run {run_id}")
+
+
+def _package_hash() -> str:
+    result = _ssh(
+        [
+            "bash",
+            "-lc",
+            "rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n' | sort | sha256sum",
+        ],
+        capture_output=True,
+    )
+    value = _decode(result).split(maxsplit=1)[0]
+    if len(value) != 64:
+        raise OperatorError("remote package manifest hash was invalid")
+    return value
+
+
+def _verify_token_absent(token: str) -> None:
+    script = r"""
+import pathlib, subprocess, sys
+secret = sys.stdin.buffer.read()
+if not secret: raise SystemExit(2)
+targets = [pathlib.Path('/etc/aion/aion.env'), pathlib.Path('/etc/systemd/system/aion-online.service')]
+root = pathlib.Path('/opt/aion/current')
+targets.extend(path for path in root.rglob('*') if path.is_file() and path.stat().st_size <= 2_000_000)
+for target in targets:
+    try: data = target.read_bytes()
+    except OSError: continue
+    if secret in data: raise SystemExit(f'token found in {target}')
+for path in pathlib.Path('/proc').glob('[0-9]*/cmdline'):
+    try: data = path.read_bytes()
+    except OSError: continue
+    if secret in data: raise SystemExit(f'token found in {path}')
+journal = subprocess.run(['journalctl','-u','aion-online.service','--no-pager'],capture_output=True).stdout
+if secret in journal: raise SystemExit('token found in journal')
+"""
+    _ssh(["python3", "-c", script], input_data=token.encode("utf-8"))
+
+
+def _activate_release(release_id: str) -> None:
+    manager = f"/opt/aion/releases/{release_id}/deploy/release_manager.py"
+    _ssh(["python3", manager, "activate", "--release-id", release_id])
+
+
+def _commit_release(release_id: str) -> None:
+    manager = f"/opt/aion/releases/{release_id}/deploy/release_manager.py"
+    _ssh(["python3", manager, "commit"])
+
+
+def _rollback_pending(release_id: str) -> None:
+    manager = f"/opt/aion/releases/{release_id}/deploy/release_manager.py"
+    _ssh(["python3", manager, "rollback-pending"], check=False)
+
+
+def _deploy(token: str, vpn: Path | None) -> None:
+    _local_verify()
+    _remote_doctor()
+    before = _remote_state()
+    package_hash = _package_hash()
+    run = before.get("run") or {}
+    was_active = bool(before.get("active"))
+    run_id = run.get("run_id")
+    if was_active and not run_id:
+        raise OperatorError("active service has no discoverable persistent run")
+
+    source_digest = _source_digest()
+    release_id = _release_id(source_digest)
+    venv_id = _requirements_digest()
+    print(f"[deploy] staging release {release_id}", flush=True)
+    _stage_release(release_id, venv_id)
+    staged_vpn = _stage_vpn(vpn, release_id) if vpn else None
+    activated = False
+    try:
+        if was_active:
+            if before.get("release"):
+                _ssh(["aionctl", "pause"])
+            else:
+                print("[deploy] first structured release: graceful legacy stop", flush=True)
+                _ssh(["systemctl", "stop", "aion-online.service"])
+        if staged_vpn:
+            _switch_vpn(staged_vpn)
+        _activate_release(release_id)
+        activated = True
+        if was_active and run.get("status") != "completed":
+            _start_remote("resume", token, str(run_id))
+            after = _wait_healthy(
+                str(run_id),
+                str(before.get("default_route", "")),
+                required_running_challenges=set(before.get("running_challenges", [])),
+            )
+            if set(after.get("runs", [])) != set(before.get("runs", [])):
+                raise OperatorError("deployment unexpectedly changed the set of run directories")
+            if not set(before.get("running_challenges", [])).issubset(
+                set(after.get("running_challenges", []))
+            ):
+                raise OperatorError("one or more running challenge containers were lost")
+            _verify_token_absent(token)
+        _remote_doctor()
+        if _package_hash() != package_hash:
+            raise OperatorError("routine deployment changed the host package manifest")
+        _commit_release(release_id)
+    except Exception:
+        if _remote_state().get("active"):
+            _ssh(["aionctl", "pause"], check=False)
+        if activated:
+            _rollback_pending(release_id)
+        if staged_vpn:
+            _restore_vpn()
+        raise
+    finally:
+        if staged_vpn:
+            _ssh(["rm", "-f", staged_vpn], check=False)
+    print(f"[deploy] release {release_id} is active", flush=True)
+
+
+def _replace_vpn_for_start(vpn: Path | None) -> bool:
+    if vpn is None:
+        return False
+    identifier = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-vpn000000000"
+    staged = _stage_vpn(vpn, identifier)
+    _switch_vpn(staged)
+    return True
+
+
+def _start_command(mode: str, token: str, run_id: str | None, vpn: Path | None) -> None:
+    before = _remote_state()
+    if before.get("active"):
+        raise OperatorError("AION is already active")
+    changed_vpn = _replace_vpn_for_start(vpn)
+    try:
+        expected = _start_remote(mode, token, run_id)
+        if expected == "latest":
+            current = _remote_state().get("run") or {}
+            expected = str(current.get("run_id") or "")
+            if not expected:
+                raise OperatorError("resumed run id could not be determined")
+        _wait_healthy(expected, str(before.get("default_route", "")))
+    except Exception:
+        if changed_vpn:
+            _restore_vpn()
+        raise
+
+
+def _restart(token: str, vpn: Path | None) -> None:
+    before = _remote_state()
+    run = before.get("run") or {}
+    if not before.get("active") or not run.get("run_id"):
+        raise OperatorError("restart requires an active persistent run")
+    if run.get("status") == "completed":
+        raise OperatorError("completed runs cannot be restarted; use start for a new run")
+    _ssh(["aionctl", "pause"])
+    changed_vpn = _replace_vpn_for_start(vpn)
+    try:
+        _start_remote("resume", token, str(run["run_id"]))
+        _wait_healthy(str(run["run_id"]), str(before.get("default_route", "")))
+    except Exception:
+        if changed_vpn:
+            _restore_vpn()
+        raise
+
+
+def _logs_pull(run_id: str, include_workspace: bool) -> Path:
+    state = _remote_state()
+    resolved = (state.get("run") or {}).get("run_id") if run_id == "latest" else run_id
+    if not isinstance(resolved, str) or RUN_ID_PATTERN.fullmatch(resolved) is None:
+        raise OperatorError("a valid run id is required to pull logs")
+    destination_dir = LOCAL_LOG_ROOT / resolved
+    destination_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = destination_dir / f"{timestamp}.tar.gz"
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    command = ["aionctl", "bundle", "--run-id", resolved]
+    if include_workspace:
+        command.append("--include-workspace")
+    try:
+        with temporary.open("wb") as output:
+            completed = subprocess.run(
+                [*_ssh_base(), SSH_TARGET, shlex.join(command)],
+                stdout=output,
+                stderr=subprocess.PIPE,
+            )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise OperatorError(f"remote log export failed: {detail}")
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="aion-log-check-") as directory:
+        with tarfile.open(destination, "r:gz") as archive:
+            member = archive.getmember("state.sqlite3")
+            source = archive.extractfile(member)
+            if source is None:
+                raise OperatorError("log bundle does not contain a state snapshot")
+            snapshot = Path(directory) / "state.sqlite3"
+            snapshot.write_bytes(source.read())
+        with sqlite3.connect(snapshot) as connection:
+            result = connection.execute("PRAGMA integrity_check").fetchone()
+        if result != ("ok",):
+            raise OperatorError("downloaded SQLite snapshot failed integrity_check")
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    print(f"{destination}  sha256={digest}")
+    return destination
+
+
+def _release_state() -> dict[str, Any]:
+    current = _remote_state().get("release")
+    if not current or RELEASE_PATTERN.fullmatch(str(current)) is None:
+        raise OperatorError("versioned AION release is not installed")
+    manager = f"/opt/aion/releases/{current}/deploy/release_manager.py"
+    result = _ssh(["python3", manager, "current", "--json"], capture_output=True)
+    return json.loads(_decode(result))
+
+
+def _rollback_release(token: str) -> None:
+    releases = _release_state()
+    history = releases.get("history") or []
+    current = releases.get("current")
+    candidates = [item for item in history if item != current]
+    if not candidates:
+        raise OperatorError("no previous successful release is available")
+    target = candidates[-1]
+    before = _remote_state()
+    run = before.get("run") or {}
+    was_active = bool(before.get("active"))
+    if was_active:
+        _ssh(["aionctl", "pause"])
+    _activate_release(target)
+    try:
+        if was_active:
+            _start_remote("resume", token, str(run.get("run_id")))
+            _wait_healthy(str(run.get("run_id")), str(before.get("default_route", "")))
+        _commit_release(target)
+    except Exception:
+        if _remote_state().get("active"):
+            _ssh(["aionctl", "pause"], check=False)
+        _rollback_pending(target)
+        raise
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    deploy = subparsers.add_parser("deploy")
+    deploy.add_argument("--benchmark-token", required=True)
+    deploy.add_argument("--vpn", type=Path)
+
+    start = subparsers.add_parser("start")
+    start.add_argument("--benchmark-token", required=True)
+    start.add_argument("--vpn", type=Path)
+
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("--benchmark-token", required=True)
+    resume.add_argument("--run-id", default="latest")
+    resume.add_argument("--vpn", type=Path)
+
+    restart = subparsers.add_parser("restart")
+    restart.add_argument("--benchmark-token", required=True)
+    restart.add_argument("--vpn", type=Path)
+
+    subparsers.add_parser("status")
+    subparsers.add_parser("stop")
+
+    logs = subparsers.add_parser("logs")
+    logs_subparsers = logs.add_subparsers(dest="logs_command", required=True)
+    tail = logs_subparsers.add_parser("tail")
+    tail.add_argument("--follow", action="store_true")
+    pull = logs_subparsers.add_parser("pull")
+    pull.add_argument("--run-id", default="latest")
+    pull.add_argument("--include-workspace", action="store_true")
+
+    rollback = subparsers.add_parser("rollback")
+    rollback.add_argument("--benchmark-token", required=True)
+    subparsers.add_parser("doctor")
+    return parser
+
+
+def _validate_token(value: str) -> str:
+    if not value or "\n" in value or "\r" in value:
+        raise OperatorError("--benchmark-token must contain one non-empty line")
+    return value
+
+
+def main() -> None:
+    try:
+        _validate_local_access()
+        args = _build_parser().parse_args()
+        if args.command == "deploy":
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _deploy(token, args.vpn)
+            token = ""
+        elif args.command == "start":
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _start_command("fresh", token, None, args.vpn)
+            token = ""
+        elif args.command == "resume":
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _start_command("resume", token, args.run_id, args.vpn)
+            token = ""
+        elif args.command == "restart":
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _restart(token, args.vpn)
+            token = ""
+        elif args.command == "status":
+            _ssh(["aionctl", "status"])
+        elif args.command == "stop":
+            _ssh(["aionctl", "stop"])
+        elif args.command == "logs" and args.logs_command == "tail":
+            command = ["aionctl", "logs"]
+            if args.follow:
+                command.append("--follow")
+            _ssh(command)
+        elif args.command == "logs" and args.logs_command == "pull":
+            _logs_pull(args.run_id, args.include_workspace)
+        elif args.command == "rollback":
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _rollback_release(token)
+            token = ""
+        elif args.command == "doctor":
+            _remote_doctor()
+            if _remote_state().get("release"):
+                _ssh(["aionctl", "doctor"])
+            print("AION VPS doctor checks passed")
+    except (OperatorError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"aion-vps: {exc}") from None
+
+
+if __name__ == "__main__":
+    main()

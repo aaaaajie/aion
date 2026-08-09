@@ -1,0 +1,26 @@
+.env
+.venv/
+config/vpn/*.ovpn
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.system-tools/
+.aion/
+.playwright-cli/
+.DS_Store
+
+# Local credentials, cookies, and session-forging material
+**/cookies.txt
+**/creds.txt
+*_ck.txt
+**/ck*.txt
+**/passwd*.txt
+jar_*.txt
+**/*_jar_*.txt
+work/a03_forge/keys*.txt
+
+# Raw authentication-probe captures
+evidence/admin2/creds_*.headers
+evidence/admin2/creds_*.html
+evidence/admin_login/cred_admin_password.html
+work/admin_login_evidence/cred_*.headers
