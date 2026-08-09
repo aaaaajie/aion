@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Root-only control plane for the AION systemd service."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+SERVICE_NAME = "aion-online.service"
+APP_ROOT = Path("/opt/aion")
+RUN_ROOT = Path("/var/lib/aion/runs")
+CURRENT_RUN_FILE = Path("/var/lib/aion/current-run-id")
+RUNTIME_DIRECTORY = Path("/run/aion")
+TOKEN_FILE = RUNTIME_DIRECTORY / "benchmark-token"
+LAUNCH_FILE = RUNTIME_DIRECTORY / "launch.json"
+MONITOR_URL = "https://43.138.171.224:8443/"
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+class ControlError(RuntimeError):
+    pass
+
+
+def _run(
+    command: list[str],
+    *,
+    check: bool = True,
+    capture_output: bool = False,
+    text: bool = True,
+) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run(
+        command,
+        check=check,
+        capture_output=capture_output,
+        text=text,
+    )
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        raise ControlError("aionctl must run as root")
+
+
+def _is_active() -> bool:
+    return (
+        _run(
+            ["systemctl", "is-active", "--quiet", SERVICE_NAME],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def _read_token_stdin() -> str:
+    value = sys.stdin.read(65537)
+    if value.endswith("\n"):
+        value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+    if not value or len(value) > 65536 or "\n" in value or "\r" in value:
+        raise ControlError("BENCHMARK_TOKEN stdin must contain one non-empty line")
+    return value
+
+
+def _atomic_write(path: Path, value: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_text(value, encoding="utf-8")
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _run_record(run_id: str) -> dict[str, Any]:
+    if RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ControlError("run_id contains unsupported characters")
+    database = RUN_ROOT / run_id / "state.sqlite3"
+    if not database.is_file():
+        raise ControlError(f"run database was not found: {run_id}")
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT run_id, status, started_at, deadline_at, last_sequence "
+                "FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ControlError(f"run database could not be read: {run_id}") from exc
+    if row is None:
+        raise ControlError(f"run state was not found: {run_id}")
+    return {
+        "run_id": row[0],
+        "status": row[1],
+        "started_at": row[2],
+        "deadline_at": row[3],
+        "last_sequence": row[4],
+    }
+
+
+def _latest_run() -> str:
+    try:
+        marked = CURRENT_RUN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        marked = ""
+    if RUN_ID_PATTERN.fullmatch(marked) and (RUN_ROOT / marked / "state.sqlite3").is_file():
+        return marked
+
+    candidates: list[tuple[str, str]] = []
+    if RUN_ROOT.is_dir():
+        for database in RUN_ROOT.glob("*/state.sqlite3"):
+            run_id = database.parent.name
+            if RUN_ID_PATTERN.fullmatch(run_id) is None:
+                continue
+            try:
+                record = _run_record(run_id)
+            except ControlError:
+                continue
+            candidates.append((str(record["started_at"]), run_id))
+    if not candidates:
+        raise ControlError("no persistent AION runs were found")
+    return max(candidates)[1]
+
+
+def _resolve_run_id(value: str) -> str:
+    return _latest_run() if value == "latest" else value
+
+
+def _start(mode: str, requested_run_id: str | None) -> None:
+    if _is_active():
+        raise ControlError("AION is already active")
+    if not (APP_ROOT / "current" / "scripts" / "online_runtime.py").is_file():
+        raise ControlError("current AION release is not installed")
+    if not (APP_ROOT / "current-venv" / "bin" / "python").is_file():
+        raise ControlError("current AION virtual environment is not installed")
+
+    if mode == "fresh":
+        run_id = requested_run_id or f"online-{secrets.token_hex(6)}"
+        if (RUN_ROOT / run_id / "state.sqlite3").exists():
+            raise ControlError(f"run_id already exists: {run_id}")
+    else:
+        run_id = _resolve_run_id(requested_run_id or "latest")
+        record = _run_record(run_id)
+        if record["status"] == "completed":
+            raise ControlError("completed runs cannot be resumed")
+
+    token = _read_token_stdin()
+    RUNTIME_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        _atomic_write(TOKEN_FILE, token)
+        token = ""
+        _atomic_write(
+            LAUNCH_FILE,
+            json.dumps({"mode": mode, "run_id": run_id}, separators=(",", ":")),
+        )
+        _run(["systemctl", "start", SERVICE_NAME])
+    finally:
+        token = ""
+        TOKEN_FILE.unlink(missing_ok=True)
+        LAUNCH_FILE.unlink(missing_ok=True)
+    print(f"AION {mode} start requested for {run_id}")
+    print(f"Monitor: {MONITOR_URL}")
+
+
+def _wait_until_inactive(timeout_seconds: float = 50.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        state = _run(
+            ["systemctl", "is-active", SERVICE_NAME],
+            check=False,
+            capture_output=True,
+        ).stdout.strip()
+        if state in {"inactive", "failed", "unknown"}:
+            return
+        time.sleep(0.25)
+    raise ControlError("AION did not stop before the timeout")
+
+
+def _pause() -> None:
+    if not _is_active():
+        raise ControlError("AION is not active")
+    _run(
+        [
+            "systemctl",
+            "kill",
+            "--kill-who=main",
+            "--signal=SIGUSR1",
+            SERVICE_NAME,
+        ]
+    )
+    _wait_until_inactive()
+    print("AION paused with persistent run state preserved")
+
+
+def _stop() -> None:
+    _run(["systemctl", "stop", SERVICE_NAME])
+    TOKEN_FILE.unlink(missing_ok=True)
+    LAUNCH_FILE.unlink(missing_ok=True)
+    print("AION stopped")
+
+
+def _release_id() -> str | None:
+    current = APP_ROOT / "current"
+    return Path(os.readlink(current)).name if current.is_symlink() else None
+
+
+def _monitor_reachable() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 8765), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _status(as_json: bool) -> None:
+    run_id: str | None
+    record: dict[str, Any] | None
+    try:
+        run_id = _latest_run()
+        record = _run_record(run_id)
+    except ControlError:
+        run_id = None
+        record = None
+    properties = _run(
+        [
+            "systemctl",
+            "show",
+            SERVICE_NAME,
+            "--no-pager",
+            "--property=ActiveState,SubState,MainPID,ExecMainStatus",
+        ],
+        check=False,
+        capture_output=True,
+    ).stdout
+    systemd = dict(
+        line.split("=", 1)
+        for line in properties.splitlines()
+        if "=" in line
+    )
+    data = {
+        "release_id": _release_id(),
+        "service": systemd,
+        "run": record,
+        "monitor_backend_reachable": _monitor_reachable(),
+        "vpn_processes": _run(
+            ["pgrep", "-a", "openvpn"], check=False, capture_output=True
+        ).stdout.splitlines(),
+    }
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return
+    print(f"release: {data['release_id'] or 'legacy-flat'}")
+    print(
+        "service: "
+        f"{systemd.get('ActiveState', 'unknown')}/{systemd.get('SubState', 'unknown')} "
+        f"pid={systemd.get('MainPID', '0')}"
+    )
+    if record:
+        print(
+            f"run: {record['run_id']} status={record['status']} "
+            f"sequence={record['last_sequence']}"
+        )
+    else:
+        print("run: none")
+    print(f"vpn_processes: {len(data['vpn_processes'])}")
+    print(f"monitor_backend: {'ready' if data['monitor_backend_reachable'] else 'down'}")
+    print(f"monitor: {MONITOR_URL}")
+
+
+def _logs(follow: bool, lines: int) -> None:
+    command = ["journalctl", "-u", SERVICE_NAME, "-n", str(lines), "--no-pager"]
+    if follow:
+        command.extend(["--follow"])
+    os.execvp(command[0], command)
+
+
+def _bundle(run_id_value: str, include_workspace: bool) -> None:
+    run_id = _resolve_run_id(run_id_value)
+    _run_record(run_id)
+    temporary = RUNTIME_DIRECTORY / f"bundle-{secrets.token_hex(8)}.tar.gz"
+    RUNTIME_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    command = [
+        str(APP_ROOT / "current-venv" / "bin" / "python"),
+        str(APP_ROOT / "current" / "scripts" / "export_run_bundle.py"),
+        "--run-root",
+        str(RUN_ROOT),
+        "--run-id",
+        run_id,
+        "--output",
+        str(temporary),
+    ]
+    if include_workspace:
+        command.append("--include-workspace")
+    try:
+        _run(command)
+        with temporary.open("rb") as source:
+            shutil.copyfileobj(source, sys.stdout.buffer)
+        sys.stdout.buffer.flush()
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _doctor(as_json: bool) -> None:
+    checks: dict[str, dict[str, Any]] = {}
+
+    def binary(name: str, command: list[str]) -> None:
+        path = shutil.which(name)
+        result = _run(command, check=False, capture_output=True) if path else None
+        checks[name] = {
+            "ok": bool(path and result and result.returncode == 0),
+            "path": path,
+            "version": (result.stdout.splitlines()[0] if result and result.stdout else ""),
+        }
+
+    binary("python3", ["python3", "--version"])
+    binary("openvpn", ["openvpn", "--version"])
+    binary("bwrap", ["bwrap", "--version"])
+    binary("nginx", ["nginx", "-t"])
+    checks["python3"]["ok"] = checks["python3"]["ok"] and checks["python3"][
+        "version"
+    ].startswith("Python 3.11.")
+    checks["nmap_absent"] = {"ok": shutil.which("nmap") is None}
+    for path in (
+        APP_ROOT,
+        Path("/etc/aion"),
+        Path("/var/lib/aion/workspace"),
+        RUN_ROOT,
+    ):
+        checks[str(path)] = {"ok": path.is_dir()}
+    checks["disk"] = {
+        "ok": shutil.disk_usage(APP_ROOT).free >= 1_000_000_000,
+        "free_bytes": shutil.disk_usage(APP_ROOT).free,
+    }
+    ok = all(bool(item["ok"]) for item in checks.values())
+    result = {"ok": ok, "checks": checks}
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        for name, item in checks.items():
+            detail = item.get("version") or item.get("path") or item.get("free_bytes", "")
+            print(f"{'ok' if item['ok'] else 'FAIL'} {name} {detail}".rstrip())
+    if not ok:
+        raise ControlError("one or more doctor checks failed")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    start = subparsers.add_parser("start")
+    start.add_argument("--fresh", action="store_true", required=True)
+    start.add_argument("--run-id")
+    start.add_argument("--benchmark-token-stdin", action="store_true", required=True)
+
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("--run-id", default="latest")
+    resume.add_argument("--benchmark-token-stdin", action="store_true", required=True)
+
+    subparsers.add_parser("pause")
+    subparsers.add_parser("stop")
+
+    status = subparsers.add_parser("status")
+    status.add_argument("--json", action="store_true")
+
+    logs = subparsers.add_parser("logs")
+    logs.add_argument("--follow", action="store_true")
+    logs.add_argument("--lines", type=int, default=200)
+
+    bundle = subparsers.add_parser("bundle")
+    bundle.add_argument("--run-id", default="latest")
+    bundle.add_argument("--include-workspace", action="store_true")
+
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--json", action="store_true")
+    return parser
+
+
+def main() -> None:
+    try:
+        _require_root()
+        args = _build_parser().parse_args()
+        if args.command == "start":
+            _start("fresh", args.run_id)
+        elif args.command == "resume":
+            _start("resume", args.run_id)
+        elif args.command == "pause":
+            _pause()
+        elif args.command == "stop":
+            _stop()
+        elif args.command == "status":
+            _status(args.json)
+        elif args.command == "logs":
+            if args.lines < 1:
+                raise ControlError("--lines must be positive")
+            _logs(args.follow, args.lines)
+        elif args.command == "bundle":
+            _bundle(args.run_id, args.include_workspace)
+        elif args.command == "doctor":
+            _doctor(args.json)
+    except (ControlError, OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(f"aionctl: {exc}") from None
+
+
+if __name__ == "__main__":
+    main()

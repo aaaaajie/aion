@@ -1,0 +1,149 @@
+name: 发布
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: '仅测试构建（不发布）'
+        type: boolean
+        default: false
+      draft:
+        description: '创建草稿发布'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  auto-tag:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取版本号
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^[[:space:]]*version = "\(.*\)"/\1/p' common/globals.go)
+          if [ -z "$VERSION" ]; then
+            echo "❌ 无法从 common/globals.go 读取版本号"
+            exit 1
+          fi
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "准备发布 ${TAG}"
+
+      - name: 创建发布标签
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/tmp/tag-ref 2>/dev/null; then
+            git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            TAG_COMMIT=$(git rev-list -n 1 "${TAG}")
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [ "$TAG_COMMIT" = "$HEAD_COMMIT" ]; then
+              echo "✅ ${TAG} 已指向当前提交，跳过创建"
+              exit 0
+            fi
+            echo "❌ ${TAG} 已存在，但不指向当前提交"
+            echo "tag:  ${TAG_COMMIT}"
+            echo "head: ${HEAD_COMMIT}"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+  release:
+    needs: [auto-tag]
+    if: ${{ always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.auto-tag.result == 'success')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析发布标签
+        id: release_tag
+        shell: bash
+        env:
+          AUTO_TAG: ${{ needs.auto-tag.outputs.tag }}
+          SNAPSHOT: ${{ inputs.snapshot }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            TAG="${AUTO_TAG}"
+            git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${SNAPSHOT}" = "true" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            echo "❌ 非 snapshot 手动发布必须从 tag 触发"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_TAG=${TAG}" >> "$GITHUB_ENV"
+
+      - name: 准备 Release Notes
+        if: ${{ !inputs.snapshot }}
+        run: |
+          TAG="${RELEASE_TAG}"
+          NOTES_FILE=".github/release-notes/${TAG}.md"
+
+          if [ -f "$NOTES_FILE" ]; then
+            echo "📝 找到版本 Release Notes: $NOTES_FILE"
+            cp "$NOTES_FILE" /tmp/release-notes.md
+          else
+            echo "⚠️ 未找到 $NOTES_FILE，使用自动生成的 changelog"
+            echo "" > /tmp/release-notes.md
+          fi
+
+          echo "RELEASE_NOTES_FILE=/tmp/release-notes.md" >> $GITHUB_ENV
+
+      - name: 构建和发布
+        uses: ./.github/actions/build-release
+        with:
+          mode: ${{ inputs.snapshot && 'snapshot' || 'release' }}
+          go-version: '1.25'
+          retention-days: '90'
+          release-args: ${{ inputs.draft && '--draft' || '' }}
+
+      - name: 更新 Release Notes
+        if: ${{ !inputs.snapshot && env.RELEASE_NOTES_FILE != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${RELEASE_TAG}"
+          NOTES_FILE="${RELEASE_NOTES_FILE}"
+
+          if [ -s "$NOTES_FILE" ]; then
+            echo "📝 更新 Release Notes..."
+            # 用版本特定的 notes 替换 goreleaser 生成的 body
+            gh release edit "$TAG" --notes-file "$NOTES_FILE"
+            echo "✅ Release Notes 已更新"
+          fi

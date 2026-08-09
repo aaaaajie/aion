@@ -1,0 +1,42 @@
+[Unit]
+Description=AION online Benchmark Runtime
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/aion/current/scripts/online_runtime.py
+ConditionPathExists=/etc/aion/aion.env
+ConditionPathExists=/etc/aion/vpn/benchmark.ovpn
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/opt/aion/current
+EnvironmentFile=/etc/aion/aion.env
+Environment=HOME=/var/lib/aion/home
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=aion
+RuntimeDirectoryMode=0700
+LoadCredential=benchmark_token:/run/aion/benchmark-token
+LoadCredential=launch_config:/run/aion/launch.json
+ExecStartPre=/usr/bin/test -x /usr/bin/bwrap
+ExecStartPre=/usr/bin/test -x /usr/sbin/openvpn
+ExecStartPre=/usr/bin/test -d /var/lib/aion/workspace
+ExecStartPre=/usr/bin/test -d /var/lib/aion/runs
+ExecStart=/opt/aion/current-venv/bin/python /opt/aion/current/scripts/online_runtime.py --benchmark-token-file %d/benchmark_token --launch-config-file %d/launch_config --vpn-config /etc/aion/vpn/benchmark.ovpn --workspace-root /var/lib/aion/workspace --run-root /var/lib/aion/runs --current-run-file /var/lib/aion/current-run-id --monitor-port 8765
+Restart=no
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=45s
+SuccessExitStatus=130 143
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/aion /run/aion
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aion-online
+
+[Install]
+WantedBy=multi-user.target

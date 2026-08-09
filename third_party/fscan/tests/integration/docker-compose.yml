@@ -1,0 +1,264 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass test123
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "test123", "ping"]
+      interval: 3s
+      retries: 10
+
+  redis-noauth:
+    image: redis:7-alpine
+    ports:
+      - "16380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 10
+
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: testdb
+    ports:
+      - "13307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot123"]
+      interval: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_DB: testdb
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 10
+
+  ftp:
+    image: fauria/vsftpd
+    environment:
+      FTP_USER: ftpuser
+      FTP_PASS: ftp123
+      PASV_MIN_PORT: 21100
+      PASV_MAX_PORT: 21110
+      PASV_ADDRESS: 127.0.0.1
+    ports:
+      - "10021:21"
+      - "21100-21110:21100-21110"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/21' || exit 1"]
+      interval: 5s
+      retries: 10
+
+  ssh:
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      PUID: 1000
+      PGID: 1000
+      USER_NAME: sshuser
+      USER_PASSWORD: ssh123
+      PASSWORD_ACCESS: "true"
+    ports:
+      - "10022:2222"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2222 || exit 1"]
+      interval: 3s
+      retries: 10
+
+  mongodb:
+    image: mongo:4.4
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: mongo123
+    ports:
+      - "17017:27017"
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')", "-u", "admin", "-p", "mongo123"]
+      interval: 5s
+      retries: 20
+
+  memcached:
+    image: memcached:1-alpine
+    ports:
+      - "11211:11211"
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc localhost 11211 | grep -q pid"]
+      interval: 3s
+      retries: 10
+
+  elasticsearch:
+    image: elasticsearch:7.17.24
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms256m -Xmx256m"
+    ports:
+      - "19200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      retries: 20
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "MssqlTest123!"
+      MSSQL_PID: Express
+    ports:
+      - "11433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'MssqlTest123!' -Q 'SELECT 1' || exit 1"]
+      interval: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: rabbit123
+    ports:
+      - "15672:15672"
+      - "15673:5672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      retries: 20
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "11883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -W 2 || exit 1"]
+      interval: 5s
+      retries: 10
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    environment:
+      LDAP_ORGANISATION: "Test"
+      LDAP_DOMAIN: "test.local"
+      LDAP_ADMIN_PASSWORD: "ldap123"
+    ports:
+      - "10389:389"
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost -b 'dc=test,dc=local' -D 'cn=admin,dc=test,dc=local' -w ldap123 || exit 1"]
+      interval: 5s
+      retries: 10
+
+  cassandra:
+    image: cassandra:4.1
+    environment:
+      CASSANDRA_AUTHENTICATOR: AllowAllAuthenticator
+    ports:
+      - "19042:9042"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE CLUSTER' || exit 1"]
+      interval: 10s
+      retries: 30
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: "neo4j/neo4jtest123"
+    ports:
+      - "17687:7687"
+      - "17474:7474"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.7.0
+    ports:
+      - "19092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      retries: 20
+
+  smtp:
+    image: mailhog/mailhog
+    ports:
+      - "11025:1025"
+      - "18025:8025"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8025/api/v2/messages || exit 1"]
+      interval: 5s
+      retries: 10
+
+  oracle:
+    image: gvenzl/oracle-xe:18-slim
+    environment:
+      ORACLE_PASSWORD: oracle123
+    ports:
+      - "11521:1521"
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 10s
+      retries: 30
+
+  activemq:
+    image: rmohr/activemq:5.15.9
+    ports:
+      - "11613:61613"
+      - "18161:8161"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://admin:admin@localhost:8161/api/jolokia || exit 1"]
+      interval: 5s
+      retries: 15
+
+  zookeeper:
+    image: zookeeper:3.9
+    ports:
+      - "12181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep -q imok"]
+      interval: 5s
+      retries: 10
+
+  rsync:
+    image: vimagick/rsyncd
+    ports:
+      - "10873:873"
+    volumes:
+      - ./rsyncd.conf:/etc/rsyncd.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 873 || exit 1"]
+      interval: 5s
+      retries: 10
+
+  vnc:
+    image: consol/debian-xfce-vnc:latest
+    environment:
+      VNC_PW: vnc123
+    ports:
+      - "15901:5901"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 5901 || exit 1"]
+      interval: 5s
+      retries: 15
+
+  snmp:
+    image: polinux/snmpd
+    ports:
+      - "10161:161/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "snmpget -v2c -c public localhost sysDescr.0 || exit 0"]
+      interval: 5s
+      retries: 10

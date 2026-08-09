@@ -1,0 +1,71 @@
+name: 🔌 新插件/协议支持
+description: 请求支持新的服务、协议或漏洞检测
+title: "[Plugin] "
+labels: ["plugin", "enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您的插件请求！fscan 持续扩展对各种服务和协议的支持。
+        提交前请先确认该服务尚未被支持（查看 README 的支持列表）。
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: 请求类型
+      options:
+        - 新服务/协议支持 (New Service)
+        - 新弱口令检测 (New Brute Force)
+        - 新漏洞 POC (New POC)
+        - 新指纹识别 (New Fingerprint)
+    validations:
+      required: true
+
+  - type: input
+    id: service
+    attributes:
+      label: 服务/协议名称
+      description: 例如 ClickHouse、etcd、Consul、Zookeeper
+    validations:
+      required: true
+
+  - type: input
+    id: port
+    attributes:
+      label: 默认端口
+      description: 例如 9000、2379、8500
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 服务描述与检测思路
+      description: 简要介绍服务用途、在内网中的常见程度，以及如何识别（Banner 特征、认证方式等）
+    validations:
+      required: true
+
+  - type: textarea
+    id: reference
+    attributes:
+      label: 参考资料（可选）
+      description: 官方文档链接、协议规范、其他工具实现、CVE 编号等
+
+  - type: dropdown
+    id: prevalence
+    attributes:
+      label: 内网常见程度
+      options:
+        - 非常常见（企业环境标配）
+        - 较为常见（经常遇到）
+        - 偶尔遇到
+        - 较少见但高价值
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: 贡献意愿
+      options:
+        - label: 我愿意尝试实现这个插件并提交 PR
+        - label: 我可以提供测试环境

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111315">
+  <title>AION Agent 工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2336aee8'/%3E%3Cpath d='M9 24 15 8h3l6 16h-4l-1.2-3.5h-5.2L12.5 24Zm5.7-6.8h3.1L16.3 12Z' fill='%23071014'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body data-mobile-pane="conversation">
+  <div class="app-shell">
+    <nav class="mobile-nav" aria-label="移动端面板切换">
+      <button type="button" data-mobile="agents">Agent <b id="mobile-agent-count">0</b></button>
+      <button type="button" data-mobile="conversation" class="active">对话</button>
+      <button type="button" data-mobile="details">详情</button>
+    </nav>
+
+    <main class="workbench">
+      <aside class="pane agent-pane" data-pane="agents" aria-label="Agent 列表">
+        <header class="sidebar-header">
+          <div>
+            <p class="eyebrow">AION / RUN AGENTS</p>
+            <h1>Agent 视图</h1>
+          </div>
+          <span class="sidebar-count" id="challenge-agent-count">0</span>
+        </header>
+
+        <label class="agent-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="agent-search" type="search" placeholder="搜索 Agent" autocomplete="off" aria-label="搜索 Agent">
+          <kbd>⌘F</kbd>
+        </label>
+
+        <div class="agent-section-label">
+          <span>挑战 AGENT</span>
+          <small>按活跃度排序</small>
+        </div>
+        <div class="agent-tree" id="agent-tree" role="tree" aria-label="挑战与执行 Agent"></div>
+        <div class="empty-state" id="agent-empty">等待挑战 Agent 创建…</div>
+
+        <div class="chief-dock">
+          <div class="agent-section-label"><span>全局视角</span></div>
+          <button class="chief-agent-button" id="chief-agent-button" type="button" aria-label="切换到首席 Agent 视角">
+            <span class="robot-slot chief-avatar" aria-hidden="true"></span>
+            <span class="chief-copy">
+              <strong>首席 Agent</strong>
+              <small id="chief-agent-meta">等待创建</small>
+            </span>
+          </button>
+        </div>
+      </aside>
+
+      <div
+        class="pane-resizer"
+        data-resize="left"
+        data-tooltip="拖动调整左侧 Agent 栏宽度"
+        role="separator"
+        aria-label="调整左侧 Agent 栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin="220"
+        aria-valuemax="420"
+        aria-valuenow="268"
+        tabindex="0"
+      ></div>
+
+      <section class="pane conversation-pane" data-pane="conversation" aria-label="Agent 对话">
+        <header class="conversation-header">
+          <div class="selected-agent">
+            <span class="robot-slot selected-avatar" id="selected-avatar" aria-hidden="true"></span>
+            <div class="selected-copy">
+              <p id="selected-role">未选择 Agent</p>
+              <h2 id="selected-name">选择左侧 Agent</h2>
+              <span id="selected-mission">选择后显示该 Agent 的任务、思考和工具活动</span>
+            </div>
+          </div>
+          <div class="conversation-actions">
+            <span class="agent-live-state" id="agent-live-state"><i></i><b id="agent-live-label">等待选择</b></span>
+          </div>
+        </header>
+
+        <div class="conversation-stream" id="conversation-stream" role="log" aria-live="polite" aria-label="Agent 对话记录"></div>
+        <button class="history-button hidden" id="history-button" type="button">加载更早记录</button>
+        <button class="new-messages-button hidden" id="new-messages-button" type="button">回到最新</button>
+        <div class="empty-state conversation-empty" id="conversation-empty">选择左侧 Agent 查看对话</div>
+      </section>
+
+      <div
+        class="pane-resizer"
+        data-resize="right"
+        data-tooltip="拖动调整右侧详情栏宽度"
+        role="separator"
+        aria-label="调整右侧详情栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin="290"
+        aria-valuemax="480"
+        aria-valuenow="366"
+        tabindex="0"
+      ></div>
+
+      <aside class="pane details-pane" data-pane="details" aria-label="Agent 详情">
+        <header class="details-header">
+          <div>
+            <p class="eyebrow">CONTEXT / STATE</p>
+            <h2 id="details-title">Agent 详情</h2>
+          </div>
+          <span class="status-pill" id="details-status">—</span>
+        </header>
+        <nav class="details-tabs" role="tablist" aria-label="Agent 详情分类">
+          <button type="button" class="active" data-detail-tab="overview" role="tab" aria-selected="true">概览</button>
+          <button type="button" data-detail-tab="prompt" role="tab" aria-selected="false">提示词</button>
+          <button type="button" data-detail-tab="memory" role="tab" aria-selected="false">记忆</button>
+          <button type="button" data-detail-tab="report" role="tab" aria-selected="false">报告</button>
+          <button type="button" data-detail-tab="runtime" role="tab" aria-selected="false">运行</button>
+        </nav>
+        <div class="details-content" id="details-content">
+          <div class="empty-state">选择 Agent 查看运行上下文</div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="statusbar" aria-label="Runtime 状态">
+      <span><i class="statusbar-branch">⌁</i><b id="run-id">RUN —</b></span>
+      <span><i id="run-status-dot"></i><b id="run-status">—</b></span>
+      <span>阶段 <b id="run-phase">—</b></span>
+      <span>事件 <b id="event-sequence">0</b></span>
+      <span class="statusbar-spacer"></span>
+      <span>CPU / MEM <b id="resource-readout">—</b></span>
+      <span id="monitor-status">—</span>
+      <span id="captured-at">—</span>
+    </footer>
+  </div>
+
+  <div class="tooltip-layer" id="tooltip-layer" role="tooltip" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

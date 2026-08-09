@@ -1,0 +1,112 @@
+name: 🎯 误报/漏报
+description: 报告扫描结果不准确的问题
+title: "[Accuracy] "
+labels: ["accuracy"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您帮助提高 fscan 的准确性！
+        **请提供对比验证结果**（如 nmap、手动连接等），仅描述"感觉不对"的报告无法处理。
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: 问题类型
+      options:
+        - 误报 (False Positive) - 报告了不存在的问题
+        - 漏报 (False Negative) - 未能检测到存在的问题
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: 涉及功能
+      options:
+        - 主机存活检测
+        - 端口状态判断
+        - 服务识别
+        - 弱口令检测
+        - POC/漏洞检测
+        - Web指纹识别
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: 使用的命令
+      description: 执行的 fscan 命令（请脱敏真实 IP/密码）
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: fscan-output
+    attributes:
+      label: fscan 输出结果
+      description: 粘贴相关的扫描输出（请脱敏敏感信息）
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际情况及验证方式
+      description: 描述目标的真实状态，以及你通过什么方式验证的（nmap、手动连接、其他工具等）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target-os
+    attributes:
+      label: 目标操作系统
+      options:
+        - Windows Server
+        - Windows Desktop
+        - Ubuntu/Debian
+        - CentOS/RHEL
+        - 其他 Linux
+        - 网络设备
+        - 容器/Docker
+        - 未知
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: 网络环境
+      options:
+        - 直连（同网段）
+        - 跨网段/路由
+        - 通过代理 (SOCKS5/HTTP)
+        - VPN
+    validations:
+      required: true
+
+  - type: dropdown
+    id: version
+    attributes:
+      label: fscan 版本
+      options:
+        - 2.2.0
+        - 2.2.0-rc
+        - 2.1.3
+        - 2.1.2
+        - 2.1.0
+        - 2.0.x
+        - 1.8.x
+        - 其他/自编译
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 改进建议（可选）
+      description: 如果您有改进判断逻辑的想法

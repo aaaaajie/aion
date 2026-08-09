@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "challenges-sdk"
+version = "0.1.0"
+description = "Async SDK for the TSec Benchmark Challenges API"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "aiosqlite>=0.20,<1",
+    "fastapi>=0.141,<1",
+    "greenlet>=3,<4",
+    "httpx>=0.28,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2,<3",
+    "psutil>=6,<8",
+    "sqlalchemy>=2,<3",
+]
+
+[project.optional-dependencies]
+app = [
+    "uvicorn>=0.35,<1",
+]
+test = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.23,<2",
+]
+
+[tool.setuptools.packages.find]
+include = ["challenges_sdk*", "tools*", "agent*"]
+
+[tool.setuptools.package-data]
+"agent.prompts" = ["*.txt"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+markers = [
+    "live: requires BENCHMARK credentials and a working VPN connection",
+]
