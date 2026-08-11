@@ -175,6 +175,8 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
             "avoid_repeating": [],
             "tasks": [
                 {
+                    "hypothesis_key": "local-file-roundtrip",
+                    "task_key": "local-file-roundtrip-1",
                     "kind": "verification",
                     "objective": "round-trip one local file and report it",
                     "priority": 80,

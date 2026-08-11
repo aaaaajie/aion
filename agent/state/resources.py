@@ -7,6 +7,7 @@ from typing import Any
 
 
 RELEASED_CONTAINER_STATUSES = frozenset({"stopped", "closed"})
+ACTIVE_CHALLENGE_WORK_STATUSES = frozenset({"active", "warning", "extended"})
 
 
 def container_slot_occupied(status: object) -> bool:
@@ -14,6 +15,24 @@ def container_slot_occupied(status: object) -> bool:
 
     normalized = str(status or "").strip()
     return normalized not in RELEASED_CONTAINER_STATUSES
+
+
+def challenge_work_active(challenge: Mapping[str, Any] | object) -> bool:
+    """Return whether one challenge is actively consuming exploration time."""
+
+    if isinstance(challenge, Mapping):
+        status = challenge.get("container_status")
+        work_status = challenge.get("work_status")
+        completed = challenge.get("is_completed")
+    else:
+        status = getattr(challenge, "container_status", None)
+        work_status = getattr(challenge, "work_status", None)
+        completed = getattr(challenge, "is_completed", False)
+    return (
+        container_slot_occupied(status)
+        and str(work_status or "") in ACTIVE_CHALLENGE_WORK_STATUSES
+        and not bool(completed)
+    )
 
 
 def checkpoint_target_status(challenge: Mapping[str, Any]) -> str:

@@ -21,6 +21,7 @@ from .models import (
     FindingRecord,
     ResourceWorkRecord,
 )
+from .resources import challenge_work_active
 from .service import StateService, derive_phase
 
 
@@ -434,12 +435,42 @@ class StagnationManager:
                 challenge = await self.service._require_challenge(session, run_id, unique_code)
                 now = aware(self.clock())
                 if (
-                    challenge.container_status not in {"running", "starting"}
+                    not challenge_work_active(challenge)
                     or challenge.last_progress_at is None
                     or challenge.is_completed
                     or challenge.work_status in {"closed", "paused"}
                 ):
                     return {"unique_code": unique_code, "level": challenge.stagnation_level, "status": challenge.work_status, "elapsed_seconds": 0, "action": "none"}
+                if (
+                    challenge.control_state == "waiting_external_change"
+                    and challenge.control_since is not None
+                ):
+                    waiting_seconds = (
+                        now - aware(challenge.control_since)
+                    ).total_seconds()
+                    if waiting_seconds < 300:
+                        return {
+                            "unique_code": unique_code,
+                            "level": challenge.stagnation_level,
+                            "status": challenge.work_status,
+                            "elapsed_seconds": 0,
+                            "action": "waiting_external",
+                            "control_state": challenge.control_state,
+                        }
+                    challenge.control_state = "ok"
+                    challenge.control_since = None
+                    challenge.active_since = now
+                    challenge.version += 1
+                    await self.service._event(
+                        session,
+                        run_id,
+                        "challenge_control_state_changed",
+                        {
+                            "unique_code": unique_code,
+                            "control_state": "ok",
+                            "reason": "waiting_external_timeout",
+                        },
+                    )
                 elapsed = active_seconds(
                     now=now,
                     active_since=challenge.active_since,
@@ -452,6 +483,8 @@ class StagnationManager:
                     challenge.stagnation_level = 2
                     challenge.work_status = "paused"
                     challenge.hint_eligible = False
+                    challenge.control_state = "degraded"
+                    challenge.control_since = now
                     challenge.version += 1
                     event_sequence = await self.service._event(
                         session,
@@ -501,6 +534,8 @@ class StagnationManager:
                 if target_level <= challenge.stagnation_level:
                     return {"unique_code": unique_code, "level": challenge.stagnation_level, "status": challenge.work_status, "elapsed_seconds": elapsed, "action": "none"}
                 challenge.stagnation_level = target_level
+                challenge.control_state = "degraded"
+                challenge.control_since = now
                 challenge.version += 1
                 challenge.work_status = "warning"
                 challenge.hint_eligible = True

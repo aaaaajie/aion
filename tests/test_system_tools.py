@@ -448,10 +448,19 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
     )
 
     assert backend.available is True
-    command = backend.command("printf linux-ok", tmp_path)
+    persistent_tmp = tmp_path / "agent-private-tmp"
+    persistent_tmp.mkdir()
+    command = backend.command("printf linux-ok", tmp_path, persistent_tmp)
     assert command[:2] == [str(executable), "--die-with-parent"]
     assert "--ro-bind" in command
     assert "--bind" in command
+    assert ["--tmpfs", "/tmp"] not in [command[index : index + 2] for index in range(len(command) - 1)]
+    tmp_bind = command.index(str(persistent_tmp))
+    assert command[tmp_bind - 1 : tmp_bind + 2] == [
+        "--bind",
+        str(persistent_tmp),
+        "/tmp",
+    ]
     chdir_index = command.index("--chdir")
     assert command[chdir_index : chdir_index + 2] == ["--chdir", str(tmp_path)]
     assert command[-4:] == ["--noprofile", "--norc", "-lc", "printf linux-ok"]

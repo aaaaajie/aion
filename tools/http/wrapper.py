@@ -50,7 +50,7 @@ class HttpTools:
     _TOOL_DEFINITIONS: ClassVar[list[dict[str, Any]]] = [
         _definition(
             "system_http_request",
-            "Use for one new HTTP request when the method, URL, parameters, body, and optional Session are already known. It always sends a fresh request. Capture the returned interaction_id/request_id; if the result is queued or running, poll with system_http_output instead of calling this tool again.",
+            "Use for one new HTTP request when the method, URL, parameters, body, and optional Session are already known. Reuse connection_context_id across calls when strict ordering or connection affinity matters; Runtime assigns increasing sequence_id and executes the context serially. It always sends a fresh request. Capture the returned interaction_id/request_id; if the result is queued or running, poll with system_http_output instead of calling this tool again.",
             HttpRequestArguments,
         ),
         _definition(
@@ -65,7 +65,7 @@ class HttpTools:
         ),
         _definition(
             "system_web_fingerprint",
-            "Use to identify the web technology stack on each discovered HTTP service before choosing a targeted/deep path profile. The passive phase reuses one homepage/Header/title/favicon response across TscanPlus, Yakit and EHole rules; the active phase probes known component paths. Results include stable rule_id, merged rule_sources and evidence. Keep interaction_id and poll with system_http_output; polling does not resend traffic. Use system_http_probe instead for parameter, Header, Cookie or Body variants.",
+            "Use to identify the web technology stack on each discovered HTTP service before choosing a targeted/deep path profile. The passive phase reuses one homepage/Header/title/favicon response across TscanPlus, Yakit and EHole rules; the active phase probes known component paths. Results include stable rule_id, merged rule_sources, evidence and deterministic confidence. minimum_confidence defaults to medium so generic login-page keyword matches stay hidden; use low only for diagnostics. Keep interaction_id and poll with system_http_output; polling does not resend traffic.",
             FingerprintArguments,
         ),
         _definition(

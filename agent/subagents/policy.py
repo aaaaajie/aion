@@ -15,6 +15,7 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
             "chief_get_schedule",
             "chief_create_challenge_agent",
             "chief_get_challenge_reports",
+            "chief_wait_for_state",
             "chief_request_hint",
             "chief_extend_stagnation",
         }
@@ -28,6 +29,7 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
             "challenge_create_execution_agent",
             "challenge_get_execution_reports",
             "challenge_get_updates",
+            "challenge_wait_for_state",
             "challenge_report_status",
             "challenge_submit_flag",
             "challenge_close_challenge",

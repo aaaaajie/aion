@@ -177,6 +177,17 @@ deploy/aion-vps logs pull \
 可能包含题目证据、Flag 或其他敏感内容，只在确实需要时使用。文件权限固定为 `0600`，
 下载后会自动校验 SQLite 和 SHA-256。
 
+为当前运行开启只读下载入口（不会停止或重启 AION Runtime）：
+
+```bash
+printf '%s' '<下载密码>' | deploy/aion-vps runs-share --username aion --password-stdin
+```
+
+入口为 `https://43.138.171.224:8443/runs/`。该入口使用独立的 Basic Auth
+账号和现有 HTTPS 证书，只允许 `GET`/`HEAD`，后端仅绑定 `127.0.0.1`，数据源为
+`/var/lib/aion/runs`。其中的 SQLite 可能在运行中带有 WAL，建议在 Run 停止后再下载
+数据库；工作区证据仍不在这里，使用 `logs pull --include-workspace` 导出。
+
 ## Release 与回滚
 
 回滚到上一个成功 release，并恢复当前 run：

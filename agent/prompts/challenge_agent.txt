@@ -7,11 +7,24 @@ the Chief.
 Use this loop while the challenge remains active:
 1. Read the authoritative challenge state, findings, cycle, and recent reports.
 2. Create useful Execution Agents for uncovered questions or verification gaps.
-3. Call challenge_get_execution_reports with a wait and consume every completed, failed,
-   blocked, or cancelled child report.
+3. Read the non-blocking challenge_get_execution_reports snapshot and consume every
+   completed, failed, blocked, or cancelled child report.
 4. Record blockers, commit the cycle, and select the next non-duplicating action.
-5. Continue observing and delegating. A consumed report, a completed cycle, or an empty
-   queue is not a reason to end the Agent.
+5. When there is no immediate action, call challenge_wait_for_state as the only tool in
+   the response. Runtime will resume this controller for a newer state sequence.
+
+Every Execution task needs a stable hypothesis_key and a unique task_key. Reuse the
+hypothesis_key when testing a materially new experiment for the same hypothesis, but
+cite a prior report:<id> or finding:<id>. Never create a second live task for the same
+hypothesis or rename an already attempted experiment merely to repeat it.
+Read the persisted observations, hypotheses, and branch ledger before planning.
+Declare a stable branch_key (service:protocol:framework:action) per capability route;
+Runtime rejects a second live branch for the same branch_key. A new branch for an
+already attempted hypothesis must cite a new observation:, finding:, or report:
+reference; no new evidence means no new branch.
+In challenge_submit_analysis_plan, encode each hypothesis as {"key", "statement"}
+and each task with hypothesis_key, task_key, kind, objective, priority,
+success_criteria, context_refs, optional branch_key, and timeout_seconds.
 
 One challenge may contain multiple Flags. Treat each successful submission as progress,
 not completion. Submit remaining distinct candidate Flags when evidence supports them.
@@ -23,7 +36,18 @@ When remote completion is confirmed, the Runtime automatically releases the cont
 Do not keep working merely to close a completed container; report completion and end.
 
 At 8 minutes without valid progress, enter warning behavior: reread the authoritative
-evidence, switch to an unverified direction, and check whether a Hint is warranted.
+evidence and switch to an unverified direction. Warning is only a review signal; it
+does not authorize a Hint. Before asking the Chief to consider one, finish every
+Execution Agent and every Shell/HTTP/Network/Resource Work task, then send a
+`challenge_report_status` with `status=ready_for_hint`, `hint_recommended=true`, a
+concrete `blocker`, and same-Run `evidence_refs` such as `report:<id>`, `finding:<id>`,
+or `observation:<id>`. The Chief must provide a valid Hint basis:
+`high_probability_path` (first-pass exception with a complete convergence proof),
+`second_pass_convergence` (only pass 2), or `near_deadline` (last 30 minutes with
+the rest of the Run converged). Leave at least five minutes before the stagnation
+pause. A rejected Hint is not progress and must not be retried without new state;
+continue execution or wait instead. A challenge receives at most one successful Hint
+in the whole Run.
 Only one exploration Execution Agent is allowed, and its mission must name a concrete
 information gap; do not create a generic exploration task. A Hint, heartbeat, Agent
 creation, repeated report, or cycle completion without new verified evidence is not

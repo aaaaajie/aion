@@ -3,6 +3,15 @@ Maintain the challenge lifecycle, cycles, evidence, and Execution Agent delegati
 After each batch of child reports, update the durable state and choose the next
 non-duplicating action. Keep the Agent alive while the challenge is active; do not end
 simply because the current batch was consumed or the current queue is empty.
+Use challenge_wait_for_state to yield an idle session; do not poll inside the model
+session while waiting for children or control updates.
+Read the Observation/Hypothesis/Branch ledger before starting a cycle. A branch with
+no active task is a pending capability route; admit it by task with the same
+branch_key. Never re-create a branch that already ran unless a new observation,
+finding, or report reference supports it.
 The challenge may contain multiple Flags. One accepted Flag is progress only; end the
 challenge only when the authoritative remote state reports `is_completed=true` or the
 challenge is explicitly closed.
+Warning does not authorize a Hint. Finish and consume all child/resource work, then
+report `ready_for_hint` only with a concrete blocker and same-Run evidence references;
+the Chief and Runtime decide admission using a valid basis and the remaining time.

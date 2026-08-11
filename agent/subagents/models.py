@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 AgentRole = Literal["chief", "challenge", "execution"]
+HintBasis = Literal[
+    "high_probability_path",
+    "second_pass_convergence",
+    "near_deadline",
+]
 AgentStatus = Literal[
     "pending",
     "running",
@@ -39,11 +44,22 @@ class UniqueCodeArguments(_Arguments):
 
 
 class HintArguments(UniqueCodeArguments):
+    basis: HintBasis
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
     reason: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def non_blank_evidence_refs(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("evidence_refs must not be blank")
+        return values
 
 
 class CreateExecutionArguments(_Arguments):
     mission: str = Field(min_length=1, max_length=4_000)
+    hypothesis_key: str = Field(min_length=1, max_length=128)
+    task_key: str = Field(min_length=1, max_length=128)
     cycle_id: str | None = Field(default=None, min_length=1, max_length=128)
     kind: Literal["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"] = "general"
     priority: int = Field(default=50, ge=0, le=100)
@@ -59,15 +75,7 @@ class CreateExecutionArguments(_Arguments):
         return value
 
 
-class PollArguments(_Arguments):
-    wait_seconds: float = Field(default=0.0, ge=0.0, le=30.0)
-    max_reports: int = Field(default=20, ge=1, le=50)
-
-
-class ExecutionReportPollArguments(_Arguments):
-    """Long-poll execution reports unless the caller explicitly opts out."""
-
-    wait_seconds: float = Field(default=30.0, ge=0.0, le=30.0)
+class ReportQueryArguments(_Arguments):
     max_reports: int = Field(default=20, ge=1, le=50)
 
 
@@ -106,6 +114,22 @@ class ChallengeStatusArguments(_Arguments):
     hint_recommended: bool = False
     blocker: str | None = Field(default=None, max_length=1_000)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_hint_recommendation(self) -> "ChallengeStatusArguments":
+        if any(not value.strip() for value in self.evidence_refs):
+            raise ValueError("evidence_refs must not be blank")
+        if self.status == "ready_for_hint" and self.hint_recommended:
+            if not self.blocker or not self.blocker.strip():
+                raise ValueError(
+                    "blocker is required when hint_recommended is true"
+                )
+            if not self.evidence_refs:
+                raise ValueError(
+                    "evidence_refs are required when hint_recommended is true"
+                )
+        return self
 
 
 class StagnationExtensionArguments(_Arguments):
@@ -161,4 +185,20 @@ class AgentStatusReport(_Arguments):
     hint_recommended: bool = False
     blocker: str | None = Field(default=None, max_length=1_000)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
     sequence: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_hint_recommendation(self) -> "AgentStatusReport":
+        if any(not value.strip() for value in self.evidence_refs):
+            raise ValueError("evidence_refs must not be blank")
+        if self.status == "ready_for_hint" and self.hint_recommended:
+            if not self.blocker or not self.blocker.strip():
+                raise ValueError(
+                    "blocker is required when hint_recommended is true"
+                )
+            if not self.evidence_refs:
+                raise ValueError(
+                    "evidence_refs are required when hint_recommended is true"
+                )
+        return self

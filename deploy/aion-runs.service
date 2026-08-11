@@ -1,0 +1,25 @@
+[Unit]
+Description=AION read-only run data download service
+After=network.target nginx.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/opt/aion/runs-share
+ExecStart=/usr/bin/python3 /opt/aion/runs-share/runs_download_server.py --root /var/lib/aion/runs --bind 127.0.0.1 --port 8766
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/aion/runs
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
