@@ -25,6 +25,7 @@ TargetStatus = Literal[
 ]
 
 AgentRole = Literal["chief", "challenge", "execution"]
+RunStatus = Literal["active", "paused", "completed", "failed", "interrupted"]
 AgentLifecycleStatus = Literal[
     "pending",
     "running",
@@ -50,7 +51,7 @@ class RunManifest(_Model):
     role: AgentRole | None = None
     parent_id: str | None = None
     unique_code: str | None = None
-    status: Literal["active", "completed", "failed", "interrupted"] = "active"
+    status: RunStatus = "active"
     started_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -100,7 +101,7 @@ class AgentNode(_Model):
 class Checkpoint(_Model):
     schema_version: int = 1
     run_id: str = Field(min_length=1)
-    status: Literal["active", "completed", "failed", "interrupted"] = "active"
+    status: RunStatus = "active"
     phase: str = "initializing"
     targets: list[TargetState] = Field(default_factory=list)
     container_capacity: dict[str, Any] = Field(default_factory=dict)

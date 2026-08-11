@@ -50,6 +50,15 @@ class AgentSessionResult:
     final: str
     last_event_sequence: int
     structured_report_seen: bool
+    yield_reason: str
+
+
+@dataclass(frozen=True)
+class ToolDispatchOutcome:
+    """Internal tool result carrying Runner control outside model payloads."""
+
+    result: dict[str, Any]
+    yield_session: bool = False
 
 
 def default_chief_prompt() -> str:
@@ -83,7 +92,9 @@ class ToolRegistry:
     def has_tool(self, name: str) -> bool:
         return name in self._owners
 
-    async def dispatch(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    async def dispatch(
+        self, name: str, arguments: Mapping[str, Any]
+    ) -> dict[str, Any] | ToolDispatchOutcome:
         if self.allowed_tools is not None and name not in self.allowed_tools:
             return {
                 "ok": False,
@@ -195,6 +206,7 @@ class AgentRunner:
         last_summary_tokens = current_tokens if resume else 0
         tool_calls_since_summary = 0
         final_content = ""
+        yield_reason = "model_return"
 
         try:
             async with self._main_client() as client:
@@ -233,9 +245,15 @@ class AgentRunner:
                         final_content = str(message.get("content") or "")
                         break
 
+                    yield_session = False
                     for tool_call in tool_calls:
-                        result, tool_message = await self._execute_tool_call(store, tool_call)
+                        result, tool_message, requested_yield = await self._execute_tool_call(
+                            store,
+                            tool_call,
+                            allow_yield=len(tool_calls) == 1,
+                        )
                         messages.append(tool_message)
+                        yield_session = yield_session or requested_yield
                         tool_calls_since_summary += 1
                         current_tokens = message_token_count(messages)
                         if should_update_memory(
@@ -250,6 +268,10 @@ class AgentRunner:
                             )
                             last_summary_tokens = current_tokens
                             tool_calls_since_summary = 0
+
+                    if yield_session:
+                        yield_reason = "controller_wait"
+                        break
 
                     if should_autocompact(current_tokens, self.settings.context_budget):
                         await self._compact(
@@ -279,6 +301,7 @@ class AgentRunner:
                 {
                     "final": final,
                     "structured_report_seen": self._structured_report_seen,
+                    "yield_reason": yield_reason,
                 },
             )
             return AgentSessionResult(
@@ -286,6 +309,7 @@ class AgentRunner:
                 final=final,
                 last_event_sequence=store.checkpoint.last_event_sequence,
                 structured_report_seen=self._structured_report_seen,
+                yield_reason=yield_reason,
             )
         except Exception as exc:
             safe_message = self._safe_error_message(exc)
@@ -310,16 +334,18 @@ class AgentRunner:
         self,
         store: AgentStateStore,
         tool_call: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        *,
+        allow_yield: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
         function = tool_call.get("function")
         if not isinstance(function, Mapping):
             result = self._invalid_tool_result()
-            return result, self._tool_message(tool_call, result)
+            return result, self._tool_message(tool_call, result), False
         name = function.get("name")
         raw_arguments = function.get("arguments", "{}")
         if not isinstance(name, str):
             result = self._invalid_tool_result()
-            return result, self._tool_message(tool_call, result)
+            return result, self._tool_message(tool_call, result), False
         try:
             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
         except json.JSONDecodeError:
@@ -336,9 +362,26 @@ class AgentRunner:
                 "arguments": safe_arguments,
             },
         )
-        result = await self.registry.dispatch(name, arguments)
+        dispatched = await self.registry.dispatch(name, arguments)
+        requested_yield = isinstance(dispatched, ToolDispatchOutcome) and dispatched.yield_session
+        result = dispatched.result if isinstance(dispatched, ToolDispatchOutcome) else dispatched
+        if requested_yield and not allow_yield:
+            requested_yield = False
+            result = {
+                "ok": False,
+                "error": {
+                    "type": "validation",
+                    "code": "controller_wait_must_be_solo",
+                    "message": "Controller wait must be the only tool call in the response",
+                    "status_code": None,
+                    "detail": {},
+                },
+            }
         if name == "execution_report" and result.get("ok"):
-            self._structured_report_seen = True
+            data = result.get("data")
+            self._structured_report_seen = self._structured_report_seen or bool(
+                isinstance(data, Mapping) and data.get("terminal")
+            )
         safe_result = redact_tool_payload(name, result, secrets=self._secrets())
         await store.append_event(
             "tool_result",
@@ -350,7 +393,7 @@ class AgentRunner:
         )
         await self._apply_tool_state(store, name, result)
         await store.save_checkpoint()
-        return result, self._tool_message(tool_call, result)
+        return result, self._tool_message(tool_call, result), requested_yield
 
     async def _apply_tool_state(
         self,

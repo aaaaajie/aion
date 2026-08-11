@@ -7,7 +7,9 @@ from .service import StateService, derive_phase
 from .wakeup import StateSignalBus
 from .scheduling import ChallengeLoopController, ChallengeScheduler, ResourceController, StagnationManager
 from .resources import (
+    ACTIVE_CHALLENGE_WORK_STATUSES,
     RELEASED_CONTAINER_STATUSES,
+    challenge_work_active,
     checkpoint_target_status,
     container_capacity_summary,
     container_slot_occupied,
@@ -21,6 +23,7 @@ from .schemas import (
     ChallengeSyncResult,
     ExecutionTaskInput,
     FindingInput,
+    HypothesisInput,
     VerificationUpdateInput,
 )
 
@@ -37,6 +40,7 @@ __all__ = [
     "ChallengeSyncResult",
     "ExecutionTaskInput",
     "FindingInput",
+    "HypothesisInput",
     "StateDatabase",
     "StateService",
     "StateSignalBus",
@@ -45,7 +49,9 @@ __all__ = [
     "StagnationManager",
     "ChallengeScheduler",
     "ChallengeLoopController",
+    "ACTIVE_CHALLENGE_WORK_STATUSES",
     "RELEASED_CONTAINER_STATUSES",
+    "challenge_work_active",
     "checkpoint_target_status",
     "container_capacity_summary",
     "container_slot_occupied",

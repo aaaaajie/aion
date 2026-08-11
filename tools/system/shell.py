@@ -71,7 +71,12 @@ class SandboxBackend:
             and os.access(self.executable, os.X_OK)
         )
 
-    def command(self, shell_command: str, cwd: Path | None = None) -> list[str]:
+    def command(
+        self,
+        shell_command: str,
+        cwd: Path | None = None,
+        temp_dir: Path | None = None,
+    ) -> list[str]:
         if self.platform not in {"Darwin", "Linux"}:
             raise SystemToolError(
                 error_type="execution",
@@ -95,7 +100,7 @@ class SandboxBackend:
                 "-lc",
                 shell_command,
             ]
-        return self._linux_command(shell_command, cwd)
+        return self._linux_command(shell_command, cwd, temp_dir)
 
     def _macos_profile(self) -> str:
         root = json.dumps(str(self.root))
@@ -126,20 +131,27 @@ class SandboxBackend:
         )
         return "\n".join(lines)
 
-    def _linux_command(self, shell_command: str, cwd: Path | None) -> list[str]:
+    def _linux_command(
+        self,
+        shell_command: str,
+        cwd: Path | None,
+        temp_dir: Path | None,
+    ) -> list[str]:
         command = [
             self.executable,
             "--die-with-parent",
             "--new-session",
             "--tmpfs",
             "/",
-            "--tmpfs",
-            "/tmp",
             "--proc",
             "/proc",
             "--dev",
             "/dev",
         ]
+        if temp_dir is None:
+            command.extend(["--tmpfs", "/tmp"])
+        else:
+            command.extend(["--dir", "/tmp"])
         bind_paths: list[tuple[str, str]] = []
         for system_path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
             if Path(system_path).exists():
@@ -171,6 +183,8 @@ class SandboxBackend:
             command.extend(["--dir", str(parent)])
         for source, destination in bind_paths:
             command.extend(["--ro-bind", source, destination])
+        if temp_dir is not None:
+            command.extend(["--bind", str(temp_dir), "/tmp"])
         command.extend(["--bind", str(self.root), str(self.root)])
         if cwd is not None:
             command.extend(["--chdir", str(cwd)])
@@ -340,7 +354,7 @@ class ShellTaskManager:
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
-                *self.sandbox.command(command, working_directory),
+                *self.sandbox.command(command, working_directory, temp_dir),
                 cwd=str(working_directory),
                 env=self._safe_environment(home_dir, temp_dir, working_directory),
                 stdin=asyncio.subprocess.DEVNULL,

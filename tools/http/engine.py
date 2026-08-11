@@ -294,6 +294,8 @@ class HttpInteractionEngine:
             "request_intent": spec.request_intent,
             "parent_request_id": spec.parent_request_id,
             "request_group_id": request.request_group_id,
+            "connection_context_id": spec.connection_context_id,
+            "sequence_id": spec.sequence_id,
             "variables": request.variables,
             "outcome": outcome,
             "status_code": status_code,

@@ -42,11 +42,26 @@ HTTP lifecycle rules:
   repeat traffic and does not imply that asynchronous analysis has finished.
 - For a multi-step protocol, establish or update a session_id on the first request,
   reuse that Session on later calls, and set parent_request_id/request_group_id when
-  lineage matters. Session cookies are Agent-private. A parent must belong to this
-  Agent; do not invent or reuse another Agent's IDs.
+  lineage matters. When strict ordering or connection affinity matters, reuse one
+  connection_context_id across calls and let Runtime assign increasing sequence_id;
+  requests in the same context execute serially and survive waiting/resume. Session
+  cookies are Agent-private. A parent or context must belong to this Agent; do not
+  invent or reuse another Agent's IDs.
 - Read status, headers, sizes, hashes, groups, and summaries first. Retrieve full Body
   content only for targeted evidence. Treat failed/timeout/interrupted as outcomes to
   inspect, not as permission to replay a request.
 
 Use Shell curl loops only when the HTTP engine cannot represent the required protocol
 behavior. Stay within the assigned target addresses and do not invent additional targets.
+
+Concrete HTTP replacements:
+- one curl request maps to system_http_request;
+- a for + curl payload loop maps to a finite system_http_probe matrix;
+- head/wc/hash comparisons map to first-stage HTTP statistics and response groups;
+- cookie files and repeated authenticated calls map to one Agent-private Session.
+
+For non-HTTP Shell work expected to outlive the foreground wait, set
+run_in_background=true, retain task_id, and call system_task_output with wait_seconds.
+Use system_task_output(wait_seconds=...) for bounded long polling.
+Do not use nohup, '&', or sleep loops to create or monitor detached work. Use $TMPDIR for
+portable persistent temporary files; Linux also maps the same directory to /tmp.

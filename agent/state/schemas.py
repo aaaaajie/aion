@@ -38,6 +38,15 @@ ChallengeWorkStatus = Literal[
 CHALLENGE_WORK_STATUS_VALUES = frozenset(
     {"unassigned", "active", "warning", "extended", "paused", "completed", "closed"}
 )
+ChallengeControlState = Literal[
+    "ok",
+    "blocked",
+    "degraded",
+    "waiting_external_change",
+]
+CHALLENGE_CONTROL_STATE_VALUES = frozenset(
+    {"ok", "blocked", "degraded", "waiting_external_change"}
+)
 
 
 class StrictModel(BaseModel):
@@ -69,6 +78,14 @@ class CredentialInput(StrictModel):
 
 
 class ExecutionTaskInput(StrictModel):
+    task_key: str = Field(min_length=1, max_length=128)
+    hypothesis_key: str = Field(min_length=1, max_length=128)
+    branch_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Stable capability branch key; defaults to hypothesis:kind when omitted.",
+    )
     kind: ExecutionKind = "general"
     objective: str = Field(min_length=1, max_length=4_000)
     priority: int = Field(default=50, ge=0, le=100)
@@ -77,10 +94,17 @@ class ExecutionTaskInput(StrictModel):
     timeout_seconds: int = Field(default=1_800, ge=1, le=3_600)
 
 
+class HypothesisInput(StrictModel):
+    key: str = Field(min_length=1, max_length=128)
+    statement: str = Field(min_length=1, max_length=4_000)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    based_on_observations: list[str] = Field(default_factory=list, max_length=50)
+
+
 class AnalysisPlanInput(StrictModel):
     expected_version: int = Field(ge=1)
     analysis_summary: str = Field(min_length=1, max_length=8_000)
-    hypotheses: list[str] = Field(default_factory=list, max_length=50)
+    hypotheses: list[HypothesisInput] = Field(default_factory=list, max_length=50)
     information_gaps: list[str] = Field(default_factory=list, max_length=50)
     avoid_repeating: list[str] = Field(default_factory=list, max_length=50)
     tasks: list[ExecutionTaskInput] = Field(default_factory=list, max_length=50)

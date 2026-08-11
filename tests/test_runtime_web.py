@@ -49,6 +49,8 @@ async def test_flight_recorder_reads_graph_history_and_redacts_secrets(tmp_path:
         role="execution",
         parent_id=challenge["agent_id"],
         unique_code="fixture-1",
+        hypothesis_key="monitor-flight-recorder",
+        task_key="monitor-flight-recorder-1",
         initial_prompt="execution prompt",
     )
     await service.append_agent_event(

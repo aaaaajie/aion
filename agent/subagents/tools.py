@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 
 from pydantic import ValidationError
 
+from agent.runner import ToolDispatchOutcome
 from agent.state.errors import StateError
 
 from .models import (
@@ -22,9 +23,8 @@ from .models import (
     CreateExecutionArguments,
     EmptyArguments,
     ExecutionReport,
-    ExecutionReportPollArguments,
     HintArguments,
-    PollArguments,
+    ReportQueryArguments,
     SubmitFlagArguments,
     UniqueCodeArguments,
     ProgressArguments,
@@ -54,13 +54,7 @@ def _definition(
     }
 
 
-_POLL_PROPERTIES = {
-    "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30, "default": 0},
-    "max_reports": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-}
-
-_EXECUTION_REPORT_POLL_PROPERTIES = {
-    "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30, "default": 30},
+_REPORT_QUERY_PROPERTIES = {
     "max_reports": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
 }
 
@@ -89,7 +83,7 @@ class AgentControlTools:
         self,
         name: str,
         arguments: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolDispatchOutcome:
         if not isinstance(name, str) or not self.policy.allows(name):
             return self._error("unknown_tool", "This Agent role cannot use that tool")
         route = self._ROUTES.get(name)
@@ -141,11 +135,24 @@ class AgentControlTools:
     async def chief_create_challenge_agent(self, unique_code: str) -> dict[str, Any]:
         return await self.supervisor.create_challenge_agent(self.agent_id, unique_code)
 
-    async def chief_get_challenge_reports(self, wait_seconds: float = 0.0, max_reports: int = 20) -> dict[str, Any]:
-        return await self.supervisor.get_challenge_reports(self.agent_id, wait_seconds, max_reports)
+    async def chief_get_challenge_reports(self, max_reports: int = 20) -> dict[str, Any]:
+        return await self.supervisor.get_challenge_reports(self.agent_id, 0.0, max_reports)
 
-    async def chief_request_hint(self, unique_code: str, reason: str) -> dict[str, Any]:
-        return await self.supervisor.request_hint(self.agent_id, unique_code, reason)
+    async def chief_wait_for_state(self) -> ToolDispatchOutcome:
+        return ToolDispatchOutcome(
+            {"ok": True, "data": {"status": "waiting"}}, yield_session=True
+        )
+
+    async def chief_request_hint(
+        self,
+        unique_code: str,
+        basis: str,
+        evidence_refs: list[str],
+        reason: str,
+    ) -> dict[str, Any]:
+        return await self.supervisor.request_hint(
+            self.agent_id, unique_code, basis, evidence_refs, reason
+        )
 
     async def chief_extend_stagnation(
         self,
@@ -158,18 +165,19 @@ class AgentControlTools:
             self.agent_id, unique_code, reason, evidence_refs, note
         )
 
-    async def challenge_create_execution_agent(self, mission: str, cycle_id: str | None = None, kind: str = "general", priority: int = 50, success_criteria: list[str] | None = None, context_refs: list[str] | None = None, timeout_seconds: int = 1_800) -> dict[str, Any]:
-        if cycle_id is None and kind == "general" and priority == 50 and not success_criteria and not context_refs:
-            return await self.supervisor.create_execution_agent(self.agent_id, mission, timeout_seconds)
+    async def challenge_create_execution_agent(self, mission: str, hypothesis_key: str, task_key: str, cycle_id: str | None = None, kind: str = "general", priority: int = 50, success_criteria: list[str] | None = None, context_refs: list[str] | None = None, branch_key: str | None = None, timeout_seconds: int = 1_800) -> dict[str, Any]:
         return await self.supervisor.create_execution_agent(
             self.agent_id,
             mission,
             timeout_seconds,
+            hypothesis_key=hypothesis_key,
+            task_key=task_key,
             cycle_id=cycle_id,
             kind=kind,
             priority=priority,
             success_criteria=success_criteria or [],
             context_refs=context_refs or [],
+            branch_key=branch_key,
         )
 
     async def challenge_get_state(self) -> dict[str, Any]:
@@ -184,11 +192,16 @@ class AgentControlTools:
     async def challenge_commit_cycle(self, cycle_id: str, expected_version: int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self.supervisor.commit_cycle(self.agent_id, expected_version, {"cycle_id": cycle_id, **payload})
 
-    async def challenge_get_execution_reports(self, wait_seconds: float = 30.0, max_reports: int = 20) -> dict[str, Any]:
-        return await self.supervisor.get_execution_reports(self.agent_id, wait_seconds, max_reports)
+    async def challenge_get_execution_reports(self, max_reports: int = 20) -> dict[str, Any]:
+        return await self.supervisor.get_execution_reports(self.agent_id, 0.0, max_reports)
 
-    async def challenge_get_updates(self, wait_seconds: float = 0.0, max_reports: int = 20) -> dict[str, Any]:
-        return await self.supervisor.get_challenge_updates(self.agent_id, wait_seconds, max_reports)
+    async def challenge_get_updates(self, max_reports: int = 20) -> dict[str, Any]:
+        return await self.supervisor.get_challenge_updates(self.agent_id, 0.0, max_reports)
+
+    async def challenge_wait_for_state(self) -> ToolDispatchOutcome:
+        return ToolDispatchOutcome(
+            {"ok": True, "data": {"status": "waiting"}}, yield_session=True
+        )
 
     async def challenge_report_status(self, **payload: Any) -> dict[str, Any]:
         return await self.supervisor.report_challenge_status(self.agent_id, payload)
@@ -237,7 +250,8 @@ class ChiefAgentTools(AgentControlTools):
         "chief_get_core_state": (EmptyArguments, "chief_get_core_state"),
         "chief_get_schedule": (EmptyArguments, "chief_get_schedule"),
         "chief_create_challenge_agent": (UniqueCodeArguments, "chief_create_challenge_agent"),
-        "chief_get_challenge_reports": (PollArguments, "chief_get_challenge_reports"),
+        "chief_get_challenge_reports": (ReportQueryArguments, "chief_get_challenge_reports"),
+        "chief_wait_for_state": (EmptyArguments, "chief_wait_for_state"),
         "chief_request_hint": (HintArguments, "chief_request_hint"),
         "chief_extend_stagnation": (StagnationExtensionArguments, "chief_extend_stagnation"),
     }
@@ -268,18 +282,26 @@ class ChiefAgentTools(AgentControlTools):
         ),
         _definition(
             "chief_get_challenge_reports",
-            "Read bounded structured progress reports sent by Challenge Agents.",
-            _POLL_PROPERTIES,
+            "Read a non-blocking bounded snapshot of structured progress reports sent by Challenge Agents.",
+            _REPORT_QUERY_PROPERTIES,
+            [],
+        ),
+        _definition(
+            "chief_wait_for_state",
+            "Yield this model session after all current decisions are persisted. Runtime resumes only for a newer state sequence or the five-minute safety wakeup. Call this as the only tool in the response.",
+            {},
             [],
         ),
         _definition(
             "chief_request_hint",
-            "Request a challenge hint after considering the Challenge Agent report. Viewing a hint can reduce later score.",
+            "Request the single challenge Hint only after Runtime admission: the challenge must be in warning, all execution and resource work must be terminal, the latest status report must be ready_for_hint with hint_recommended=true, and the cited evidence must support a high-probability path, second-pass convergence, or near-deadline convergence. Warning alone never authorizes a Hint.",
             {
                 "unique_code": {"type": "string", "minLength": 1},
+                "basis": {"type": "string", "enum": ["high_probability_path", "second_pass_convergence", "near_deadline"]},
+                "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 20},
                 "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
             },
-            ["unique_code", "reason"],
+            ["unique_code", "basis", "evidence_refs", "reason"],
         ),
         _definition(
             "chief_extend_stagnation",
@@ -303,21 +325,30 @@ class ChallengeAgentTools(AgentControlTools):
         "challenge_submit_analysis_plan": (CycleVersionArguments, "challenge_submit_analysis_plan"),
         "challenge_commit_cycle": (CycleVersionArguments, "challenge_commit_cycle"),
         "challenge_create_execution_agent": (CreateExecutionArguments, "challenge_create_execution_agent"),
-        "challenge_get_execution_reports": (ExecutionReportPollArguments, "challenge_get_execution_reports"),
-        "challenge_get_updates": (PollArguments, "challenge_get_updates"),
+        "challenge_get_execution_reports": (ReportQueryArguments, "challenge_get_execution_reports"),
+        "challenge_get_updates": (ReportQueryArguments, "challenge_get_updates"),
+        "challenge_wait_for_state": (EmptyArguments, "challenge_wait_for_state"),
         "challenge_report_status": (ChallengeStatusArguments, "challenge_report_status"),
         "challenge_submit_flag": (SubmitFlagArguments, "challenge_submit_flag"),
         "challenge_close_challenge": (EmptyArguments, "challenge_close_challenge"),
     }
     _DEFINITIONS = [
         _definition(
-        "challenge_create_execution_agent",
+            "challenge_create_execution_agent",
             "Create a short-lived execution Agent for this challenge. The execution Agent receives only system tools and a fixed reporting tool.",
             {
                 "mission": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "hypothesis_key": {"type": "string", "minLength": 1, "maxLength": 128},
+                "task_key": {"type": "string", "minLength": 1, "maxLength": 128},
+                "cycle_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "kind": {"type": "string", "enum": ["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"], "default": "general"},
+                "priority": {"type": "integer", "minimum": 0, "maximum": 100, "default": 50},
+                "success_criteria": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                "context_refs": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "branch_key": {"type": "string", "minLength": 1, "maxLength": 256},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 1800},
             },
-            ["mission"],
+            ["mission", "hypothesis_key", "task_key"],
         ),
         _definition("challenge_get_state", "Read the bound challenge's authoritative state, findings, and permitted credentials.", {}, []),
         _definition("challenge_begin_cycle", "Freeze a STATE snapshot and begin a structured cycle.", {"expected_challenge_version": {"type": "integer", "minimum": 1}}, ["expected_challenge_version"]),
@@ -325,25 +356,32 @@ class ChallengeAgentTools(AgentControlTools):
         _definition("challenge_commit_cycle", "Commit structured verification and update state atomically.", {"cycle_id": {"type": "string", "minLength": 1}, "expected_version": {"type": "integer", "minimum": 1}, "payload": {"type": "object"}}, ["cycle_id", "expected_version", "payload"]),
         _definition(
             "challenge_get_execution_reports",
-            "Read bounded reports from execution Agents. If no wait_seconds is supplied, wait for up to 30 seconds for a child report. Every completed or failed child must be consumed before deciding the cycle.",
-            _EXECUTION_REPORT_POLL_PROPERTIES,
+            "Read a non-blocking bounded snapshot of new Execution Agent reports. Consume every completed, failed, blocked, or cancelled child before deciding the cycle.",
+            _REPORT_QUERY_PROPERTIES,
             [],
         ),
         _definition(
             "challenge_get_updates",
-            "Read bounded control updates delivered by the Chief Agent, including approved Hint results.",
-            _POLL_PROPERTIES,
+            "Read a non-blocking bounded snapshot of control updates delivered by the Chief Agent, including the one persisted Hint result.",
+            _REPORT_QUERY_PROPERTIES,
+            [],
+        ),
+        _definition(
+            "challenge_wait_for_state",
+            "Yield this model session after all current evidence and decisions are persisted. Runtime resumes only for a newer state sequence or the five-minute safety wakeup. Call this as the only tool in the response.",
+            {},
             [],
         ),
         _definition(
             "challenge_report_status",
-            "Report structured progress to the Chief Agent, including whether a hint is recommended.",
+            "Report structured progress to the Chief Agent. Use ready_for_hint only after all child/resource work has converged; when hint_recommended=true, blocker and same-Run evidence_refs are mandatory. This report does not request a Hint or bypass Runtime admission.",
             {
                 "status": {"type": "string", "enum": ["analyzing", "blocked", "ready_for_hint", "flag_candidate", "completed", "failed"]},
                 "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
                 "hint_recommended": {"type": "boolean", "default": False},
                 "blocker": {"type": "string", "maxLength": 1000},
                 "next_steps": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 20},
             },
             ["status", "summary"],
         ),

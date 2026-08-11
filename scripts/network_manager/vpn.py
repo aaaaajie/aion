@@ -368,6 +368,19 @@ class VPNManager:
             return None
 
     def _process_error(self, prefix: str) -> VPNManagerError:
+        process = self._process
+        if (
+            process is not None
+            and process.returncode == 0
+            and any(
+                "halt command was pushed by server" in line.lower()
+                for line in self._recent_output
+            )
+        ):
+            return VPNManagerError(
+                "vpn_remote_halt",
+                "The VPN server closed the managed connection",
+            )
         if any(
             "sudo: a password is required" in line.lower()
             for line in self._recent_output

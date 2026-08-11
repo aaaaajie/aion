@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -14,14 +15,20 @@ import psutil
 from agent.config import AgentSettings, PROJECT_ROOT
 from agent.runtime_cleanup import cleanup_fresh_run_artifacts
 from agent.state import (
+    AgentReportInput,
+    CapabilityContext,
     CapabilityRegistry,
     ResourceController,
     StateService,
     StagnationManager,
+    challenge_work_active,
 )
 from agent.state.clock import utc_now
 from agent.subagents import AgentSupervisor, SubagentError
 from tools.benchmark import BenchmarkTools
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class NetworkLifecycle(Protocol):
@@ -32,6 +39,14 @@ class NetworkLifecycle(Protocol):
     async def wait_failure(self) -> None: ...
 
     async def close(self) -> None: ...
+
+
+class RuntimePausedError(RuntimeError):
+    """Raised after Runtime has safely persisted a resumable pause."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Runtime paused: {reason}")
+        self.reason = reason
 
 
 class AgentRuntime:
@@ -53,6 +68,7 @@ class AgentRuntime:
         stagnation_interval_seconds: float = 30.0,
         projection_interval_seconds: float = 1.0,
         catalog_reconcile_interval_seconds: float = 120.0,
+        second_pass_min_remaining_seconds: int = 30 * 60,
     ) -> None:
         self.settings = settings
         self.benchmark = benchmark
@@ -67,6 +83,7 @@ class AgentRuntime:
         self.stagnation_interval_seconds = stagnation_interval_seconds
         self.projection_interval_seconds = projection_interval_seconds
         self.catalog_reconcile_interval_seconds = catalog_reconcile_interval_seconds
+        self.second_pass_min_remaining_seconds = second_pass_min_remaining_seconds
         self.run_id: str | None = None
         self.chief_agent_id: str | None = None
         self.state_service: StateService | None = None
@@ -78,8 +95,10 @@ class AgentRuntime:
         self._network_watch_task: asyncio.Task[None] | None = None
         self._network_failure_event: asyncio.Event | None = None
         self._network_failure: Exception | None = None
+        self._network_pause_reason: str | None = None
         self._network_failure_recorded = False
         self._network_failure_record_lock = asyncio.Lock()
+        self._loop_diagnostics: dict[str, float] = {}
         self._closed = False
 
     @classmethod
@@ -131,6 +150,7 @@ class AgentRuntime:
                 "state_service": service,
                 "capability_registry": self.capability_registry,
                 "catalog_reconcile_interval_seconds": self.catalog_reconcile_interval_seconds,
+                "second_pass_min_remaining_seconds": self.second_pass_min_remaining_seconds,
                 "duration_minutes": self.settings.run_duration_minutes,
             }
             if self.runner_factory is not None:
@@ -222,9 +242,15 @@ class AgentRuntime:
     async def ensure_healthy(self) -> None:
         """Raise after recording an unexpected managed-network failure."""
 
+        if self._network_pause_reason is not None:
+            reason = self._network_pause_reason
+            await self.pause(reason=reason)
+            raise RuntimePausedError(reason)
         if self._network_failure is None:
             return
         await self._record_network_failure()
+        if self.supervisor is not None:
+            await self.supervisor.close()
         raise self._network_failure
 
     async def admission_once(self) -> dict[str, Any] | None:
@@ -275,15 +301,22 @@ class AgentRuntime:
             runtime = await self.state_service.get_agent_runtime(
                 self._run_id(), agent_id
             )
-            if runtime["agent"]["status"] not in {
-                "completed",
-                "failed",
-                "stopped",
-                "cancelled",
-                "interrupted",
-            }:
-                await self.state_service.finish_agent(
-                    self._run_id(), agent_id, status="failed"
+            if runtime["agent"].get("terminal_report_id") is None:
+                await self.state_service.finalize_execution_agent(
+                    self._run_id(),
+                    agent_id,
+                    CapabilityContext(
+                        run_id=self._run_id(),
+                        agent_id=agent_id,
+                        role="execution",
+                        unique_code=runtime["agent"]["unique_code"],
+                    ),
+                    AgentReportInput(
+                        status="failed",
+                        summary="Execution Agent could not be started",
+                        failure_code="agent_start_failed",
+                    ),
+                    allow_inactive=True,
                 )
             return {"ok": False, "status": "failed", "agent_id": agent_id}
 
@@ -293,7 +326,7 @@ class AgentRuntime:
         challenges = await self.state_service.list_challenges(self._run_id())
         results: list[dict[str, Any]] = []
         for challenge in challenges:
-            if challenge["container_status"] not in {"starting", "running"}:
+            if not challenge_work_active(challenge):
                 continue
             result = await self.stagnation_manager.evaluate(
                 self._run_id(), challenge["unique_code"]
@@ -324,9 +357,11 @@ class AgentRuntime:
     async def close(self) -> None:
         await self._shutdown(preserve_run=False)
 
-    async def pause(self) -> None:
+    async def pause(self, *, reason: str = "runtime_pause") -> None:
         """Release external resources while keeping the run resumable."""
 
+        if self.state_service is not None and self.run_id is not None:
+            await self.state_service.pause_run(self.run_id, reason=reason)
         await self._shutdown(preserve_run=True)
 
     async def _shutdown(self, *, preserve_run: bool) -> None:
@@ -349,14 +384,20 @@ class AgentRuntime:
                 *self._execution_watchers.values(), return_exceptions=True
             )
         self._execution_watchers.clear()
+        supervisor_error: Exception | None = None
         if self.supervisor is not None:
             try:
                 if preserve_run:
                     await self.supervisor.pause()
                 else:
                     await self.supervisor.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                supervisor_error = exc
+                LOGGER.exception(
+                    "supervisor_shutdown_failed run_id=%s preserve_run=%s",
+                    self.run_id,
+                    preserve_run,
+                )
             self.supervisor = None
         if self.benchmark is not None:
             try:
@@ -381,6 +422,8 @@ class AgentRuntime:
                 await self.network_manager.close()
             except Exception:
                 pass
+        if supervisor_error is not None:
+            raise supervisor_error
 
     async def _admission_loop(self) -> None:
         while True:
@@ -398,9 +441,39 @@ class AgentRuntime:
                 await self.stagnation_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._record_loop_diagnostic("stagnation", exc)
             await asyncio.sleep(self.stagnation_interval_seconds)
+
+    async def _record_loop_diagnostic(self, loop_name: str, exc: Exception) -> None:
+        fingerprint = f"{loop_name}:{type(exc).__name__}:{str(exc)[:200]}"
+        now = asyncio.get_running_loop().time()
+        if now - self._loop_diagnostics.get(fingerprint, -600.0) < 300.0:
+            return
+        self._loop_diagnostics[fingerprint] = now
+        LOGGER.warning(
+            "runtime_loop_failed run_id=%s loop=%s error_type=%s",
+            self.run_id,
+            loop_name,
+            type(exc).__name__,
+        )
+        if self.state_service is not None and self.run_id is not None:
+            try:
+                await self.state_service.append_run_event(
+                    self.run_id,
+                    "runtime_loop_failed",
+                    {
+                        "loop": loop_name,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    },
+                )
+            except Exception:
+                LOGGER.exception(
+                    "runtime_loop_failure_event_failed run_id=%s loop=%s",
+                    self.run_id,
+                    loop_name,
+                )
 
     async def _projection_loop(self) -> None:
         while True:
@@ -421,19 +494,19 @@ class AgentRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._network_failure = exc
+            if getattr(exc, "code", None) == "vpn_remote_halt":
+                self._network_pause_reason = "vpn_remote_halt"
+            else:
+                self._network_failure = exc
         else:
             self._network_failure = RuntimeError(
                 "Managed network connection stopped unexpectedly"
             )
         if self._network_failure_event is not None:
             self._network_failure_event.set()
+        if self._network_pause_reason is not None:
+            return
         await self._record_network_failure()
-        if self.supervisor is not None:
-            try:
-                await self.supervisor.close()
-            except Exception:
-                pass
 
     async def _record_network_failure(self) -> None:
         async with self._network_failure_record_lock:
@@ -445,18 +518,15 @@ class AgentRuntime:
                 return
             if not await self.state_service.run_exists(self.run_id):
                 return
+            await self.state_service.finish_run(
+                self.run_id,
+                "failed",
+                report={
+                    "type": "network_failure",
+                    "summary": "The managed VPN connection exited unexpectedly",
+                },
+            )
             self._network_failure_recorded = True
-            try:
-                await self.state_service.finish_run(
-                    self.run_id,
-                    "failed",
-                    report={
-                        "type": "network_failure",
-                        "summary": "The managed VPN connection exited unexpectedly",
-                    },
-                )
-            except Exception:
-                pass
 
     async def _wait_for_agents(self, chief_id: str) -> dict[str, Any]:
         assert self.supervisor is not None

@@ -98,6 +98,7 @@ async def test_discovery_uses_network_tasks_and_paginates(tmp_path: Path) -> Non
         wait_seconds=None,
     )
     assert result["status"] == "completed"
+    assert result["recommended_wait_seconds"] == 0
     assert result["scan_intent"] == "initial_surface"
     assert result["scanner_version"] == "test-fscan"
     assert result["bridge_protocol_version"] == "1"

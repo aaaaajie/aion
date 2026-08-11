@@ -222,12 +222,14 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
         for definitions in (ChiefAgentTools.tool_definitions(), ChallengeAgentTools.tool_definitions(), ExecutionAgentTools.tool_definitions())
         for item in definitions
     )
-    execution_poll = next(
+    execution_snapshot = next(
         item
         for item in ChallengeAgentTools.tool_definitions()
         if item["function"]["name"] == "challenge_get_execution_reports"
     )
-    assert execution_poll["function"]["parameters"]["properties"]["wait_seconds"]["default"] == 30
+    assert "wait_seconds" not in execution_snapshot["function"]["parameters"]["properties"]
+    assert "chief_wait_for_state" in chief_names
+    assert "challenge_wait_for_state" in challenge_names
 
     mixed_registry = ToolRegistry(
         [ChiefAgentTools.__new__(ChiefAgentTools), ExecutionAgentTools.__new__(ExecutionAgentTools)],
@@ -469,17 +471,28 @@ async def test_warning_allows_one_explicit_exploration_only(tmp_path: Path) -> N
         row.work_status = "warning"
         row.hint_eligible = True
 
-    generic = await supervisor.create_execution_agent(challenge_id, "generic sweep")
+    generic = await supervisor.create_execution_agent(
+        challenge_id,
+        "generic sweep",
+        hypothesis_key="generic-sweep",
+        task_key="generic-sweep-1",
+    )
     assert generic["ok"] is False
     assert generic["error"]["code"] == "exploration_only"
     missing_gap = await supervisor.create_execution_agent(
-        challenge_id, "explore", kind="exploration"
+        challenge_id,
+        "explore",
+        hypothesis_key="missing-gap",
+        task_key="missing-gap-1",
+        kind="exploration",
     )
     assert missing_gap["ok"] is False
     assert missing_gap["error"]["code"] == "information_gap_required"
     first = await supervisor.create_execution_agent(
         challenge_id,
         "verify the unauthenticated document endpoint",
+        hypothesis_key="authorization-boundary",
+        task_key="authorization-boundary-1",
         kind="exploration",
         context_refs=["gap:authorization-boundary"],
     )
@@ -487,6 +500,8 @@ async def test_warning_allows_one_explicit_exploration_only(tmp_path: Path) -> N
     second = await supervisor.create_execution_agent(
         challenge_id,
         "verify a second direction",
+        hypothesis_key="second-direction",
+        task_key="second-direction-1",
         kind="exploration",
         context_refs=["gap:second-direction"],
     )
@@ -520,7 +535,12 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
 
     execution = await challenge.dispatch(
         "challenge_create_execution_agent",
-        {"mission": "inspect the service", "timeout_seconds": 20},
+        {
+            "mission": "inspect the service",
+            "hypothesis_key": "service-inspection",
+            "task_key": "service-inspection-1",
+            "timeout_seconds": 20,
+        },
     )
     assert execution["ok"] is True
     execution_id = execution["data"]["agent_id"]
@@ -674,10 +694,12 @@ async def test_failed_execution_report_contains_safe_reason_and_advances_parent_
     execution_result = await supervisor.create_execution_agent(
         challenge_id,
         "inspect the service",
+        hypothesis_key="service-inspection-failure",
+        task_key="service-inspection-failure-1",
     )
     execution_id = execution_result["data"]["agent_id"]
 
-    await supervisor._publish_missing_report(
+    await supervisor._finalize_missing_report(
         execution_id,
         failure_code="llm_request_failed",
         failure_message="LLM request failed",
@@ -742,6 +764,8 @@ async def test_challenge_controller_waits_and_consumes_each_sequence_once(
         role="execution",
         parent_id=challenge_id,
         unique_code="task-1",
+        hypothesis_key="controller-report",
+        task_key="controller-report-1",
         mission="report fixture",
     )
     report = await service.publish_control_report(
@@ -897,7 +921,10 @@ async def test_execution_without_structured_report_has_one_failed_terminal_state
     challenge = await supervisor.create_challenge_agent(chief_id, "task-1")
     challenge_id = challenge["data"]["agent_id"]
     execution = await supervisor.create_execution_agent(
-        challenge_id, "return without a report"
+        challenge_id,
+        "return without a report",
+        hypothesis_key="missing-report",
+        task_key="missing-report-1",
     )
     execution_id = execution["data"]["agent_id"]
     await supervisor.launch_execution_agent(execution_id)
@@ -997,21 +1024,61 @@ async def test_hint_is_chief_only_and_status_mailbox_is_structured(tmp_path: Pat
     status = await challenge.dispatch(
         "challenge_report_status",
         {
-            "status": "ready_for_hint",
-            "summary": "Need more direction",
-            "hint_recommended": True,
+            "status": "analyzing",
+            "summary": "Collected a concrete blocker reference",
         },
     )
     assert status["ok"] is True
+    prior_report = await service.latest_control_report(
+        "run-hint", recipient_id=chief_id, report_type="challenge_status"
+    )
+    assert prior_report is not None
+    async with service.db.sessions.begin() as session:
+        row = await session.get(ChallengeRecord, ("run-hint", "task-1"))
+        assert row is not None
+        row.work_status = "warning"
+        row.stagnation_level = 1
+        row.hint_eligible = True
+        row.control_since = row.active_since
     chief_reports = await chief.dispatch("chief_get_challenge_reports", {})
-    assert chief_reports["data"]["reports"][0]["hint_recommended"] is True
+    assert chief_reports["data"]["reports"][0]["status"] == "analyzing"
+
+    status = await challenge.dispatch(
+        "challenge_report_status",
+        {
+            "status": "ready_for_hint",
+            "summary": "Need more direction",
+            "hint_recommended": True,
+            "blocker": "The final path remains unverified",
+            "evidence_refs": [f"report:{prior_report['report_id']}"],
+        },
+    )
+    assert status["ok"] is True
 
     hint = await chief.dispatch(
         "chief_request_hint",
-        {"unique_code": "task-1", "reason": "execution agents are blocked"},
+        {
+            "unique_code": "task-1",
+            "basis": "high_probability_path",
+            "evidence_refs": [f"report:{prior_report['report_id']}"],
+            "reason": "execution agents are blocked",
+        },
     )
     assert hint["ok"] is True
+    reused = await chief.dispatch(
+        "chief_request_hint",
+        {
+            "unique_code": "task-1",
+            "basis": "high_probability_path",
+            "evidence_refs": [f"report:{prior_report['report_id']}"],
+            "reason": "check the same persisted hint",
+        },
+    )
+    assert reused["ok"] is True
+    assert reused["data"]["reused"] is True
+    assert [name for name, _ in benchmark.calls].count("benchmark_get_hint") == 1
     challenge_updates = await challenge.dispatch("challenge_get_updates", {})
+    assert challenge_updates["data"]["count"] == 1
     assert challenge_updates["data"]["updates"][0]["type"] == "hint_received"
 
     forbidden = await challenge.dispatch("chief_request_hint", {"unique_code": "task-1", "reason": "no"})
