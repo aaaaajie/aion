@@ -54,6 +54,7 @@
     chief_request_hint: "申请挑战提示",
     challenge_begin_cycle: "开始分析周期",
     challenge_submit_analysis_plan: "提交分析计划",
+    challenge_create_domain_probes: "识别题目领域",
     challenge_create_execution_agent: "创建执行 Agent",
     challenge_get_execution_reports: "读取执行报告",
     challenge_get_updates: "读取协作更新",

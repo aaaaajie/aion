@@ -37,8 +37,13 @@ def render_prompt(name: str, **values: object) -> str:
 
 
 def system_prompt(role: str) -> str:
-    """Load the role-specific system prompt."""
+    """Compose the invariant base prompt with one role-specific system prompt."""
 
     if role not in {"chief", "challenge", "execution"}:
         raise ValueError("unknown Agent role")
-    return load_prompt(f"{role}_system.txt")
+    return "\n\n".join(
+        (
+            load_prompt("base_system.txt"),
+            load_prompt(f"{role}_system.txt"),
+        )
+    )

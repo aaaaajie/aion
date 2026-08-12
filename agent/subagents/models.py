@@ -6,6 +6,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from scan.contracts import (
+    CostClass,
+    ScannerProfileName,
+    TaskPhase,
+    validate_profile_tools,
+    validate_task_budgets,
+)
+
 AgentRole = Literal["chief", "challenge", "execution"]
 HintBasis = Literal[
     "high_probability_path",
@@ -61,18 +69,93 @@ class CreateExecutionArguments(_Arguments):
     hypothesis_key: str = Field(min_length=1, max_length=128)
     task_key: str = Field(min_length=1, max_length=128)
     cycle_id: str | None = Field(default=None, min_length=1, max_length=128)
-    kind: Literal["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"] = "general"
+    kind: Literal["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration", "domain_recognition"] = "general"
+    task_phase: TaskPhase
+    entry_point: str = Field(min_length=1, max_length=2_000)
+    capability_class: str = Field(min_length=1, max_length=128)
+    verification_question: str = Field(min_length=1, max_length=2_000)
     priority: int = Field(default=50, ge=0, le=100)
-    success_criteria: list[str] = Field(default_factory=list, max_length=20)
+    target_scope: list[str] = Field(min_length=1, max_length=20)
+    tool_names: list[str] = Field(min_length=1, max_length=20)
+    success_criteria: list[str] = Field(min_length=1, max_length=20)
+    failure_criteria: list[str] = Field(min_length=1, max_length=20)
+    evidence_requirements: list[str] = Field(min_length=1, max_length=20)
+    stop_conditions: list[str] = Field(min_length=1, max_length=20)
+    depends_on: list[str] = Field(default_factory=list, max_length=20)
+    scanner_profile: ScannerProfileName
+    cost_class: CostClass = "low"
     context_refs: list[str] = Field(default_factory=list, max_length=50)
+    branch_key: str | None = Field(default=None, min_length=1, max_length=256)
+    max_http_requests: int = Field(ge=0, le=1_000)
+    max_shell_tasks: int = Field(ge=0, le=100)
+    max_network_tasks: int = Field(ge=0, le=20)
     timeout_seconds: int = Field(default=1_800, ge=1, le=3_600)
 
-    @field_validator("mission")
+    @field_validator(
+        "mission",
+        "entry_point",
+        "capability_class",
+        "verification_question",
+    )
     @classmethod
-    def mission_non_blank(cls, value: str) -> str:
+    def atomic_fields_non_blank(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("mission must not be blank")
+            raise ValueError("atomic task fields must not be blank")
         return value
+
+    @field_validator(
+        "target_scope",
+        "tool_names",
+        "success_criteria",
+        "failure_criteria",
+        "evidence_requirements",
+        "stop_conditions",
+        "depends_on",
+        "context_refs",
+    )
+    @classmethod
+    def non_blank_task_items(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("task contract items must not be blank")
+        if len(set(values)) != len(values):
+            raise ValueError("task contract items must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_atomic_contract(self) -> "CreateExecutionArguments":
+        if self.task_key in self.depends_on:
+            raise ValueError("a task must not depend on itself")
+        validate_profile_tools(self.scanner_profile, self.tool_names)
+        validate_task_budgets(
+            self.tool_names,
+            max_http_requests=self.max_http_requests,
+            max_shell_tasks=self.max_shell_tasks,
+            max_network_tasks=self.max_network_tasks,
+        )
+        if self.kind == "domain_recognition":
+            if self.scanner_profile != "domain_recognition":
+                raise ValueError(
+                    "domain recognition tasks require the domain_recognition profile"
+                )
+            if self.task_phase != "domain_recognition":
+                raise ValueError(
+                    "domain recognition tasks require the domain_recognition phase"
+                )
+            if (
+                self.max_http_requests > 1
+                or self.max_shell_tasks != 0
+                or self.max_network_tasks != 0
+            ):
+                raise ValueError("domain recognition task budgets must remain bounded")
+        elif self.scanner_profile == "domain_recognition":
+            raise ValueError(
+                "the domain_recognition profile is reserved for domain probes"
+            )
+        elif self.task_phase == "domain_recognition":
+            raise ValueError(
+                "the domain_recognition phase is reserved for domain probes"
+            )
+        return self
 
 
 class ReportQueryArguments(_Arguments):

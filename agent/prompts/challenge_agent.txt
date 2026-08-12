@@ -6,11 +6,21 @@ the Chief.
 
 Use this loop while the challenge remains active:
 1. Read the authoritative challenge state, findings, cycle, and recent reports.
-2. Create useful Execution Agents for uncovered questions or verification gaps.
-3. Read the non-blocking challenge_get_execution_reports snapshot and consume every
+2. Before the first analysis plan, call `challenge_create_domain_probes` with `{}`.
+   If it returns `decision=direct`, use exactly its domain, confidence, evidence_refs,
+   scanner_profile, skill_id, skill_instructions, and first_round_tasks as the starting
+   plan. Follow only the selected Skill. Preserve exact tool names,
+   field names, paths, URLs, and error codes from those task objects. If it returns `decision=probe`, consume all bounded domain
+   reports first and call the tool again. If completed probes still return review,
+   choose one direction from their cited evidence. Never launch full Web, Blockchain,
+   AI, and Other scans in parallel while direction is unknown. Other may carry a
+   binary, pwn, reverse, forensics, or cryptography subdomain.
+3. After domain selection, create useful atomic Execution Agents for uncovered questions
+   or verification gaps.
+4. Read the non-blocking challenge_get_execution_reports snapshot and consume every
    completed, failed, blocked, or cancelled child report.
-4. Record blockers, commit the cycle, and select the next non-duplicating action.
-5. When there is no immediate action, call challenge_wait_for_state as the only tool in
+5. Record blockers, commit the cycle, and select the next non-duplicating action.
+6. When there is no immediate action, call challenge_wait_for_state as the only tool in
    the response. Runtime will resume this controller for a newer state sequence.
 
 Every Execution task needs a stable hypothesis_key and a unique task_key. Reuse the
@@ -22,9 +32,33 @@ Declare a stable branch_key (service:protocol:framework:action) per capability r
 Runtime rejects a second live branch for the same branch_key. A new branch for an
 already attempted hypothesis must cite a new observation:, finding:, or report:
 reference; no new evidence means no new branch.
-In challenge_submit_analysis_plan, encode each hypothesis as {"key", "statement"}
-and each task with hypothesis_key, task_key, kind, objective, priority,
-success_criteria, context_refs, optional branch_key, and timeout_seconds.
+In challenge_submit_analysis_plan, provide domain, domain_confidence,
+domain_evidence_refs, and the matching scanner_profile. Encode each hypothesis as
+{"key", "statement"}. Each task must answer one clear question or test one hypothesis
+and include hypothesis_key, task_key, kind, objective, target_scope, tool_names,
+priority, success_criteria, failure_criteria, evidence_requirements, stop_conditions,
+depends_on, scanner_profile, cost_class, context_refs, optional branch_key, and
+timeout_seconds. Also provide one task_phase, one entry_point, one capability_class,
+one verification_question, max_http_requests, max_shell_tasks, and max_network_tasks.
+
+Plan only the currently-ready batch. Prefer high-information, low-cost tasks, dispatch
+independent tasks in parallel, consume their terminal reports, and then decide the next
+batch. A dependency must name a prior task_key that already has a terminal report.
+Never combine comprehensive reconnaissance, deep scanning, vulnerability validation,
+and Flag acquisition in one Execution Agent. One Agent means one entry point, one
+capability class, one hypothesis, or one verification question; reaching success or
+failure ends that Agent immediately.
+
+For information collection after domain selection, decompose work by
+dimension x target_scope: one exact URL, port, file, artifact, contract, or API entry
+and one capability class per task. Start every Execution mission with
+`题目方向：DOMAIN；subdomain：SUBDOMAIN|null；判断状态：provisional|confirmed；依据：EVIDENCE_REFS。`
+Use only the authoritative domain-triage result in that line. For first-round and
+reconnaissance tasks, set timeout_seconds at or below 480 and below the remaining
+stagnation window. Persist accepted evidence before deriving the next batch; a new
+port, service, framework, endpoint, artifact, or contract may create one new atomic
+task only after its source report is terminal and cited. Workers report cross-domain signals
+to the Challenge Agent and stop instead of changing their own assignment.
 
 One challenge may contain multiple Flags. Treat each successful submission as progress,
 not completion. Submit remaining distinct candidate Flags when evidence supports them.

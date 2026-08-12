@@ -15,6 +15,7 @@ from agent.config import AgentSettings
 from agent.runner import ToolRegistry
 from agent.state import StateService
 from agent.state.models import ChallengeRecord
+from agent.state.schemas import ExecutionTaskInput
 from agent.subagents import (
     AgentSupervisor,
     ChallengeAgentTools,
@@ -22,6 +23,7 @@ from agent.subagents import (
     ExecutionAgentTools,
     SubagentError,
 )
+from agent.subagents.policy import AgentPolicy
 
 
 def _settings() -> AgentSettings:
@@ -44,6 +46,31 @@ def _challenge(code: str) -> dict[str, Any]:
         "is_completed": False,
         "container_status": "stopped",
         "container_addr": [],
+    }
+
+
+def _atomic_task_arguments(
+    *, mission: str, hypothesis_key: str, task_key: str
+) -> dict[str, Any]:
+    return {
+        "mission": mission,
+        "hypothesis_key": hypothesis_key,
+        "task_key": task_key,
+        "task_phase": "reconnaissance",
+        "entry_point": "task-1",
+        "capability_class": "fixture_inspection",
+        "verification_question": "Does the fixture answer the assigned hypothesis?",
+        "target_scope": ["task-1"],
+        "tool_names": ["execution_get_assignment", "execution_report"],
+        "success_criteria": ["the one assigned question is answered"],
+        "failure_criteria": ["the assigned evidence is insufficient"],
+        "evidence_requirements": ["cite the inspected metadata or response"],
+        "stop_conditions": ["a success or failure criterion is met"],
+        "scanner_profile": "other_light",
+        "cost_class": "low",
+        "max_http_requests": 0,
+        "max_shell_tasks": 0,
+        "max_network_tasks": 0,
     }
 
 
@@ -214,6 +241,7 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
     execution_names = {item["function"]["name"] for item in ExecutionAgentTools.tool_definitions()}
 
     assert "chief_create_challenge_agent" in chief_names
+    assert "challenge_create_domain_probes" in challenge_names
     assert "challenge_create_execution_agent" in challenge_names
     assert "system_shell" not in chief_names | challenge_names
     assert "benchmark_submit_flag" not in execution_names
@@ -231,6 +259,15 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
     assert "chief_wait_for_state" in chief_names
     assert "challenge_wait_for_state" in challenge_names
 
+    recognition_policy = AgentPolicy(
+        "execution", execution_kind="domain_recognition"
+    )
+    assert recognition_policy.allows("system_http_request")
+    assert recognition_policy.allows("system_read_file")
+    assert not recognition_policy.allows("system_shell")
+    assert not recognition_policy.allows("system_http_probe")
+    assert not recognition_policy.allows("system_network_discovery")
+
     mixed_registry = ToolRegistry(
         [ChiefAgentTools.__new__(ChiefAgentTools), ExecutionAgentTools.__new__(ExecutionAgentTools)],
         allowed_tools={"chief_refresh_challenges"},
@@ -240,6 +277,216 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
     assert [item["function"]["name"] for item in mixed_registry.definitions()] == [
         "chief_refresh_challenges"
     ]
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_domain_triage_creates_only_four_bounded_probes(
+    tmp_path: Path,
+) -> None:
+    service = StateService(
+        tmp_path / "runs" / "domain-low" / "state.sqlite3",
+        run_root=tmp_path / "runs",
+    )
+    supervisor = AgentSupervisor(
+        _settings(),
+        benchmark=_FakeBenchmark(),
+        run_root=tmp_path / "runs",
+        runner_factory=_FakeRunner,
+        catalog_reconcile_interval_seconds=0,
+        state_service=service,
+    )
+    chief_id = await supervisor.prepare_chief("coordinate", run_id="domain-low")
+    challenge = await supervisor.create_challenge_agent(chief_id, "task-1")
+    challenge_id = challenge["data"]["agent_id"]
+
+    first = await supervisor.create_domain_probes(challenge_id)
+    assert first["ok"] is True
+    assert first["data"]["decision"] == "probe"
+    assert len(first["data"]["probes"]) == 4
+    overview = await service.get_overview("domain-low")
+    probes = [
+        item for item in overview["agents"] if item["kind"] == "domain_recognition"
+    ]
+    assert len(probes) == 4
+    assert {item["timeout_seconds"] for item in probes} == {120}
+    assert {
+        item["task_key"].split(":")[1] for item in probes
+    } == {"web", "blockchain", "ai", "other"}
+    ai_probe = next(
+        item
+        for item in probes
+        if item["task_key"].startswith("domain-recognition:ai")
+    )
+    assert "/chat, /completions, /generate, /v1/models, or /ask" in ai_probe["mission"]
+    assert "messages, prompt, input, system, model, temperature" in ai_probe["mission"]
+    assert "choices, role=assistant, content, usage" in ai_probe["mission"]
+    web_mission = next(
+        item["mission"]
+        for item in probes
+        if item["task_key"].startswith("domain-recognition:web")
+    )
+    assert "cross-domain AI evidence" in web_mission
+
+    second = await supervisor.create_domain_probes(challenge_id)
+    assert second["data"]["decision"] == "pending"
+    assert len(
+        [
+            item
+            for item in (await service.get_overview("domain-low"))["agents"]
+            if item["kind"] == "domain_recognition"
+        ]
+    ) == 4
+    before_progress = next(
+        item
+        for item in (await service.get_overview("domain-low"))["challenges"]
+        if item["unique_code"] == "task-1"
+    )["last_progress_at"]
+    web_probe = next(item for item in probes if item["task_key"].startswith("domain-recognition:web"))
+    probe_tools = ExecutionAgentTools(
+        supervisor, agent_id=web_probe["agent_id"], unique_code="task-1"
+    )
+    reported = await probe_tools.dispatch(
+        "execution_report",
+        {
+            "status": "completed",
+            "summary": "DOMAIN_MATCH=true",
+            "confidence": 0.92,
+            "findings": [
+                {
+                    "category": "other",
+                    "summary": "Domain recognition result: web",
+                    "detail": {
+                        "domain": "web",
+                        "is_match": True,
+                        "confidence": 0.92,
+                        "signals": ["description:http"],
+                    },
+                    "verification_status": "verified",
+                }
+            ],
+        },
+    )
+    assert reported["ok"] is True
+    after = await service.get_overview("domain-low")
+    assert all(
+        item["status"] == "queued"
+        for item in after["agents"]
+        if item["kind"] == "domain_recognition"
+        and item["agent_id"] != web_probe["agent_id"]
+    )
+    assert next(
+        item for item in after["challenges"] if item["unique_code"] == "task-1"
+    )["last_progress_at"] == before_progress
+    for probe in probes:
+        if probe["agent_id"] == web_probe["agent_id"]:
+            continue
+        domain = probe["task_key"].split(":")[1]
+        result = await ExecutionAgentTools(
+            supervisor, agent_id=probe["agent_id"], unique_code="task-1"
+        ).dispatch(
+            "execution_report",
+            {
+                "status": "completed",
+                "summary": f"{domain}: no",
+                "confidence": 0.9,
+                "findings": [
+                    {
+                        "category": "other",
+                        "summary": f"Domain recognition result: {domain}",
+                        "detail": {
+                            "domain": domain,
+                            "is_match": False,
+                            "confidence": 0.9,
+                            "signals": ["metadata mismatch"],
+                        },
+                    }
+                ],
+            },
+        )
+        assert result["ok"] is True
+    resolved = await supervisor.create_domain_probes(challenge_id)
+    assert resolved["data"]["decision"] == "direct"
+    assert resolved["data"]["domain"] == "web"
+    assert resolved["data"]["scanner_profile"] == "web_light"
+    assert resolved["data"]["skill_id"] == "web.light_scanner"
+    assert "# Web Light Scanner Skill" in resolved["data"]["skill_instructions"]
+    assert resolved["data"]["evidence_refs"][0].startswith("observation:")
+    assert len(resolved["data"]["first_round_tasks"]) == 2
+    fingerprint_task = next(
+        task
+        for task in resolved["data"]["first_round_tasks"]
+        if task["task_key"] == "web-light-fingerprint-1"
+    )
+    resolved_task = ExecutionTaskInput.model_validate(
+        fingerprint_task
+    )
+    assert resolved_task.scanner_profile == "web_light"
+    assert resolved_task.target_scope == ["challenge-metadata:task-1"]
+    assert set(resolved_task.tool_names) == {
+        "execution_get_assignment",
+        "system_web_fingerprint",
+        "system_http_output",
+        "system_http_analyze",
+        "execution_report",
+    }
+    await supervisor.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_domain_triage_selects_profile_without_probe_agents(
+    tmp_path: Path,
+) -> None:
+    benchmark = _FakeBenchmark()
+    benchmark.challenges[0]["unique_code"] = "web-sqli"
+    benchmark.challenges[0]["description"] = (
+        "Inspect the Flask HTTP API for SQL injection"
+    )
+    benchmark.challenges[0]["container_addr"] = ["http://127.0.0.1:8000"]
+    service = StateService(
+        tmp_path / "runs" / "domain-high" / "state.sqlite3",
+        run_root=tmp_path / "runs",
+    )
+    supervisor = AgentSupervisor(
+        _settings(),
+        benchmark=benchmark,
+        run_root=tmp_path / "runs",
+        runner_factory=_FakeRunner,
+        catalog_reconcile_interval_seconds=0,
+        state_service=service,
+    )
+    chief_id = await supervisor.prepare_chief("coordinate", run_id="domain-high")
+    challenge = await supervisor.create_challenge_agent(chief_id, "web-sqli")
+    result = await supervisor.create_domain_probes(challenge["data"]["agent_id"])
+
+    assert result["data"]["decision"] == "direct"
+    assert result["data"]["domain"] == "web"
+    assert result["data"]["scanner_profile"] == "web_light"
+    assert result["data"]["skill_id"] == "web.light_scanner"
+    assert "# Web Light Scanner Skill" in result["data"]["skill_instructions"]
+    assert result["data"]["evidence_refs"][0].startswith("observation:")
+    assert len(result["data"]["first_round_tasks"]) == 2
+    fingerprint_task = next(
+        task
+        for task in result["data"]["first_round_tasks"]
+        if task["task_key"] == "web-light-fingerprint-1"
+    )
+    direct_task = ExecutionTaskInput.model_validate(
+        fingerprint_task
+    )
+    assert direct_task.scanner_profile == "web_light"
+    assert direct_task.target_scope == ["http://127.0.0.1:8000"]
+    assert set(direct_task.tool_names) == {
+        "execution_get_assignment",
+        "system_web_fingerprint",
+        "system_http_output",
+        "system_http_analyze",
+        "execution_report",
+    }
+    overview = await service.get_overview("domain-high")
+    assert all(item["role"] != "execution" for item in overview["agents"])
+    await supervisor.close()
+    await service.close()
 
 
 @pytest.mark.asyncio
@@ -532,13 +779,30 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
     assert first["ok"] is True
     challenge_id = first["data"]["agent_id"]
     challenge = ChallengeAgentTools(supervisor, agent_id=challenge_id, unique_code="task-1")
+    await service.record_observation(
+        "run-one",
+        "task-1",
+        category="domain_triage",
+        summary="Challenge domain classified as other",
+        detail={
+            "domain": "other",
+            "confidence": 0.9,
+            "scanner_profile": "other_light",
+        },
+        source="test_domain_triage",
+        confidence=0.9,
+        mark_progress=False,
+        route_branches=False,
+    )
 
     execution = await challenge.dispatch(
         "challenge_create_execution_agent",
         {
-            "mission": "inspect the service",
-            "hypothesis_key": "service-inspection",
-            "task_key": "service-inspection-1",
+            **_atomic_task_arguments(
+                mission="inspect the service",
+                hypothesis_key="service-inspection",
+                task_key="service-inspection-1",
+            ),
             "timeout_seconds": 20,
         },
     )

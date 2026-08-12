@@ -34,6 +34,38 @@ from agent.state.schemas import (
 from agent.state.scheduling import ResourceController, StagnationManager
 
 
+async def _record_domain(
+    service: StateService,
+    run_id: str,
+    unique_code: str,
+    *,
+    domain: str = "web",
+) -> str:
+    profile = {
+        "web": "web_light",
+        "blockchain": "blockchain_light",
+        "ai": "ai_light",
+        "binary": "binary_light",
+        "other": "other_light",
+    }[domain]
+    result = await service.record_observation(
+        run_id,
+        unique_code,
+        category="domain_triage",
+        summary=f"Challenge domain classified as {domain}",
+        detail={
+            "domain": domain,
+            "confidence": 0.95,
+            "scanner_profile": profile,
+        },
+        source="test_domain_triage",
+        confidence=0.95,
+        mark_progress=False,
+        route_branches=False,
+    )
+    return f"observation:{result['observation_id']}"
+
+
 def test_container_capacity_only_releases_explicit_terminal_states() -> None:
     assert container_slot_occupied("stopped") is False
     assert container_slot_occupied("closed") is False
@@ -78,6 +110,7 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
     registry = CapabilityRegistry()
     chief_cap = registry.issue("run-1", chief["agent_id"], "chief")
     challenge_cap = registry.issue("run-1", challenge["agent_id"], "challenge", "web-1")
+    domain_ref = await _record_domain(service, "run-1", "web-1")
     app = create_state_app(service, registry)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://state") as client:
@@ -94,6 +127,10 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
             headers=headers,
             json={
                 "expected_version": cycle["version"],
+                "domain": "web",
+                "domain_confidence": 0.95,
+                "domain_evidence_refs": [domain_ref],
+                "scanner_profile": "web_light",
                 "analysis_summary": "map the current evidence",
                 "hypotheses": [
                     {"key": "assigned-service", "statement": "the assigned service is reachable"}
@@ -101,8 +138,23 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
                 "tasks": [{
                     "hypothesis_key": "assigned-service",
                     "task_key": "assigned-service-recon-1",
+                    "task_phase": "reconnaissance",
+                    "entry_point": "web-1",
+                    "capability_class": "http_baseline",
+                    "verification_question": "Is the assigned service reachable?",
                     "objective": "inspect the assigned service",
                     "kind": "recon",
+                    "target_scope": ["web-1"],
+                    "tool_names": ["system_http_request", "execution_report"],
+                    "success_criteria": ["service response is characterized"],
+                    "failure_criteria": ["service cannot be reached once"],
+                    "evidence_requirements": ["record status and response metadata"],
+                    "stop_conditions": ["one response or one connection failure is recorded"],
+                    "scanner_profile": "web_light",
+                    "cost_class": "low",
+                    "max_http_requests": 1,
+                    "max_shell_tasks": 0,
+                    "max_network_tasks": 0,
                 }],
             },
         )
@@ -132,7 +184,14 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
         stale = await client.put(
             f"/internal/v1/runs/run-1/cycles/{cycle['cycle_id']}/analysis-plan",
             headers=headers,
-            json={"expected_version": 1, "analysis_summary": "stale"},
+            json={
+                "expected_version": 1,
+                "domain": "web",
+                "domain_confidence": 0.95,
+                "domain_evidence_refs": [domain_ref],
+                "scanner_profile": "web_light",
+                "analysis_summary": "stale",
+            },
         )
         assert stale.status_code == 409
         assert stale.json()["code"] == "state_conflict"
@@ -368,6 +427,9 @@ async def test_cycle_completed_does_not_mark_challenge_solved(tmp_path: Path) ->
     context = registry.issue(
         "run-1", challenge["agent_id"], "challenge", "multi-flag"
     ).context
+    domain_ref = await _record_domain(
+        service, "run-1", "multi-flag", domain="other"
+    )
 
     cycle = await service.begin_cycle(
         "run-1",
@@ -381,6 +443,10 @@ async def test_cycle_completed_does_not_mark_challenge_solved(tmp_path: Path) ->
         context,
         AnalysisPlanInput(
             expected_version=cycle["version"],
+            domain="other",
+            domain_confidence=0.95,
+            domain_evidence_refs=[domain_ref],
+            scanner_profile="other_light",
             analysis_summary="record the current evidence",
         ),
     )
@@ -613,6 +679,7 @@ async def test_only_structured_valid_progress_resets_stagnation_clock(
     context = CapabilityContext(
         run_id="run-1", agent_id=challenge_agent["agent_id"], role="challenge", unique_code="web-1"
     )
+    domain_ref = await _record_domain(service, "run-1", "web-1")
     await service.start_challenge("run-1", "web-1")
     await service.import_challenges(
         "run-1",
@@ -645,6 +712,10 @@ async def test_only_structured_valid_progress_resets_stagnation_clock(
         context,
         AnalysisPlanInput(
             expected_version=cycle["version"],
+            domain="web",
+            domain_confidence=0.95,
+            domain_evidence_refs=[domain_ref],
+            scanner_profile="web_light",
             analysis_summary="verify the current evidence",
         ),
     )
@@ -686,6 +757,10 @@ async def test_only_structured_valid_progress_resets_stagnation_clock(
         context,
         AnalysisPlanInput(
             expected_version=duplicate["version"],
+            domain="web",
+            domain_confidence=0.95,
+            domain_evidence_refs=[domain_ref],
+            scanner_profile="web_light",
             analysis_summary="repeat the same report",
         ),
     )

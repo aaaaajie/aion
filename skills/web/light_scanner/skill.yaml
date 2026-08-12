@@ -1,0 +1,52 @@
+id: web.light_scanner
+name: Web Light Scanner
+version: "1.0.0"
+category:
+  - web
+stage:
+  - reconnaissance
+description: Build one low-cost, atomic first-round Web surface fingerprint task after the challenge domain is identified as Web.
+risk_level: low
+trigger:
+  keywords:
+    - web
+    - http
+    - https
+    - api
+    - flask
+    - django
+    - nginx
+  evidence:
+    - request_response
+    - execution_trace
+requires:
+  tools:
+    - execution_get_assignment
+    - system_read_file
+    - system_glob
+    - system_grep
+    - system_web_fingerprint
+    - system_http_output
+    - system_http_analyze
+    - execution_report
+  permissions:
+    - execution
+workflow:
+  - inspect_metadata
+  - plan_independent_tasks
+  - fingerprint_one_entry
+  - inspect_local_artifacts
+  - record_evidence
+  - report
+outputs:
+  findings:
+    - WEB_LIGHT_SURFACE
+  evidence:
+    - request_response
+    - execution_trace
+  credentials:
+    optional: false
+tags:
+  - web
+  - light_scanner
+  - first_round

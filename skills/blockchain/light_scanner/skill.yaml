@@ -1,0 +1,51 @@
+id: blockchain.light_scanner
+name: Blockchain Light Scanner
+version: "1.0.0"
+category:
+  - blockchain
+stage:
+  - reconnaissance
+description: Build one low-cost, atomic first-round Blockchain artifact or RPC entry task after the challenge domain is identified as Blockchain.
+risk_level: low
+trigger:
+  keywords:
+    - blockchain
+    - solidity
+    - evm
+    - smart contract
+    - json-rpc
+    - foundry
+    - hardhat
+  evidence:
+    - execution_trace
+    - test_result
+requires:
+  tools:
+    - execution_get_assignment
+    - system_read_file
+    - system_glob
+    - system_grep
+    - system_http_request
+    - system_http_output
+    - system_http_analyze
+    - execution_report
+  permissions:
+    - execution
+workflow:
+  - inspect_metadata
+  - plan_independent_tasks
+  - inspect_artifacts
+  - request_one_rpc_entry
+  - report
+outputs:
+  findings:
+    - BLOCKCHAIN_LIGHT_SURFACE
+  evidence:
+    - execution_trace
+    - test_result
+  credentials:
+    optional: false
+tags:
+  - blockchain
+  - light_scanner
+  - first_round

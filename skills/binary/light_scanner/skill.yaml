@@ -1,0 +1,52 @@
+id: binary.light_scanner
+name: Binary Light Scanner
+version: "1.0.0"
+category:
+  - binary
+stage:
+  - reconnaissance
+description: Build low-cost, atomic first-round artifact tasks after the challenge domain is identified as Other with a binary, reverse, pwn, forensics, or cryptography subdomain.
+risk_level: low
+trigger:
+  keywords:
+    - binary
+    - pwn
+    - reverse
+    - elf
+    - pe
+    - apk
+    - forensics
+    - cryptography
+  evidence:
+    - execution_trace
+    - test_result
+requires:
+  tools:
+    - execution_get_assignment
+    - system_read_file
+    - system_list_directory
+    - system_glob
+    - system_shell
+    - system_task_output
+    - execution_report
+  permissions:
+    - execution
+workflow:
+  - inspect_metadata
+  - plan_independent_tasks
+  - locate_one_artifact
+  - profile_artifact
+  - classify_subdomain
+  - report
+outputs:
+  findings:
+    - BINARY_LIGHT_ARTIFACT
+  evidence:
+    - execution_trace
+    - test_result
+  credentials:
+    optional: false
+tags:
+  - binary
+  - light_scanner
+  - first_round

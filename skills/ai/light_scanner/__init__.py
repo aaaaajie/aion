@@ -1,0 +1,1 @@
+"""AI lightweight scanner Skill."""

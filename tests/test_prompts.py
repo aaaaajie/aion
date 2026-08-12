@@ -41,6 +41,19 @@ def test_challenge_prompt_requires_a_persistent_report_loop() -> None:
     assert "one-shot task" in prompt
     assert "consume every" in prompt.lower()
     assert "challenge_wait_for_state" in prompt
+    assert "challenge_create_domain_probes" in prompt
+    assert "failure_criteria" in prompt
+    assert "currently-ready batch" in prompt
+    assert "first_round_tasks" in prompt
+    assert "skill_id" in prompt
+    assert "skill_instructions" in prompt
+    assert "Other" in prompt
+    assert "exact tool names" in prompt
+    assert "dimension x target_scope" in prompt
+    assert "题目方向：DOMAIN" in prompt
+    assert "timeout_seconds at or below 480" in prompt
+    assert "Persist accepted evidence before deriving the next batch" in prompt
+    assert "cross-domain signals" in prompt
     assert "challenge_data" in prompt
 
 
@@ -56,6 +69,32 @@ def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
     assert "system_task_output(wait_seconds=...)" in prompt
     assert "nohup" in prompt
     assert "for + curl" in prompt
+    assert "execution_task_contract" in prompt
+    assert "one atomic experiment" in prompt
+    assert "domain_recognition" in prompt
+    assert "Simplified Chinese" in prompt
+    assert "exact tool" in prompt
+    assert "debugging-only" in prompt
+
+
+def test_base_prompt_documents_chinese_debugging_rule_and_minor_cost() -> None:
+    prompt = load_prompt("base_system.txt")
+    assert "Simplified Chinese" in prompt
+    assert "exact tool names, field names, paths" in prompt
+    assert "URLs, and error codes" in prompt
+    assert "impact is minor" in prompt
+    assert "debugging-only" in prompt
+
+
+def test_language_rule_reaches_every_agent_system_prompt_once() -> None:
+    rule = (
+        "Use exact tool names, field names, paths, URLs, and error codes. "
+        "Summaries may use concise Chinese. Do not translate technical identifiers."
+    )
+    for role in ("chief", "challenge", "execution"):
+        prompt = system_prompt(role)
+        assert prompt.count(rule) == 1
+        assert "Simplified Chinese" in prompt
 
 
 def test_prompt_loader_rejects_missing_templates() -> None:

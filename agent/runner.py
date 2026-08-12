@@ -16,6 +16,12 @@ import httpx
 
 from agent.config import AgentSettings
 from agent.prompts import load_prompt
+from scan.contracts import (
+    HTTP_WORK_TOOLS,
+    NETWORK_WORK_TOOLS,
+    SHELL_WORK_TOOLS,
+    extract_task_contract,
+)
 
 from .memory.context import (
     build_runtime_messages,
@@ -158,6 +164,8 @@ class AgentRunner:
         self._summary_failures = 0
         self._summary_task: asyncio.Task[None] | None = None
         self._structured_report_seen = False
+        self._tool_budget_limits: dict[str, int] = {}
+        self._tool_budget_counts: dict[str, int] = {}
 
     async def close(self) -> None:
         if self._summary_task is not None:
@@ -192,6 +200,7 @@ class AgentRunner:
         initial_user_message = {"role": "user", "content": prompt}
         memory = await store.read_memory()
         durable_events = await store.load_events() if resume else []
+        self._configure_tool_budgets(prompt, durable_events)
         messages = build_runtime_messages(
             base_system_prompt=base_system_prompt,
             initial_user_message=initial_user_message,
@@ -246,7 +255,8 @@ class AgentRunner:
                         break
 
                     yield_session = False
-                    for tool_call in tool_calls:
+                    terminal_report_seen = False
+                    for index, tool_call in enumerate(tool_calls):
                         result, tool_message, requested_yield = await self._execute_tool_call(
                             store,
                             tool_call,
@@ -268,6 +278,19 @@ class AgentRunner:
                             )
                             last_summary_tokens = current_tokens
                             tool_calls_since_summary = 0
+                        if self._structured_report_seen:
+                            terminal_report_seen = True
+                            remaining = len(tool_calls) - index - 1
+                            if remaining:
+                                await store.append_event(
+                                    "terminal_tool_calls_skipped",
+                                    {"skipped_count": remaining},
+                                )
+                            break
+
+                    if terminal_report_seen:
+                        final_content = "Execution Agent submitted terminal execution_report."
+                        break
 
                     if yield_session:
                         yield_reason = "controller_wait"
@@ -330,6 +353,75 @@ class AgentRunner:
             )
             await store.save_checkpoint()
 
+    def _configure_tool_budgets(
+        self,
+        prompt: str,
+        durable_events: Sequence[Any],
+    ) -> None:
+        contract = extract_task_contract(prompt) if self.role == "execution" else None
+        fields = (
+            "max_http_requests",
+            "max_shell_tasks",
+            "max_network_tasks",
+        )
+        self._tool_budget_limits = {}
+        self._tool_budget_counts = {field: 0 for field in fields}
+        if not isinstance(contract, Mapping):
+            return
+        for field in fields:
+            value = contract.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                self._tool_budget_limits[field] = value
+
+        for event in durable_events:
+            if getattr(event, "event_type", None) != "tool_call":
+                continue
+            payload = getattr(event, "payload", {})
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("budget_admitted") is False:
+                continue
+            field = payload.get("budget_field")
+            if not isinstance(field, str):
+                field = self._budget_field(str(payload.get("tool_name") or ""))
+            if field in self._tool_budget_counts:
+                self._tool_budget_counts[field] += 1
+
+    @staticmethod
+    def _budget_field(tool_name: str) -> str | None:
+        if tool_name in HTTP_WORK_TOOLS:
+            return "max_http_requests"
+        if tool_name in SHELL_WORK_TOOLS:
+            return "max_shell_tasks"
+        if tool_name in NETWORK_WORK_TOOLS:
+            return "max_network_tasks"
+        return None
+
+    def _admit_budget(self, tool_name: str) -> tuple[str | None, dict[str, Any] | None]:
+        field = self._budget_field(tool_name)
+        if field is None or field not in self._tool_budget_limits:
+            return field, None
+        limit = self._tool_budget_limits[field]
+        used = self._tool_budget_counts.get(field, 0)
+        if used >= limit:
+            return field, {
+                "ok": False,
+                "error": {
+                    "type": "conflict",
+                    "code": "execution_budget_exceeded",
+                    "message": "The atomic task tool-call budget is exhausted",
+                    "status_code": None,
+                    "detail": {
+                        "budget_field": field,
+                        "limit": limit,
+                        "used": used,
+                        "tool_name": tool_name,
+                    },
+                },
+            }
+        self._tool_budget_counts[field] = used + 1
+        return field, None
+
     async def _execute_tool_call(
         self,
         store: AgentStateStore,
@@ -353,6 +445,7 @@ class AgentRunner:
         if not isinstance(arguments, Mapping):
             arguments = {"_invalid_arguments": True}
 
+        budget_field, budget_error = self._admit_budget(name)
         safe_arguments = redact_tool_payload(name, arguments, secrets=self._secrets())
         await store.append_event(
             "tool_call",
@@ -360,11 +453,24 @@ class AgentRunner:
                 "tool_call_id": tool_call.get("id"),
                 "tool_name": name,
                 "arguments": safe_arguments,
+                "budget_field": budget_field,
+                "budget_admitted": budget_error is None,
             },
         )
-        dispatched = await self.registry.dispatch(name, arguments)
-        requested_yield = isinstance(dispatched, ToolDispatchOutcome) and dispatched.yield_session
-        result = dispatched.result if isinstance(dispatched, ToolDispatchOutcome) else dispatched
+        if budget_error is not None:
+            result = budget_error
+            requested_yield = False
+        else:
+            dispatched = await self.registry.dispatch(name, arguments)
+            requested_yield = (
+                isinstance(dispatched, ToolDispatchOutcome)
+                and dispatched.yield_session
+            )
+            result = (
+                dispatched.result
+                if isinstance(dispatched, ToolDispatchOutcome)
+                else dispatched
+            )
         if requested_yield and not allow_yield:
             requested_yield = False
             result = {
