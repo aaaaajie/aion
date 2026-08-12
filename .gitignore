@@ -29,3 +29,5 @@ evidence/admin2/creds_*.headers
 evidence/admin2/creds_*.html
 evidence/admin_login/cred_admin_password.html
 work/admin_login_evidence/cred_*.headers
+
+/docs

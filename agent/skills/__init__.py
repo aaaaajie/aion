@@ -1,19 +1,6 @@
-"""Project Skill discovery and validation."""
+"""Role-scoped, progressively loaded AION skills."""
 
-from .loader import (
-    SkillDefinition,
-    SkillLoadError,
-    discover_skills,
-    project_skill_registry,
-    skill_definition,
-)
-from .models import SkillManifest
+from .catalog import SkillCatalog, SkillCatalogError
+from .tools import SkillTools
 
-__all__ = [
-    "SkillDefinition",
-    "SkillLoadError",
-    "SkillManifest",
-    "discover_skills",
-    "project_skill_registry",
-    "skill_definition",
-]
+__all__ = ["SkillCatalog", "SkillCatalogError", "SkillTools"]

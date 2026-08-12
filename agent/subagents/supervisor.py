@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from agent.memory.models import AgentNode
 from agent.memory.redaction import redact_value
 from agent.prompts import render_prompt, system_prompt
 from agent.runner import AgentRunner, AgentRunnerError, AgentSessionResult, ToolRegistry
+from agent.skills import SkillCatalog, SkillTools
 from agent.state import (
     AgentStateStore,
     CapabilityRegistry,
@@ -130,6 +132,7 @@ class AgentSupervisor:
         state_service: StateService,
         capability_registry: CapabilityRegistry | None = None,
         resource_controller: ResourceController | None = None,
+        skill_catalog: SkillCatalog | None = None,
     ) -> None:
         if max_challenge_slots != self.MAX_CHALLENGE_SLOTS:
             raise ValueError("the benchmark challenge slot limit is fixed at 3")
@@ -148,6 +151,7 @@ class AgentSupervisor:
         self.state_service = state_service
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.resource_controller = resource_controller
+        self.skill_catalog = skill_catalog or SkillCatalog()
         self._state_capabilities: dict[str, CapabilityContext] = {}
         self.run_id: str | None = None
         self.store: AgentStateStore | None = None
@@ -222,11 +226,20 @@ class AgentSupervisor:
                 initial_prompt=prompt,
             )
 
+        runtime_prefix = Path(sys.prefix).resolve()
+        runtime_python = runtime_prefix / "bin" / Path(sys.executable).name
+        if not runtime_python.is_file():
+            runtime_python = Path(sys.executable).resolve()
         self._shell_tasks = ShellTaskManager(
             WorkspacePolicy(self.project_root),
             service,
             run_id,
             clock=service.clock,
+            read_only_paths=(self.skill_catalog.root, runtime_prefix),
+            environment={
+                "AION_SKILLS_ROOT": str(self.skill_catalog.root),
+                "AION_PYTHON": str(runtime_python),
+            },
         )
         await self._shell_tasks.initialize(resume=resume)
         self._http_interactions = HttpProbeManager(
@@ -2155,6 +2168,7 @@ class AgentSupervisor:
             wrappers: list[Any] = [ChiefAgentTools(self, agent_id=agent_id)]
         elif role == "challenge":
             wrappers = [
+                SkillTools(self.skill_catalog, role="challenge"),
                 ChallengeAgentTools(
                     self, agent_id=agent_id, unique_code=agent["unique_code"]
                 )
@@ -2167,6 +2181,7 @@ class AgentSupervisor:
             ):
                 raise SubagentError("Execution task managers are not initialized")
             wrappers = [
+                SkillTools(self.skill_catalog, role="execution"),
                 SystemTools(
                     root=self.project_root,
                     shell=self._shell_tasks.bind(agent_id),

@@ -24,6 +24,8 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
     ),
     "challenge": frozenset(
         {
+            "skill_list",
+            "skill_read",
             "challenge_get_state",
             "challenge_begin_cycle",
             "challenge_submit_analysis_plan",
@@ -40,6 +42,8 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
     ),
     "execution": frozenset(
         {
+            "skill_list",
+            "skill_read",
             "execution_get_assignment",
             "execution_update_progress",
             "execution_report",

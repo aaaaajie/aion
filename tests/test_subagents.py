@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from agent.config import AgentSettings
 from agent.runner import ToolRegistry
+from agent.skills import SkillTools
 from agent.state import StateService
 from agent.state.models import ChallengeRecord
 from agent.state.schemas import ExecutionTaskInput
@@ -258,6 +259,10 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
     assert "wait_seconds" not in execution_snapshot["function"]["parameters"]["properties"]
     assert "chief_wait_for_state" in chief_names
     assert "challenge_wait_for_state" in challenge_names
+    skill_names = {item["function"]["name"] for item in SkillTools.tool_definitions()}
+    assert skill_names <= AgentPolicy("challenge").allowed_tools
+    assert skill_names <= AgentPolicy("execution").allowed_tools
+    assert skill_names.isdisjoint(AgentPolicy("chief").allowed_tools)
 
     recognition_policy = AgentPolicy(
         "execution", execution_kind="domain_recognition"

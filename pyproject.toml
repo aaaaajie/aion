@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pydantic-settings>=2,<3",
     "psutil>=6,<8",
-    "PyYAML>=6,<7",
+    "pyyaml>=6,<7",
     "sqlalchemy>=2,<3",
 ]
 
@@ -33,7 +33,7 @@ include = ["challenges_sdk*", "tools*", "agent*", "scan*", "skills*"]
 
 [tool.setuptools.package-data]
 "agent.prompts" = ["*.txt"]
-"skills" = ["**/SKILL.md", "**/skill.yaml"]
+"agent.skills" = ["common/**/*", "challenge/**/*", "execution/**/*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
