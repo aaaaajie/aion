@@ -42,6 +42,10 @@ def test_challenge_prompt_requires_a_persistent_report_loop() -> None:
     assert "consume every" in prompt.lower()
     assert "challenge_wait_for_state" in prompt
     assert "challenge_data" in prompt
+    system = system_prompt("challenge")
+    assert "skill_list" in system
+    assert "common/challenge" in system
+    assert "Never preload" in system
 
 
 def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
@@ -56,6 +60,10 @@ def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
     assert "system_task_output(wait_seconds=...)" in prompt
     assert "nohup" in prompt
     assert "for + curl" in prompt
+    assert "skill_list" in prompt
+    assert "skill_read" in prompt
+    assert "$AION_SKILLS_ROOT" in prompt
+    assert "$AION_PYTHON" in prompt
 
 
 def test_prompt_loader_rejects_missing_templates() -> None:
