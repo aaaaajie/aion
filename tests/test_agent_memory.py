@@ -26,6 +26,7 @@ from agent.memory.summarizer import SessionMemorySummarizer
 from agent.runner import AgentRunner, ToolDispatchOutcome, ToolRegistry
 from agent.state import AgentStateStore, StateService
 from agent.state.models import DEFAULT_SESSION_MEMORY
+from scan.contracts import TASK_CONTRACT_END, TASK_CONTRACT_START, task_contract_json
 
 
 def _settings(**overrides: Any) -> AgentSettings:
@@ -283,6 +284,51 @@ class _ControllerWaitTools:
         return None
 
 
+class _AtomicExecutionTools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    @classmethod
+    def tool_definitions(cls) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            for name in ("system_http_request", "execution_report")
+        ]
+
+    async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((name, dict(arguments)))
+        if name == "execution_report":
+            return {"ok": True, "data": {"terminal": True}}
+        return {"ok": True, "data": {"status": 200}}
+
+    async def close(self) -> None:
+        return None
+
+
+def _execution_budget_prompt(*, max_http_requests: int) -> str:
+    contract = {
+        "max_http_requests": max_http_requests,
+        "max_shell_tasks": 0,
+        "max_network_tasks": 0,
+    }
+    return (
+        f"{TASK_CONTRACT_START}\n"
+        f"{task_contract_json(contract)}\n"
+        f"{TASK_CONTRACT_END}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Path) -> None:
     fake_tools = _FakeTools({"system_read_file": {"ok": True, "data": {"content": "ok"}}})
@@ -442,6 +488,175 @@ async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Pat
     assert requested_yield is False
     assert rejected["error"]["code"] == "controller_wait_must_be_solo"
 
+    await runner.close()
+    await client.aclose()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_http_budget_survives_durable_resume_state(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "execution-budget" / "state.sqlite3", run_root=run_root
+    )
+    prompt = _execution_budget_prompt(max_http_requests=1)
+    await service.create_run("execution-budget", model="test-model", prompt=prompt)
+    agent = await service.register_agent(
+        "execution-budget", role="chief", initial_prompt=prompt
+    )
+    store = await AgentStateStore.open(
+        service,
+        run_id="execution-budget",
+        agent_id=agent["agent_id"],
+        run_dir=run_root / "execution-budget",
+    )
+    tools = _AtomicExecutionTools()
+    first_runner = AgentRunner(
+        _settings(),
+        ToolRegistry([tools]),
+        run_root=run_root,
+        state_service=service,
+        agent_id=agent["agent_id"],
+        role="execution",
+    )
+    first_runner._configure_tool_budgets(prompt, [])
+    accepted, _, _ = await first_runner._execute_tool_call(
+        store,
+        {
+            "id": "http-1",
+            "type": "function",
+            "function": {"name": "system_http_request", "arguments": "{}"},
+        },
+        allow_yield=False,
+    )
+    assert accepted["ok"] is True
+
+    resumed_runner = AgentRunner(
+        _settings(),
+        ToolRegistry([tools]),
+        run_root=run_root,
+        state_service=service,
+        agent_id=agent["agent_id"],
+        role="execution",
+    )
+    resumed_runner._configure_tool_budgets(prompt, await store.load_events())
+    rejected, _, _ = await resumed_runner._execute_tool_call(
+        store,
+        {
+            "id": "http-2",
+            "type": "function",
+            "function": {"name": "system_http_request", "arguments": "{}"},
+        },
+        allow_yield=False,
+    )
+    assert rejected["error"]["code"] == "execution_budget_exceeded"
+    assert rejected["error"]["detail"] == {
+        "budget_field": "max_http_requests",
+        "limit": 1,
+        "used": 1,
+        "tool_name": "system_http_request",
+    }
+    assert [name for name, _ in tools.calls] == ["system_http_request"]
+    events = await service.list_agent_events(
+        "execution-budget", agent["agent_id"]
+    )
+    rejected_call = next(
+        item
+        for item in events
+        if item["event_type"] == "tool_call"
+        and item["payload"].get("tool_call_id") == "http-2"
+    )
+    assert rejected_call["payload"]["budget_admitted"] is False
+    await first_runner.close()
+    await resumed_runner.close()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_execution_report_skips_remaining_tool_calls(
+    tmp_path: Path,
+) -> None:
+    tools = _AtomicExecutionTools()
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "report-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "execution_report",
+                                        "arguments": "{}",
+                                    },
+                                },
+                                {
+                                    "id": "http-after-report",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "system_http_request",
+                                        "arguments": "{}",
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    run_root = tmp_path / "runs"
+    prompt = _execution_budget_prompt(max_http_requests=1)
+    service = StateService(
+        run_root / "terminal-report" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("terminal-report", model="test-model", prompt=prompt)
+    agent = await service.register_agent(
+        "terminal-report", role="chief", initial_prompt=prompt
+    )
+    store = await AgentStateStore.open(
+        service,
+        run_id="terminal-report",
+        agent_id=agent["agent_id"],
+        run_dir=run_root / "terminal-report",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    runner = AgentRunner(
+        _settings(),
+        ToolRegistry([tools]),
+        http_client=client,
+        run_root=run_root,
+        state_service=service,
+        agent_id=agent["agent_id"],
+        role="execution",
+        require_structured_report=True,
+    )
+    result = await runner.run_session(prompt, store=store)
+    assert result.structured_report_seen is True
+    assert result.final == "Execution Agent submitted terminal execution_report."
+    assert requests == 1
+    assert [name for name, _ in tools.calls] == ["execution_report"]
+    events = await service.list_agent_events("terminal-report", agent["agent_id"])
+    skipped = [
+        item for item in events if item["event_type"] == "terminal_tool_calls_skipped"
+    ]
+    assert skipped[0]["payload"] == {"skipped_count": 1}
+    assert all(
+        item["payload"].get("tool_call_id") != "http-after-report"
+        for item in events
+        if item["event_type"] == "tool_call"
+    )
     await runner.close()
     await client.aclose()
     await service.close()

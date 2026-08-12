@@ -33,6 +33,7 @@ from agent.state.schemas import (
     CapabilityContext,
     CreateCycleInput,
     FindingInput,
+    ExecutionTaskInput,
     StagnationExtensionInput,
     VerificationUpdateInput,
 )
@@ -41,6 +42,19 @@ from tools.http import HttpProbeManager, HttpTools
 from tools.network import NetworkDiscoveryManager, NetworkTools
 from tools.system import ShellTaskManager, SystemTools
 from tools.system.policy import WorkspacePolicy
+from scan.contracts import (
+    SCANNER_PROFILES,
+    extract_task_contract,
+    task_contract_json,
+    validate_profile_tools,
+    validate_task_budgets,
+)
+from scan.domain import COMPETITION_DOMAINS, assess_probe_reports, classify_challenge
+from scan.registry import (
+    build_first_round_tasks,
+    skill_for_domain,
+    skill_instructions_for_domain,
+)
 
 from .models import AgentRole, AgentStatusReport, ExecutionReport
 from .policy import AgentPolicy
@@ -56,6 +70,28 @@ if not LOGGER.handlers:
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
+
+DOMAIN_RECOGNITION_SIGNALS = {
+    "web": (
+        "Positive discriminators: traditional login, register, upload, download, "
+        "CRUD, CMS, admin, route, cookie, session, framework, or middleware evidence. "
+        "Treat messages/prompt/model request fields with choices/assistant/usage or "
+        "SSE responses as cross-domain AI evidence."
+    ),
+    "blockchain": (
+        "Positive discriminators: Solidity, ABI, contract address, bytecode, JSON-RPC, "
+        "wallet, nonce, gas, transaction, event, Foundry, or Hardhat evidence."
+    ),
+    "ai": (
+        "Positive discriminators: /chat, /completions, /generate, /v1/models, or /ask; "
+        "messages, prompt, input, system, model, temperature, max_tokens, or top_p request "
+        "fields; choices, role=assistant, content, usage, or SSE data: response shapes."
+    ),
+    "other": (
+        "Positive discriminators: ELF, PE, APK, firmware, pcap, memory dump, ciphertext, "
+        "binary, pwn, reverse, forensics, or cryptography artifact evidence."
+    ),
+}
 
 
 class SubagentError(RuntimeError):
@@ -854,6 +890,317 @@ class AgentSupervisor:
         )
         return self._ok(result)
 
+    async def create_domain_probes(self, caller_id: str) -> dict[str, Any]:
+        """Select one scanner profile or launch only low-cost domain probes."""
+
+        parent = await self._agent_record(caller_id, "challenge")
+        if parent["status"] in self.TERMINAL_AGENT_STATES:
+            return self._error(
+                "parent_not_running",
+                "The Challenge Agent is no longer active",
+                error_type="conflict",
+            )
+        unique_code = parent["unique_code"]
+        context = await self._service().get_challenge_context(
+            self._run_id(), unique_code, self._state_context(caller_id)
+        )
+        challenge = context["challenge"]
+        report_snapshot = await self._service().list_reports(
+            self._run_id(),
+            self._state_context(caller_id),
+            after_sequence=0,
+            wait_seconds=0,
+            max_reports=100,
+        )
+        hints = [
+            str(item.get("payload", {}).get("hint"))
+            for item in report_snapshot.get("reports") or []
+            if item.get("report_type") == "hint"
+            and isinstance(item.get("payload"), Mapping)
+            and item.get("payload", {}).get("hint")
+        ]
+        overview = await self._service().get_overview(self._run_id())
+        probe_agents = [
+            item
+            for item in overview["agents"]
+            if item["parent_id"] == caller_id
+            and item["kind"] == "domain_recognition"
+        ]
+        if probe_agents:
+            probe_reports: list[dict[str, Any]] = []
+            for item in probe_agents:
+                runtime = await self._service().get_agent_runtime(
+                    self._run_id(), item["agent_id"]
+                )
+                probe_reports.append(
+                    self._domain_probe_result(runtime["agent"])
+                )
+            combined = assess_probe_reports(probe_reports)
+            result = combined.as_dict()
+            result["source"] = "domain_probe_reports"
+            result["probes"] = [
+                {
+                    "agent_id": item["agent_id"],
+                    "task_key": item["task_key"],
+                    "status": item["status"],
+                }
+                for item in probe_agents
+            ]
+            if combined.decision == "direct" and combined.domain is not None:
+                selected_skill = skill_for_domain(combined.domain)
+                observation = await self._service().record_observation(
+                    self._run_id(),
+                    unique_code,
+                    category="domain_triage",
+                    summary=f"Challenge domain classified as {combined.domain}",
+                    detail={
+                        "domain": combined.domain,
+                        "subdomain": combined.subdomain,
+                        "confidence": combined.confidence,
+                        "scanner_profile": combined.scanner_profile,
+                        "skill_id": selected_skill.manifest.id,
+                        "source": "domain_probe_reports",
+                        "evidence_refs": list(combined.evidence_refs),
+                    },
+                    source="challenge_domain_triage",
+                    source_ref=caller_id,
+                    confidence=combined.confidence,
+                    mark_progress=False,
+                    route_branches=False,
+                )
+                result["evidence_refs"] = [
+                    f"observation:{observation['observation_id']}",
+                    *combined.evidence_refs,
+                ]
+                result["skill_id"] = selected_skill.manifest.id
+                result["skill_instructions"] = skill_instructions_for_domain(
+                    combined.domain
+                )
+                result["first_round_tasks"] = build_first_round_tasks(
+                    combined.domain,
+                    unique_code=unique_code,
+                    target_scope=list(challenge.get("container_addr") or [])
+                    or [f"challenge-metadata:{unique_code}"],
+                    description=str(challenge.get("description") or ""),
+                    evidence_refs=result["evidence_refs"],
+                    observations=context.get("observations") or [],
+                )
+            return self._ok(result)
+
+        assessment = classify_challenge(
+            challenge,
+            hints=hints,
+            observations=context.get("observations") or [],
+        )
+        if assessment.decision == "direct" and assessment.domain is not None:
+            selected_skill = skill_for_domain(assessment.domain)
+            observation = await self._service().record_observation(
+                self._run_id(),
+                unique_code,
+                category="domain_triage",
+                summary=f"Challenge domain classified as {assessment.domain}",
+                detail={
+                    "domain": assessment.domain,
+                    "subdomain": assessment.subdomain,
+                    "confidence": assessment.confidence,
+                    "scanner_profile": assessment.scanner_profile,
+                    "skill_id": selected_skill.manifest.id,
+                    "scores": assessment.scores,
+                    "signals": list(assessment.evidence),
+                    "source": "challenge_metadata",
+                },
+                source="challenge_domain_triage",
+                source_ref=caller_id,
+                confidence=assessment.confidence,
+                mark_progress=False,
+                route_branches=False,
+            )
+            result = assessment.as_dict()
+            result.update(
+                {
+                    "source": "challenge_metadata",
+                    "evidence_refs": [
+                        f"observation:{observation['observation_id']}"
+                    ],
+                }
+            )
+            result["skill_id"] = selected_skill.manifest.id
+            result["skill_instructions"] = skill_instructions_for_domain(
+                assessment.domain
+            )
+            result["first_round_tasks"] = build_first_round_tasks(
+                assessment.domain,
+                unique_code=unique_code,
+                target_scope=list(challenge.get("container_addr") or [])
+                or [f"challenge-metadata:{unique_code}"],
+                description=str(challenge.get("description") or ""),
+                evidence_refs=result["evidence_refs"],
+                observations=context.get("observations") or [],
+            )
+            return self._ok(result)
+
+        metadata = {
+            "unique_code": challenge.get("unique_code"),
+            "description": challenge.get("description"),
+            "difficulty": challenge.get("difficulty"),
+            "level": challenge.get("level"),
+            "target_addresses": challenge.get("container_addr") or [],
+            "initial_scores": assessment.scores,
+            "initial_signals": list(assessment.evidence),
+            "hints": hints,
+        }
+        target_scope = list(challenge.get("container_addr") or []) or [
+            f"challenge-metadata:{unique_code}"
+        ]
+        probe_tools = [
+            "execution_get_assignment",
+            "system_http_request",
+            "system_http_analyze",
+            "system_http_output",
+            "system_http_response",
+            "execution_report",
+        ]
+        probes: list[dict[str, Any]] = []
+        for domain in COMPETITION_DOMAINS:
+            mission = (
+                f"Answer only whether this challenge belongs to the {domain} domain. "
+                f"{DOMAIN_RECOGNITION_SIGNALS[domain]} "
+                "Use the supplied metadata first. If an HTTP target is available, make at "
+                "most one low-cost request only when metadata is insufficient. Do not run "
+                "path discovery, network discovery, bulk probing, exploitation, or Flag work. "
+                "Report one candidate finding whose detail is exactly structured with domain, "
+                "is_match, confidence, and signals. For the other domain, also return subdomain "
+                "as binary, pwn, reverse, forensics, cryptography, or null. Challenge metadata: "
+                f"{json.dumps(metadata, ensure_ascii=False)}"
+            )
+            created = await self.create_execution_agent(
+                caller_id,
+                mission,
+                120,
+                hypothesis_key=f"domain-recognition:{domain}",
+                task_key=f"domain-recognition:{domain}:1",
+                kind="domain_recognition",
+                task_phase="domain_recognition",
+                entry_point=target_scope[0],
+                capability_class="domain_recognition",
+                verification_question=f"该题是否属于 {domain} 方向？",
+                priority=100,
+                target_scope=target_scope,
+                tool_names=probe_tools,
+                success_criteria=[
+                    f"return a yes or no decision for only the {domain} domain",
+                    "return confidence between 0 and 1 with concrete matched signals",
+                ],
+                failure_criteria=[
+                    "available metadata and one optional request contain no discriminating signal"
+                ],
+                evidence_requirements=[
+                    "cite the exact title, description, target, header, or response clue used"
+                ],
+                stop_conditions=[
+                    "the domain decision and confidence are ready",
+                    "one HTTP interaction has completed",
+                    "120 seconds have elapsed",
+                ],
+                depends_on=[],
+                scanner_profile="domain_recognition",
+                cost_class="low",
+                context_refs=[],
+                branch_key=f"domain:recognition:{domain}",
+                max_http_requests=1,
+                max_shell_tasks=0,
+                max_network_tasks=0,
+            )
+            probes.append(
+                {
+                    "domain": domain,
+                    "ok": created.get("ok") is True,
+                    **(
+                        dict(created.get("data") or {})
+                        if isinstance(created.get("data"), Mapping)
+                        else {"error": created.get("error")}
+                    ),
+                }
+            )
+        return self._ok(
+            {
+                **assessment.as_dict(),
+                "decision": "probe",
+                "source": "challenge_metadata",
+                "cost_class": "low",
+                "probes": probes,
+            }
+        )
+
+    async def _execution_dependency_error(
+        self, unique_code: str, depends_on: list[str]
+    ) -> dict[str, Any] | None:
+        if not depends_on:
+            return None
+        challenge = await self._service().get_challenge_context(
+            self._run_id(), unique_code
+        )
+        ledger = {
+            item.get("task_key"): item
+            for item in challenge.get("task_ledger") or []
+            if item.get("task_key")
+        }
+        missing = sorted(key for key in depends_on if key not in ledger)
+        if missing:
+            return self._error(
+                "task_dependency_unknown",
+                "The execution task references an unknown dependency",
+                detail={"task_keys": missing},
+            )
+        pending = sorted(
+            key
+            for key in depends_on
+            if not ledger[key].get("terminal_report_id")
+        )
+        if pending:
+            return self._error(
+                "task_dependency_not_ready",
+                "The previous atomic task batch has not reported yet",
+                error_type="conflict",
+                detail={"task_keys": pending},
+            )
+        return None
+
+    async def _scanner_profile_selection_error(
+        self, unique_code: str, scanner_profile: str
+    ) -> dict[str, Any] | None:
+        context = await self._service().get_challenge_context(
+            self._run_id(), unique_code
+        )
+        selected_profile: str | None = None
+        for cycle in context.get("recent_cycles") or []:
+            analysis = cycle.get("analysis")
+            if isinstance(analysis, Mapping) and analysis.get("scanner_profile"):
+                selected_profile = str(analysis["scanner_profile"])
+                break
+        if selected_profile is None:
+            for observation in context.get("observations") or []:
+                if observation.get("category") != "domain_triage":
+                    continue
+                detail = observation.get("detail")
+                if isinstance(detail, Mapping) and detail.get("scanner_profile"):
+                    selected_profile = str(detail["scanner_profile"])
+                    break
+        if selected_profile is None:
+            return self._error(
+                "domain_triage_required",
+                "Identify the challenge domain before creating a normal execution task",
+                error_type="conflict",
+            )
+        if scanner_profile != selected_profile:
+            return self._error(
+                "scanner_profile_mismatch",
+                "The execution task scanner profile does not match the identified domain",
+                error_type="conflict",
+                detail={"expected_scanner_profile": selected_profile},
+            )
+        return None
+
     async def create_execution_agent(
         self,
         caller_id: str,
@@ -864,10 +1211,26 @@ class AgentSupervisor:
         task_key: str,
         cycle_id: str | None = None,
         kind: str = "general",
+        task_phase: str | None = None,
+        entry_point: str | None = None,
+        capability_class: str | None = None,
+        verification_question: str | None = None,
         priority: int = 50,
+        target_scope: list[str] | None = None,
+        tool_names: list[str] | None = None,
         success_criteria: list[str] | None = None,
+        failure_criteria: list[str] | None = None,
+        evidence_requirements: list[str] | None = None,
+        stop_conditions: list[str] | None = None,
+        depends_on: list[str] | None = None,
+        scanner_profile: str | None = None,
+        cost_class: str = "low",
         context_refs: list[str] | None = None,
         branch_key: str | None = None,
+        max_http_requests: int | None = None,
+        max_shell_tasks: int | None = None,
+        max_network_tasks: int | None = None,
+        require_domain_selection: bool = False,
     ) -> dict[str, Any]:
         parent = await self._agent_record(caller_id, "challenge")
         if parent["status"] in self.TERMINAL_AGENT_STATES:
@@ -879,6 +1242,91 @@ class AgentSupervisor:
         timeout = timeout_seconds or self.default_execution_timeout
         agent_id = f"execution_{uuid4().hex}"
         challenge = await self._challenge_record(parent["unique_code"])
+        addresses = list(challenge.get("container_addr") or [])
+        resolved_profile = scanner_profile or (
+            "web_light" if kind == "web" else "other_light"
+        )
+        if resolved_profile not in SCANNER_PROFILES:
+            return self._error(
+                "invalid_scanner_profile",
+                "The execution task scanner profile is unknown",
+            )
+        if require_domain_selection and kind != "domain_recognition":
+            selection_error = await self._scanner_profile_selection_error(
+                parent["unique_code"], resolved_profile
+            )
+            if selection_error is not None:
+                return selection_error
+        resolved_scope = list(target_scope or addresses or [parent["unique_code"]])
+        resolved_tools = list(
+            tool_names
+            or (
+                "execution_get_assignment",
+                "execution_update_progress",
+                "execution_report",
+            )
+        )
+        resolved_phase = task_phase or {
+            "domain_recognition": "domain_recognition",
+            "recon": "reconnaissance",
+            "web": "reconnaissance",
+            "verification": "validation",
+            "exploit": "exploitation",
+        }.get(kind, "reconnaissance")
+        resolved_entry_point = entry_point or resolved_scope[0]
+        resolved_capability = capability_class or kind
+        resolved_question = verification_question or (
+            f"Does {resolved_entry_point} satisfy hypothesis {hypothesis_key}?"
+        )
+        resolved_http_budget = (
+            max_http_requests
+            if max_http_requests is not None
+            else (1 if resolved_tools and any(name.startswith("system_http_") or name.startswith("system_web_") for name in resolved_tools) else 0)
+        )
+        resolved_shell_budget = (
+            max_shell_tasks
+            if max_shell_tasks is not None
+            else (1 if "system_shell" in resolved_tools else 0)
+        )
+        resolved_network_budget = (
+            max_network_tasks
+            if max_network_tasks is not None
+            else (1 if "system_network_discovery" in resolved_tools else 0)
+        )
+        try:
+            validate_profile_tools(resolved_profile, resolved_tools)
+            validate_task_budgets(
+                resolved_tools,
+                max_http_requests=resolved_http_budget,
+                max_shell_tasks=resolved_shell_budget,
+                max_network_tasks=resolved_network_budget,
+            )
+        except ValueError as exc:
+            return self._error("invalid_task_tools", str(exc))
+        resolved_success = list(
+            success_criteria or ["the single assigned hypothesis is answered"]
+        )
+        resolved_failure = list(
+            failure_criteria or ["the hypothesis cannot be answered with the assigned tools"]
+        )
+        resolved_evidence = list(
+            evidence_requirements or ["report the concrete output that supports the conclusion"]
+        )
+        resolved_stop = list(
+            stop_conditions
+            or [
+                "a success criterion is met",
+                "a failure criterion is met",
+                "the task timeout is reached",
+            ]
+        )
+        resolved_dependencies = list(depends_on or [])
+        resolved_branch_key = branch_key or f"{hypothesis_key}:{kind}"
+        dependency_error = await self._execution_dependency_error(
+            parent["unique_code"], resolved_dependencies
+        )
+        if dependency_error is not None:
+            return dependency_error
         if challenge["stagnation_level"] >= 2 or challenge.get("work_status") in {"paused", "extended"}:
             return self._error(
                 "challenge_paused",
@@ -927,10 +1375,37 @@ class AgentSupervisor:
                     exc.message,
                     error_type="conflict",
                 )
-        prompt = self._execution_prompt(
-            mission,
-            challenge.get("container_addr") or [],
-        )
+        task_contract = {
+            "task_key": task_key,
+            "hypothesis_key": hypothesis_key,
+            "branch_key": resolved_branch_key,
+            "kind": kind,
+            "task_phase": resolved_phase,
+            "entry_point": resolved_entry_point,
+            "capability_class": resolved_capability,
+            "verification_question": resolved_question,
+            "objective": mission,
+            "target_scope": resolved_scope,
+            "tool_names": resolved_tools,
+            "priority": priority,
+            "success_criteria": resolved_success,
+            "failure_criteria": resolved_failure,
+            "evidence_requirements": resolved_evidence,
+            "stop_conditions": resolved_stop,
+            "depends_on": resolved_dependencies,
+            "scanner_profile": resolved_profile,
+            "cost_class": cost_class,
+            "context_refs": list(context_refs or []),
+            "max_http_requests": resolved_http_budget,
+            "max_shell_tasks": resolved_shell_budget,
+            "max_network_tasks": resolved_network_budget,
+            "timeout_seconds": timeout,
+        }
+        try:
+            ExecutionTaskInput.model_validate(task_contract)
+        except ValueError as exc:
+            return self._error("invalid_atomic_task", str(exc))
+        prompt = self._execution_prompt(task_contract, addresses)
         record = await self._service().register_agent(
             self._run_id(),
             agent_id=agent_id,
@@ -942,11 +1417,11 @@ class AgentSupervisor:
             priority=priority,
             mission=mission,
             initial_prompt=prompt,
-            success_criteria=success_criteria or [],
+            success_criteria=resolved_success,
             context_refs=context_refs or [],
             hypothesis_key=hypothesis_key,
             task_key=task_key,
-            branch_key=branch_key,
+            branch_key=resolved_branch_key,
             timeout_seconds=timeout,
         )
         if record.get("duplicate"):
@@ -1702,9 +2177,26 @@ class AgentSupervisor:
                     self, agent_id=agent_id, unique_code=agent["unique_code"]
                 ),
             ]
+        task_contract = extract_task_contract(prompt) if role == "execution" else None
+        policy = AgentPolicy(
+            role,
+            execution_kind=agent.get("kind"),
+            requested_tools=(
+                task_contract.get("tool_names")
+                if isinstance(task_contract, Mapping)
+                and isinstance(task_contract.get("tool_names"), list)
+                else None
+            ),
+            scanner_profile=(
+                str(task_contract.get("scanner_profile"))
+                if isinstance(task_contract, Mapping)
+                and task_contract.get("scanner_profile")
+                else None
+            ),
+        )
         runner = self.runner_factory(
             self.settings,
-            ToolRegistry(wrappers, allowed_tools=AgentPolicy(role).allowed_tools),
+            ToolRegistry(wrappers, allowed_tools=policy.allowed_tools),
             max_rounds=200 if role == "execution" else 1_000,
             run_root=self.run_root,
             role=role,
@@ -2413,6 +2905,71 @@ class AgentSupervisor:
         }
 
     @staticmethod
+    def _domain_probe_result(agent: Mapping[str, Any]) -> dict[str, Any]:
+        hypothesis = str(agent.get("hypothesis_key") or "")
+        domain = hypothesis.rsplit(":", 1)[-1].lower()
+        if domain not in {"web", "blockchain", "ai", "binary", "other"}:
+            domain = "other"
+        final_report = (
+            agent.get("final_report")
+            if isinstance(agent.get("final_report"), Mapping)
+            else {}
+        )
+        is_match: bool | None = None
+        confidence: Any = final_report.get("confidence", 0.0)
+        signals: list[str] = []
+        for finding in final_report.get("findings") or []:
+            if not isinstance(finding, Mapping):
+                continue
+            detail = finding.get("detail")
+            if not isinstance(detail, Mapping):
+                continue
+            finding_domain = str(detail.get("domain") or domain).lower()
+            if finding_domain != domain:
+                continue
+            raw_match = detail.get("is_match", detail.get("matches"))
+            if isinstance(raw_match, bool):
+                is_match = raw_match
+            confidence = detail.get(
+                "confidence", finding.get("confidence", confidence)
+            )
+            signals = [str(value) for value in detail.get("signals") or []]
+            break
+        if is_match is None:
+            summary = str(final_report.get("summary") or "").lower()
+            positive_markers = (
+                "domain_match=true",
+                "is_match=true",
+                "is_match: true",
+                f"{domain}: yes",
+            )
+            negative_markers = (
+                "domain_match=false",
+                "is_match=false",
+                "is_match: false",
+                f"{domain}: no",
+            )
+            if any(marker in summary for marker in positive_markers):
+                is_match = True
+            elif any(marker in summary for marker in negative_markers):
+                is_match = False
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        report_id = final_report.get("report_id") or agent.get(
+            "terminal_report_id"
+        )
+        return {
+            "domain": domain,
+            "is_match": is_match,
+            "confidence": max(0.0, min(1.0, confidence_value)),
+            "signals": signals,
+            "status": agent.get("status") or "pending",
+            "evidence_ref": f"report:{report_id}" if report_id else None,
+        }
+
+    @staticmethod
     def _finding_input(value: str | dict[str, Any], confidence: float | None) -> FindingInput:
         if isinstance(value, str):
             return FindingInput(
@@ -2453,7 +3010,7 @@ class AgentSupervisor:
         start_data = start_result.get("data") if isinstance(start_result.get("data"), Mapping) else {}
         data = {
             "unique_code": challenge.get("unique_code"),
-            "name": challenge.get("name"),
+            "name": challenge.get("name") or challenge.get("unique_code"),
             "description": str(challenge.get("description") or "")[:4_000],
             "difficulty": challenge.get("difficulty"),
             "level": challenge.get("level"),
@@ -2465,10 +3022,13 @@ class AgentSupervisor:
         )
 
     @staticmethod
-    def _execution_prompt(mission: str, addresses: list[str]) -> str:
+    def _execution_prompt(
+        task_contract: Mapping[str, Any], addresses: list[str]
+    ) -> str:
         return render_prompt(
             "execution_agent.txt",
-            mission=mission[:4_000],
+            mission=str(task_contract.get("objective") or "")[:4_000],
+            task_contract=task_contract_json(task_contract),
             target_addresses=json.dumps(addresses),
         )
 

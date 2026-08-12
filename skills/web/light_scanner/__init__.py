@@ -1,0 +1,1 @@
+"""Web lightweight scanner Skill."""

@@ -1,0 +1,52 @@
+id: ai.light_scanner
+name: AI Light Scanner
+version: "1.0.0"
+category:
+  - ai
+stage:
+  - reconnaissance
+description: Build one low-cost, atomic first-round AI model, RAG, embedding, prompt, or inference API surface task after the challenge domain is identified as AI.
+risk_level: low
+trigger:
+  keywords:
+    - ai
+    - llm
+    - rag
+    - embedding
+    - system prompt
+    - inference
+    - model endpoint
+  evidence:
+    - request_response
+    - execution_trace
+requires:
+  tools:
+    - execution_get_assignment
+    - system_read_file
+    - system_glob
+    - system_grep
+    - system_http_request
+    - system_http_output
+    - system_http_analyze
+    - system_http_response
+    - execution_report
+  permissions:
+    - execution
+workflow:
+  - inspect_metadata
+  - plan_independent_tasks
+  - inspect_ai_surface
+  - request_one_api_entry
+  - report
+outputs:
+  findings:
+    - AI_LIGHT_SURFACE
+  evidence:
+    - request_response
+    - execution_trace
+  credentials:
+    optional: false
+tags:
+  - ai
+  - light_scanner
+  - first_round

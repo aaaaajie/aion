@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from scan.contracts import EXECUTION_CONTROL_TOOLS, SCANNER_PROFILES
+
 from .models import AgentRole
 
 
@@ -26,6 +28,7 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
             "challenge_begin_cycle",
             "challenge_submit_analysis_plan",
             "challenge_commit_cycle",
+            "challenge_create_domain_probes",
             "challenge_create_execution_agent",
             "challenge_get_execution_reports",
             "challenge_get_updates",
@@ -73,11 +76,34 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
 class AgentPolicy:
     """Immutable allow-list; prompts and model arguments cannot extend it."""
 
-    def __init__(self, role: AgentRole) -> None:
+    def __init__(
+        self,
+        role: AgentRole,
+        *,
+        execution_kind: str | None = None,
+        requested_tools: Iterable[str] | None = None,
+        scanner_profile: str | None = None,
+    ) -> None:
         if role not in ROLE_TOOL_NAMES:
             raise ValueError("unknown Agent role")
         self.role = role
-        self.allowed_tools = ROLE_TOOL_NAMES[role]
+        allowed_tools = ROLE_TOOL_NAMES[role]
+        if role == "execution":
+            if execution_kind == "domain_recognition":
+                allowed_tools = SCANNER_PROFILES["domain_recognition"].allowed_tools
+            elif requested_tools is not None:
+                requested = set(requested_tools) | set(EXECUTION_CONTROL_TOOLS)
+                if scanner_profile in SCANNER_PROFILES:
+                    requested.intersection_update(
+                        SCANNER_PROFILES[scanner_profile].allowed_tools
+                    )
+                allowed_tools = frozenset(requested) & ROLE_TOOL_NAMES["execution"]
+            elif scanner_profile in SCANNER_PROFILES:
+                allowed_tools = (
+                    SCANNER_PROFILES[scanner_profile].allowed_tools
+                    & ROLE_TOOL_NAMES["execution"]
+                )
+        self.allowed_tools = frozenset(allowed_tools)
 
     def allows(self, tool_name: str) -> bool:
         return tool_name in self.allowed_tools

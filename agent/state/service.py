@@ -16,6 +16,8 @@ from sqlalchemy import delete, func, select, update
 
 from agent.memory.models import AgentNode, Checkpoint, TargetState
 from agent.memory.redaction import redact_value
+from agent.prompts import render_prompt
+from scan.contracts import extract_task_contract, task_contract_json
 from .capabilities import fingerprint_secret
 from .clock import active_seconds, aware, utc_now
 from .database import StateDatabase
@@ -466,6 +468,9 @@ class StateService:
                         "mission": item.mission,
                         "status": item.status,
                         "context_refs": item.context_refs,
+                        "task_contract": extract_task_contract(
+                            item.initial_prompt
+                        ),
                         "terminal_report_id": item.terminal_report_id,
                         "report_summary": (
                             item.final_report.get("summary")
@@ -777,6 +782,7 @@ class StateService:
             return {
                 "agent": self._agent_dict(agent),
                 "challenge": await self.get_challenge_context(run_id, agent.unique_code, context) if agent.unique_code else None,
+                "task_contract": extract_task_contract(agent.initial_prompt),
             }
 
     async def run_exists(self, run_id: str) -> bool:
@@ -2187,6 +2193,147 @@ class StateService:
                 )
         return self._cycle_dict(cycle)
 
+    async def _validate_domain_plan(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        payload: AnalysisPlanInput,
+    ) -> None:
+        active_probe = await session.scalar(
+            select(AgentRecord).where(
+                AgentRecord.run_id == run_id,
+                AgentRecord.unique_code == unique_code,
+                AgentRecord.kind == "domain_recognition",
+                AgentRecord.status.in_(
+                    ["pending", "queued", "starting", "running", "working"]
+                ),
+            )
+        )
+        if active_probe is not None:
+            raise StateConflict(
+                "domain_triage_pending",
+                "Domain-recognition tasks must report before an analysis plan is accepted",
+                {"agent_id": active_probe.agent_id},
+            )
+
+        valid_refs: list[str] = []
+        asserted_domains: set[str] = set()
+        for reference in payload.domain_evidence_refs:
+            kind, separator, identifier = reference.partition(":")
+            if not separator or not identifier:
+                continue
+            if kind == "observation":
+                row = await session.get(ObservationRecord, identifier)
+                if (
+                    row is None
+                    or row.run_id != run_id
+                    or row.unique_code != unique_code
+                    or row.category != "domain_triage"
+                ):
+                    continue
+                valid_refs.append(reference)
+                detail = row.detail if isinstance(row.detail, Mapping) else {}
+                asserted = str(detail.get("domain") or "").lower()
+                if asserted in {"web", "blockchain", "ai", "binary", "other"}:
+                    asserted_domains.add(asserted)
+            elif kind == "report":
+                row = await session.get(ReportRecord, identifier)
+                source_agent = (
+                    await session.get(AgentRecord, row.agent_id)
+                    if row is not None
+                    else None
+                )
+                if (
+                    row is None
+                    or row.run_id != run_id
+                    or row.unique_code != unique_code
+                    or source_agent is None
+                    or source_agent.kind != "domain_recognition"
+                ):
+                    continue
+                valid_refs.append(reference)
+                report_payload = row.payload if isinstance(row.payload, Mapping) else {}
+                for finding in report_payload.get("findings") or []:
+                    if not isinstance(finding, Mapping):
+                        continue
+                    detail = finding.get("detail")
+                    if not isinstance(detail, Mapping):
+                        continue
+                    if detail.get("is_match") is not True:
+                        continue
+                    asserted = str(detail.get("domain") or "").lower()
+                    try:
+                        confidence = float(
+                            detail.get("confidence", finding.get("confidence", 0.0))
+                        )
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    if (
+                        asserted in {"web", "blockchain", "ai", "binary", "other"}
+                        and confidence >= 0.7
+                    ):
+                        asserted_domains.add(asserted)
+        if not valid_refs:
+            raise StateConflict(
+                "domain_evidence_required",
+                "The analysis plan must cite a domain-triage observation or domain-recognition report",
+            )
+        if asserted_domains and payload.domain not in asserted_domains:
+            raise StateConflict(
+                "domain_evidence_mismatch",
+                "The selected domain conflicts with high-confidence domain evidence",
+                {"asserted_domains": sorted(asserted_domains)},
+            )
+
+    async def _validate_plan_dependencies(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        tasks: list[Any],
+    ) -> None:
+        current_keys = {task.task_key for task in tasks}
+        for task in tasks:
+            for dependency in task.depends_on:
+                if dependency in current_keys:
+                    raise StateConflict(
+                        "task_dependency_not_ready",
+                        "Only the currently-ready atomic task batch may be dispatched",
+                        {
+                            "task_key": task.task_key,
+                            "dependency": dependency,
+                        },
+                    )
+                prior = await session.scalar(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.task_key == dependency,
+                    )
+                )
+                if prior is None:
+                    raise StateConflict(
+                        "task_dependency_unknown",
+                        "An atomic task references an unknown dependency",
+                        {
+                            "task_key": task.task_key,
+                            "dependency": dependency,
+                        },
+                    )
+                if prior.terminal_report_id is None:
+                    raise StateConflict(
+                        "task_dependency_not_ready",
+                        "The previous atomic task has not produced a terminal report",
+                        {
+                            "task_key": task.task_key,
+                            "dependency": dependency,
+                            "agent_id": prior.agent_id,
+                        },
+                    )
+
     async def submit_analysis_plan(self, run_id: str, cycle_id: str, context: CapabilityContext, payload: AnalysisPlanInput) -> dict[str, Any]:
         async with self._lock:
             async with self.db.sessions.begin() as session:
@@ -2195,22 +2342,46 @@ class StateService:
                 self._check_version(cycle.version, payload.expected_version)
                 if cycle.status not in {"state", "analysis"}:
                     raise StateConflict("invalid_cycle_phase", "cycle is not accepting analysis and plan")
+                challenge = await self._require_challenge(
+                    session, run_id, cycle.unique_code
+                )
+                await self._validate_domain_plan(
+                    session,
+                    run_id=run_id,
+                    unique_code=cycle.unique_code,
+                    payload=payload,
+                )
+                await self._validate_plan_dependencies(
+                    session,
+                    run_id=run_id,
+                    unique_code=cycle.unique_code,
+                    tasks=payload.tasks,
+                )
                 cycle.analysis = {
                     "summary": payload.analysis_summary,
+                    "domain": payload.domain,
+                    "domain_confidence": payload.domain_confidence,
+                    "domain_evidence_refs": payload.domain_evidence_refs,
+                    "scanner_profile": payload.scanner_profile,
                     "hypotheses": [
                         item.model_dump(mode="json") for item in payload.hypotheses
                     ],
                     "information_gaps": payload.information_gaps,
                     "avoid_repeating": payload.avoid_repeating,
                 }
-                cycle.plan = {"tasks": [item.model_dump(mode="json") for item in payload.tasks]}
+                cycle.plan = {
+                    "domain": payload.domain,
+                    "scanner_profile": payload.scanner_profile,
+                    "tasks": [
+                        item.model_dump(mode="json") for item in payload.tasks
+                    ],
+                }
                 cycle.status = "execute"
                 cycle.analysis_at = self.clock()
                 cycle.plan_at = self.clock()
                 cycle.execute_at = self.clock()
                 cycle.version += 1
                 admissions: list[dict[str, Any]] = []
-                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
                 tasks = list(payload.tasks)
                 if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
                     if tasks:
@@ -2311,7 +2482,20 @@ class StateService:
                         branch_key=branch_key,
                         mission=task.objective, success_criteria=task.success_criteria,
                         context_refs=task.context_refs, timeout_seconds=task.timeout_seconds,
-                        initial_prompt=task.objective,
+                        initial_prompt=render_prompt(
+                            "execution_agent.txt",
+                            mission=task.objective[:4_000],
+                            task_contract=task_contract_json(
+                                {
+                                    **task.model_dump(mode="json"),
+                                    "branch_key": branch_key,
+                                }
+                            ),
+                            target_addresses=json.dumps(
+                                challenge.container_addr or task.target_scope,
+                                ensure_ascii=False,
+                            ),
+                        ),
                         session_memory=DEFAULT_SESSION_MEMORY,
                         status="queued",
                     )
@@ -2457,9 +2641,16 @@ class StateService:
                     else item.model_copy(update={"evidence_paths": payload.evidence_paths})
                     for item in payload.findings
                 ]
+                if agent.kind == "domain_recognition":
+                    finding_values = [
+                        item.model_copy(update={"verification_status": "candidate"})
+                        for item in finding_values
+                    ]
                 valid, findings = await self._record_findings(
                     session, run_id, agent.unique_code, agent_id, finding_values
                 )
+                if agent.kind == "domain_recognition":
+                    valid = False
                 if agent.unique_code and valid:
                     challenge = await self._require_challenge(session, run_id, agent.unique_code)
                     self._mark_progress(challenge)
@@ -2522,9 +2713,16 @@ class StateService:
                     else item.model_copy(update={"evidence_paths": payload.evidence_paths})
                     for item in payload.findings
                 ]
+                if agent.kind == "domain_recognition":
+                    finding_values = [
+                        item.model_copy(update={"verification_status": "candidate"})
+                        for item in finding_values
+                    ]
                 valid, findings = await self._record_findings(
                     session, run_id, agent.unique_code, agent_id, finding_values
                 )
+                if agent.kind == "domain_recognition":
+                    valid = False
                 if agent.unique_code and valid:
                     self._mark_progress(challenge)
                     await self._event(
@@ -2541,7 +2739,7 @@ class StateService:
                 safe_payload = {
                     "status": payload.status,
                     "summary": payload.summary,
-                    "findings": [item.model_dump(mode="json") for item in payload.findings],
+                    "findings": [item.model_dump(mode="json") for item in finding_values],
                     "evidence_paths": payload.evidence_paths,
                     "next_steps": payload.next_steps,
                     "confidence": payload.confidence,
@@ -2641,6 +2839,11 @@ class StateService:
                     else item.model_copy(update={"evidence_paths": payload.evidence_paths})
                     for item in payload.findings
                 ]
+                if agent.kind == "domain_recognition":
+                    finding_values = [
+                        item.model_copy(update={"verification_status": "candidate"})
+                        for item in finding_values
+                    ]
                 valid, findings = await self._record_findings(
                     session,
                     run_id,
@@ -2648,6 +2851,8 @@ class StateService:
                     agent_id,
                     finding_values,
                 )
+                if agent.kind == "domain_recognition":
+                    valid = False
                 if challenge is not None and valid:
                     self._mark_progress(challenge)
                     await self._event(
@@ -2665,7 +2870,7 @@ class StateService:
                     "status": payload.status,
                     "summary": payload.summary,
                     "findings": [
-                        item.model_dump(mode="json") for item in payload.findings
+                        item.model_dump(mode="json") for item in finding_values
                     ],
                     "evidence_paths": payload.evidence_paths,
                     "next_steps": payload.next_steps,
@@ -2758,7 +2963,11 @@ class StateService:
                                 hypothesis.status = "rejected"
                             hypothesis.updated_at = self.clock()
                             hypothesis.version += 1
-                    if resolved_status == "completed" and valid:
+                    if (
+                        agent.kind != "domain_recognition"
+                        and resolved_status == "completed"
+                        and valid
+                    ):
                         cancelled_branches = await self._cancel_sibling_branches(
                             session,
                             run_id,
@@ -4251,6 +4460,7 @@ class StateService:
         source_ref: str | None = None,
         confidence: float = 0.5,
         mark_progress: bool = True,
+        route_branches: bool = True,
     ) -> dict[str, Any]:
         """Persist one deduplicated Observation and route capability branches."""
 
@@ -4287,7 +4497,7 @@ class StateService:
                         },
                     )
                 branch_keys: list[str] = []
-                if created:
+                if created and route_branches:
                     routes = routes_for_observation(
                         {
                             "category": category,
@@ -4650,6 +4860,9 @@ class StateService:
     @staticmethod
     def _agent_dict(item: AgentRecord, *, include_runtime: bool = False) -> dict[str, Any]:
         data = {"agent_id": item.agent_id, "run_id": item.run_id, "parent_id": item.parent_id, "unique_code": item.unique_code, "cycle_id": item.cycle_id, "role": item.role, "kind": item.kind, "priority": item.priority, "mission": item.mission, "success_criteria": item.success_criteria, "context_refs": item.context_refs, "hypothesis_key": item.hypothesis_key, "task_key": item.task_key, "branch_key": item.branch_key, "terminal_report_id": item.terminal_report_id, "status": item.status, "timeout_seconds": item.timeout_seconds, "last_heartbeat_at": _json_value(item.last_heartbeat_at), "last_report_sequence": item.last_report_sequence, "report_cursor": item.report_cursor, "report_cursors": item.report_cursors, "controller_cursor": item.controller_cursor, "last_summarized_sequence": item.last_summarized_sequence, "started_at": _json_value(item.started_at), "ended_at": _json_value(item.ended_at), "stop_requested_at": _json_value(item.stop_requested_at), "updated_at": _json_value(item.updated_at), "version": item.version}
+        task_contract = extract_task_contract(item.initial_prompt)
+        if task_contract is not None:
+            data["task_contract"] = task_contract
         if include_runtime:
             data.update({"initial_prompt": item.initial_prompt, "session_memory": item.session_memory, "final_report": item.final_report})
         return data

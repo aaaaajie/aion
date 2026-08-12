@@ -52,8 +52,8 @@ from scripts.runtime_web import RuntimeMonitor
 # context. Add more dictionaries to test multiple challenge branches.
 CHALLENGES: list[dict[str, Any]] = [
     {
-        "name": "web",
-        "description": "ctf-web",
+        "name": "test",
+        "description": "ctf-test",
         "address": "http://www.dlhayashi.com/",
         "mission": (
             "Test the configured CTF address with the available tools. Do not "

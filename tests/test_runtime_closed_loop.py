@@ -161,6 +161,22 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
     created = await supervisor.create_challenge_agent(chief_id, "offline-1")
     assert created["ok"] is True
     challenge_id = created["data"]["agent_id"]
+    domain_observation = await supervisor.state_service.record_observation(
+        "closed-loop",
+        "offline-1",
+        category="domain_triage",
+        summary="Challenge domain classified as other",
+        detail={
+            "domain": "other",
+            "confidence": 0.95,
+            "scanner_profile": "other_light",
+        },
+        source="test_domain_triage",
+        confidence=0.95,
+        mark_progress=False,
+        route_branches=False,
+    )
+    domain_ref = f"observation:{domain_observation['observation_id']}"
     state = await supervisor.get_challenge_state(challenge_id)
     challenge_version = state["data"]["challenge"]["version"]
     cycle = await supervisor.begin_cycle(challenge_id, challenge_version)
@@ -169,6 +185,10 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
         cycle["data"]["version"],
         {
             "cycle_id": cycle["data"]["cycle_id"],
+            "domain": "other",
+            "domain_confidence": 0.95,
+            "domain_evidence_refs": [domain_ref],
+            "scanner_profile": "other_light",
             "analysis_summary": "exercise the local report path",
             "hypotheses": [],
             "information_gaps": [],
@@ -178,10 +198,29 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
                     "hypothesis_key": "local-file-roundtrip",
                     "task_key": "local-file-roundtrip-1",
                     "kind": "verification",
+                    "task_phase": "validation",
+                    "entry_point": "runtime-fixture.txt",
+                    "capability_class": "local_file_roundtrip",
+                    "verification_question": "Does the read content match the written content?",
                     "objective": "round-trip one local file and report it",
+                    "target_scope": ["runtime-fixture.txt"],
+                    "tool_names": [
+                        "system_write_file",
+                        "system_read_file",
+                        "execution_report",
+                    ],
                     "priority": 80,
                     "success_criteria": ["read content matches"],
+                    "failure_criteria": ["file write or read fails"],
+                    "evidence_requirements": ["report the read-back content result"],
+                    "stop_conditions": ["one write/read round-trip finishes"],
+                    "depends_on": [],
+                    "scanner_profile": "other_light",
+                    "cost_class": "low",
                     "context_refs": [],
+                    "max_http_requests": 0,
+                    "max_shell_tasks": 0,
+                    "max_network_tasks": 0,
                     "timeout_seconds": 30,
                 }
             ],
