@@ -14,12 +14,21 @@ from pydantic import ValidationError
 
 from agent.runner import ToolDispatchOutcome
 from agent.state.errors import StateError
+from agent.state.schemas import (
+    AttackPathInput,
+    CredentialInput,
+    ExecutionTaskInput,
+    FindingInput,
+    FindingResolutionInput,
+    HypothesisInput,
+)
 
 from .models import (
     AgentRole,
+    AnalysisPlanArguments,
     ChallengeStatusArguments,
+    CommitCycleArguments,
     CycleArguments,
-    CycleVersionArguments,
     CreateExecutionArguments,
     EmptyArguments,
     ExecutionReport,
@@ -58,6 +67,32 @@ _REPORT_QUERY_PROPERTIES = {
     "max_reports": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
 }
 
+_CHALLENGE_REFRESH_GATED_TOOLS = frozenset(
+    {
+        "challenge_begin_cycle",
+        "challenge_submit_analysis_plan",
+        "challenge_commit_cycle",
+        "challenge_create_execution_agent",
+        "challenge_wait_for_state",
+    }
+)
+
+
+def _model_schema(model: type[Any]) -> dict[str, Any]:
+    """Inline one canonical Pydantic model in an Agent tool schema."""
+
+    schema = deepcopy(model.model_json_schema())
+    schema.pop("title", None)
+    return schema
+
+
+_HYPOTHESIS_SCHEMA = _model_schema(HypothesisInput)
+_TASK_SCHEMA = _model_schema(ExecutionTaskInput)
+_FINDING_SCHEMA = _model_schema(FindingInput)
+_FINDING_RESOLUTION_SCHEMA = _model_schema(FindingResolutionInput)
+_CREDENTIAL_SCHEMA = _model_schema(CredentialInput)
+_ATTACK_PATH_SCHEMA = _model_schema(AttackPathInput)
+
 
 class AgentControlTools:
     """Base class for one fixed role's Agent-facing control surface."""
@@ -89,6 +124,12 @@ class AgentControlTools:
         route = self._ROUTES.get(name)
         if route is None:
             return self._error("unknown_tool", "Unknown Agent control tool")
+        if self.ROLE == "challenge" and name in _CHALLENGE_REFRESH_GATED_TOOLS:
+            refresh_error = self.supervisor.challenge_state_refresh_error(
+                self.agent_id, name
+            )
+            if refresh_error is not None:
+                return refresh_error
         if arguments is None:
             arguments = {}
         if not isinstance(arguments, Mapping):
@@ -97,7 +138,15 @@ class AgentControlTools:
         try:
             validated = argument_model.model_validate(arguments)
             method = getattr(self, method_name)
-            return await method(**validated.model_dump(mode="json"))
+            result = await method(**validated.model_dump(mode="json"))
+            if (
+                self.ROLE == "challenge"
+                and name == "challenge_get_state"
+                and isinstance(result, Mapping)
+                and result.get("ok") is True
+            ):
+                self.supervisor.clear_challenge_state_refresh_required(self.agent_id)
+            return self._decorate_conflict_result(name, result)
         except ValidationError as exc:
             return {
                 "ok": False,
@@ -110,6 +159,22 @@ class AgentControlTools:
                 },
             }
         except StateError as exc:
+            detail = dict(exc.detail)
+            if (
+                self.ROLE == "challenge"
+                and name in _CHALLENGE_REFRESH_GATED_TOOLS
+                and exc.status_code == 409
+            ):
+                self.supervisor.mark_challenge_state_refresh_required(
+                    self.agent_id, exc.code, exc.detail
+                )
+                detail.update(
+                    {
+                        "required_tool": "challenge_get_state",
+                        "retry_same_arguments": False,
+                        "original_conflict_code": exc.code,
+                    }
+                )
             return {
                 "ok": False,
                 "error": {
@@ -117,7 +182,7 @@ class AgentControlTools:
                     "code": exc.code,
                     "message": exc.message,
                     "status_code": exc.status_code,
-                    "detail": exc.detail,
+                    "detail": detail,
                 },
             }
         except Exception:
@@ -165,47 +230,14 @@ class AgentControlTools:
             self.agent_id, unique_code, reason, evidence_refs, note
         )
 
-    async def challenge_create_domain_probes(self) -> dict[str, Any]:
-        return await self.supervisor.create_domain_probes(self.agent_id)
-
-    async def challenge_create_execution_agent(
-        self,
-        mission: str,
-        hypothesis_key: str,
-        task_key: str,
-        task_phase: str,
-        entry_point: str,
-        capability_class: str,
-        verification_question: str,
-        target_scope: list[str],
-        tool_names: list[str],
-        success_criteria: list[str],
-        failure_criteria: list[str],
-        evidence_requirements: list[str],
-        stop_conditions: list[str],
-        scanner_profile: str,
-        cycle_id: str | None = None,
-        kind: str = "general",
-        priority: int = 50,
-        depends_on: list[str] | None = None,
-        cost_class: str = "low",
-        context_refs: list[str] | None = None,
-        branch_key: str | None = None,
-        max_http_requests: int = 0,
-        max_shell_tasks: int = 0,
-        max_network_tasks: int = 0,
-        timeout_seconds: int = 1_800,
-    ) -> dict[str, Any]:
+    async def challenge_create_execution_agent(self, mission: str, hypothesis_key: str, task_key: str, task_stage: str, cycle_id: str | None = None, kind: str = "general", priority: int = 50, success_criteria: list[str] | None = None, context_refs: list[str] | None = None, branch_key: str | None = None, timeout_seconds: int = 1_800) -> dict[str, Any]:
         return await self.supervisor.create_execution_agent(
             self.agent_id,
             mission,
             timeout_seconds,
             hypothesis_key=hypothesis_key,
             task_key=task_key,
-            task_phase=task_phase,
-            entry_point=entry_point,
-            capability_class=capability_class,
-            verification_question=verification_question,
+            task_stage=task_stage,
             cycle_id=cycle_id,
             kind=kind,
             priority=priority,
@@ -229,14 +261,89 @@ class AgentControlTools:
     async def challenge_get_state(self) -> dict[str, Any]:
         return await self.supervisor.get_challenge_state(self.agent_id)
 
+    def _decorate_conflict_result(
+        self,
+        name: str,
+        result: dict[str, Any] | ToolDispatchOutcome,
+    ) -> dict[str, Any] | ToolDispatchOutcome:
+        if self.ROLE != "challenge" or name not in _CHALLENGE_REFRESH_GATED_TOOLS:
+            return result
+        if isinstance(result, ToolDispatchOutcome) or not isinstance(result, Mapping):
+            return result
+        error = result.get("error")
+        if not isinstance(error, Mapping) or error.get("type") != "conflict":
+            return result
+        conflict_code = error.get("code")
+        if not isinstance(conflict_code, str):
+            return result
+        self.supervisor.mark_challenge_state_refresh_required(
+            self.agent_id,
+            conflict_code,
+            error.get("detail") if isinstance(error.get("detail"), Mapping) else {},
+        )
+        updated_error = dict(error)
+        updated_error["status_code"] = error.get("status_code") or 409
+        updated_detail = dict(
+            error.get("detail") if isinstance(error.get("detail"), Mapping) else {}
+        )
+        updated_detail.update(
+            {
+                "required_tool": "challenge_get_state",
+                "retry_same_arguments": False,
+                "original_conflict_code": conflict_code,
+            }
+        )
+        updated_error["detail"] = updated_detail
+        return {**result, "error": updated_error}
+
     async def challenge_begin_cycle(self, expected_challenge_version: int) -> dict[str, Any]:
         return await self.supervisor.begin_cycle(self.agent_id, expected_challenge_version)
 
-    async def challenge_submit_analysis_plan(self, cycle_id: str, expected_version: int, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self.supervisor.submit_analysis_plan(self.agent_id, expected_version, {"cycle_id": cycle_id, **payload})
+    async def challenge_submit_analysis_plan(
+        self,
+        cycle_id: str,
+        expected_version: int,
+        analysis_summary: str,
+        direction: str = "unknown",
+        hypotheses: list[dict[str, Any]] | None = None,
+        information_gaps: list[str] | None = None,
+        avoid_repeating: list[str] | None = None,
+        tasks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return await self.supervisor.submit_analysis_plan(
+            self.agent_id,
+            cycle_id,
+            expected_version,
+            analysis_summary=analysis_summary,
+            direction=direction,
+            hypotheses=hypotheses or [],
+            information_gaps=information_gaps or [],
+            avoid_repeating=avoid_repeating or [],
+            tasks=tasks or [],
+        )
 
-    async def challenge_commit_cycle(self, cycle_id: str, expected_version: int, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self.supervisor.commit_cycle(self.agent_id, expected_version, {"cycle_id": cycle_id, **payload})
+    async def challenge_commit_cycle(
+        self,
+        cycle_id: str,
+        expected_version: int,
+        summary: str,
+        outcome: str,
+        findings: list[dict[str, Any]] | None = None,
+        credentials: list[dict[str, Any]] | None = None,
+        next_steps: list[str] | None = None,
+        new_attack_paths: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return await self.supervisor.commit_cycle(
+            self.agent_id,
+            cycle_id,
+            expected_version,
+            summary=summary,
+            findings=findings or [],
+            credentials=credentials or [],
+            next_steps=next_steps or [],
+            new_attack_paths=new_attack_paths or [],
+            outcome=outcome,
+        )
 
     async def challenge_get_execution_reports(self, max_reports: int = 20) -> dict[str, Any]:
         return await self.supervisor.get_execution_reports(self.agent_id, 0.0, max_reports)
@@ -368,9 +475,8 @@ class ChallengeAgentTools(AgentControlTools):
     _ROUTES = {
         "challenge_get_state": (EmptyArguments, "challenge_get_state"),
         "challenge_begin_cycle": (CycleArguments, "challenge_begin_cycle"),
-        "challenge_submit_analysis_plan": (CycleVersionArguments, "challenge_submit_analysis_plan"),
-        "challenge_commit_cycle": (CycleVersionArguments, "challenge_commit_cycle"),
-        "challenge_create_domain_probes": (EmptyArguments, "challenge_create_domain_probes"),
+        "challenge_submit_analysis_plan": (AnalysisPlanArguments, "challenge_submit_analysis_plan"),
+        "challenge_commit_cycle": (CommitCycleArguments, "challenge_commit_cycle"),
         "challenge_create_execution_agent": (CreateExecutionArguments, "challenge_create_execution_agent"),
         "challenge_get_execution_reports": (ReportQueryArguments, "challenge_get_execution_reports"),
         "challenge_get_updates": (ReportQueryArguments, "challenge_get_updates"),
@@ -388,19 +494,14 @@ class ChallengeAgentTools(AgentControlTools):
         ),
         _definition(
             "challenge_create_execution_agent",
-            "Create one short-lived Agent for exactly one atomic experiment after domain recognition. Atomic fields, tool names, dependencies, and tool-call budgets are code-validated.",
+            "Create one atomic execution experiment. kind selects the technical capability; task_stage selects discovery, validation, or exploitation. Validation/exploitation requires a same-Challenge report/finding/observation reference. Warning permits parallel validation/exploitation but only one evidence-backed discovery pivot. A conflict requires challenge_get_state before retrying or waiting.",
             {
                 "mission": {"type": "string", "minLength": 1, "maxLength": 4000},
                 "hypothesis_key": {"type": "string", "minLength": 1, "maxLength": 128},
                 "task_key": {"type": "string", "minLength": 1, "maxLength": 128},
                 "cycle_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                "kind": {"type": "string", "enum": ["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration", "domain_recognition"], "default": "general"},
-                "task_phase": {"type": "string", "enum": ["domain_recognition", "reconnaissance", "validation", "exploitation", "flag_acquisition"]},
-                "entry_point": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "capability_class": {"type": "string", "minLength": 1, "maxLength": 128},
-                "verification_question": {"type": "string", "minLength": 1, "maxLength": 2000},
-                "target_scope": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 20},
-                "tool_names": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 20},
+                "kind": {"type": "string", "enum": ["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"], "default": "general"},
+                "task_stage": {"type": "string", "enum": ["discovery", "validation", "exploitation"]},
                 "priority": {"type": "integer", "minimum": 0, "maximum": 100, "default": 50},
                 "success_criteria": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 20},
                 "failure_criteria": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 20},
@@ -416,30 +517,40 @@ class ChallengeAgentTools(AgentControlTools):
                 "max_network_tasks": {"type": "integer", "minimum": 0, "maximum": 20},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 1800},
             },
-            [
-                "mission",
-                "hypothesis_key",
-                "task_key",
-                "task_phase",
-                "entry_point",
-                "capability_class",
-                "verification_question",
-                "target_scope",
-                "tool_names",
-                "success_criteria",
-                "failure_criteria",
-                "evidence_requirements",
-                "stop_conditions",
-                "scanner_profile",
-                "max_http_requests",
-                "max_shell_tasks",
-                "max_network_tasks",
-            ],
+            ["mission", "hypothesis_key", "task_key", "task_stage"],
         ),
-        _definition("challenge_get_state", "Read the bound challenge's authoritative state, findings, and permitted credentials.", {}, []),
-        _definition("challenge_begin_cycle", "Freeze a STATE snapshot and begin a structured cycle.", {"expected_challenge_version": {"type": "integer", "minimum": 1}}, ["expected_challenge_version"]),
-        _definition("challenge_submit_analysis_plan", "Submit the identified domain, scanner profile, structured analysis, and only the currently-ready batch of atomic tasks.", {"cycle_id": {"type": "string", "minLength": 1}, "expected_version": {"type": "integer", "minimum": 1}, "payload": {"type": "object"}}, ["cycle_id", "expected_version", "payload"]),
-        _definition("challenge_commit_cycle", "Commit structured verification and update state atomically.", {"cycle_id": {"type": "string", "minLength": 1}, "expected_version": {"type": "integer", "minimum": 1}, "payload": {"type": "object"}}, ["cycle_id", "expected_version", "payload"]),
+        _definition("challenge_get_state", "Read the bound challenge's authoritative state, findings, cycle ledger, and permitted credentials. This is mandatory after any cycle mutation conflict before retrying or waiting.", {}, []),
+        _definition("challenge_begin_cycle", "Freeze a STATE snapshot and begin a structured cycle. If a conflict is returned, reread challenge_get_state and do not retry cached arguments.", {"expected_challenge_version": {"type": "integer", "minimum": 1}}, ["expected_challenge_version"]),
+        _definition(
+            "challenge_submit_analysis_plan",
+            "Submit an explicit analysis summary, hypotheses, information gaps, and bounded execution tasks. If validation_debt is non-empty, every non-empty plan must include a validation/exploitation task citing one debt finding; independent discovery may run in the same batch. Use the latest cycle version; after a conflict, challenge_get_state is required before another mutation.",
+            {
+                "cycle_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "expected_version": {"type": "integer", "minimum": 1},
+                "analysis_summary": {"type": "string", "minLength": 1, "maxLength": 8000},
+                "direction": {"type": "string", "enum": ["unknown", "web", "binary", "ai", "blockchain"], "default": "unknown"},
+                "hypotheses": {"type": "array", "items": _HYPOTHESIS_SCHEMA, "maxItems": 50},
+                "information_gaps": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "avoid_repeating": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "tasks": {"type": "array", "items": _TASK_SCHEMA, "maxItems": 50},
+            },
+            ["cycle_id", "expected_version", "analysis_summary"],
+        ),
+        _definition(
+            "challenge_commit_cycle",
+            "Commit explicit findings, credentials, attack paths, and the cycle outcome atomically. Use only the current cycle phase and version from challenge_get_state or the latest successful tool result.",
+            {
+                "cycle_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "expected_version": {"type": "integer", "minimum": 1},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 8000},
+                "findings": {"type": "array", "items": _FINDING_SCHEMA, "maxItems": 100},
+                "credentials": {"type": "array", "items": _CREDENTIAL_SCHEMA, "maxItems": 50},
+                "next_steps": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "new_attack_paths": {"type": "array", "items": _ATTACK_PATH_SCHEMA, "maxItems": 20},
+                "outcome": {"type": "string", "enum": ["progress", "no_progress", "completed", "blocked", "failed"]},
+            },
+            ["cycle_id", "expected_version", "summary", "outcome"],
+        ),
         _definition(
             "challenge_get_execution_reports",
             "Read a non-blocking bounded snapshot of new Execution Agent reports. Consume every completed, failed, blocked, or cancelled child before deciding the cycle.",
@@ -454,7 +565,7 @@ class ChallengeAgentTools(AgentControlTools):
         ),
         _definition(
             "challenge_wait_for_state",
-            "Yield this model session after all current evidence and decisions are persisted. Runtime resumes only for a newer state sequence or the five-minute safety wakeup. Call this as the only tool in the response.",
+            "Yield this model session after all current evidence and decisions are persisted. Runtime resumes only for a newer state sequence or the five-minute safety wakeup. Call this as the only tool in the response. It is rejected until a required challenge_get_state refresh succeeds.",
             {},
             [],
         ),
@@ -494,31 +605,34 @@ class ExecutionAgentTools(AgentControlTools):
         "execution_report": (ExecutionReport, "execution_report"),
     }
     _DEFINITIONS = [
-        _definition("execution_get_assignment", "Read the persisted assignment and bound challenge context.", {}, []),
+        _definition("execution_get_assignment", "First tool call. Read the compact persisted mission, task_stage, context references, target, direction, and the non-empty Challenge-specific evidence_root. Write evidence only below that root; do not use shared workspace or Run artifacts.", {}, []),
         _definition(
             "execution_update_progress",
-            "Persist a bounded progress heartbeat and verified findings.",
+            "Persist bounded in-session progress and structured findings. This never finalizes the Execution Agent; finish exactly once with execution_report.",
             {
                 "status": {"type": "string", "enum": ["working", "blocked", "completed", "failed", "cancelled"]},
                 "phase": {"type": "string", "minLength": 1, "maxLength": 64},
                 "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "findings": {"type": "array", "items": {"type": "object"}, "maxItems": 50},
+                "findings": {"type": "array", "items": _FINDING_SCHEMA, "maxItems": 50},
                 "evidence_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                "expected_result_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
             },
             ["status", "phase", "summary"],
         ),
         _definition(
             "execution_report",
-            "Save a bounded structured result for the parent Challenge Agent. Put detailed output in workspace artifacts and reference paths here.",
+            "Save the one terminal structured result for the parent Challenge Agent. hypothesis_outcome is mandatory; Discovery may only report actionable Findings as candidate. Validation/Exploitation may resolve a cited candidate with finding_resolutions; supported/rejected requires evidence. Do not copy all context Findings into verified state.",
             {
-                "status": {"type": "string", "enum": ["working", "completed", "blocked", "failed", "cancelled"]},
+                "status": {"type": "string", "enum": ["completed", "blocked", "failed", "cancelled"]},
                 "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "findings": {"type": "array", "items": {}, "maxItems": 50},
+                "findings": {"type": "array", "items": _FINDING_SCHEMA, "maxItems": 50},
                 "evidence_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
                 "next_steps": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
                 "candidate_flag": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "hypothesis_outcome": {"type": "string", "enum": ["supported", "rejected", "inconclusive"]},
+                "finding_resolutions": {"type": "array", "items": _FINDING_RESOLUTION_SCHEMA, "maxItems": 50},
             },
-            ["status", "summary"],
+            ["status", "summary", "hypothesis_outcome"],
         )
     ]

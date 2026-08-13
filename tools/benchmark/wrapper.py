@@ -398,13 +398,6 @@ class BenchmarkTools:
         return value
 
     def _redact(self, value: Any) -> Any:
-        secret = getattr(self._client, "_token", "")
-        if isinstance(value, str):
-            return value.replace(secret, "[REDACTED]") if secret else value
-        if isinstance(value, list):
-            return [self._redact(item) for item in value]
-        if isinstance(value, tuple):
-            return [self._redact(item) for item in value]
-        if isinstance(value, dict):
-            return {key: self._redact(item) for key, item in value.items()}
+        """Keep complete benchmark errors for isolated local analysis."""
+
         return value

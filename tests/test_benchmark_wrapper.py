@@ -210,7 +210,7 @@ async def test_dispatch_rejects_unknown_and_invalid_arguments_without_http_call(
 
 
 @pytest.mark.asyncio
-async def test_api_error_is_normalized_and_token_is_redacted() -> None:
+async def test_api_error_is_normalized_with_full_local_detail() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             404,
@@ -229,7 +229,7 @@ async def test_api_error_is_normalized_and_token_is_redacted() -> None:
     assert result["error"]["type"] == "api"
     assert result["error"]["code"] == "task_not_found"
     assert result["error"]["status_code"] == 404
-    assert TOKEN not in json.dumps(result)
+    assert TOKEN in json.dumps(result)
 
 
 @pytest.mark.asyncio

@@ -251,7 +251,7 @@ class HttpProbeManager:
         expected_response_bytes: int | None = None,
         priority: int = 50,
         wait_seconds: float | None = 20.0,
-        result_limit: int = 100,
+        result_limit: int = 10,
         kind: str = "probe",
     ) -> dict[str, Any]:
         self._require_open()
@@ -303,6 +303,13 @@ class HttpProbeManager:
                 )
             expanded.append(item)
         requests = expanded
+        template_summary = {
+            "case_count": len(cases),
+            "variable_names": sorted({name for case in cases for name in case.variables}),
+            "combinations": [case.combine for case in cases],
+            "expanded_requests": len(requests),
+            "url_samples": [item.spec.url for item in requests[:3]],
+        }
         interaction_dir = self._interaction_dir(agent_id, interaction_id)
         response_dir = interaction_dir / "responses"
         response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -322,6 +329,7 @@ class HttpProbeManager:
                     "concurrency": concurrency,
                     "rate_limit_per_second": rate_limit_per_second,
                     "requests": [self._request_json(item) for item in requests],
+                    "template_summary": template_summary,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -1048,6 +1056,12 @@ class HttpProbeManager:
                 "conflict",
                 "http_interaction_running",
                 "Active HTTP interaction must be stopped before cleanup",
+                detail={
+                    "interaction_id": interaction_id,
+                    "required_tool": "system_http_stop",
+                    "recommended_action": "stop_then_cleanup",
+                    "recommended_wait_seconds": 20,
+                },
             )
         if row["output_cleaned_at"] is not None:
             return {"interaction_id": interaction_id, "cleaned": False, "already_cleaned": True}
@@ -2027,6 +2041,20 @@ class HttpProbeManager:
                 or row["analysis_status"] in {"pending", "queued", "running"}
                 else 0
             ),
+            "is_terminal": row["status"] in TERMINAL
+            and row["analysis_status"] not in {"pending", "queued", "running"},
+            "can_cleanup": row["status"] in TERMINAL
+            and row["analysis_status"] not in {"pending", "queued", "running"},
+            "recommended_action": (
+                "cleanup"
+                if row["status"] in TERMINAL
+                and row["analysis_status"] not in {"pending", "queued", "running"}
+                else "analyze"
+                if row["execution_status"] == "completed"
+                and row["analysis_status"] in {"pending", "queued", "running"}
+                else "output"
+            ),
+            "template_summary": self._plan(agent_id, interaction_id).get("template_summary"),
         }
         if row["kind"] in {"path_probe", "fingerprint"}:
             summary = self._load_summary(agent_id, interaction_id)
@@ -2795,5 +2823,16 @@ class HttpProbeManager:
             raise self._error("conflict", "http_manager_closed", "HTTP manager is closed")
 
     @staticmethod
-    def _error(error_type: str, code: str, message: str) -> SystemToolError:
-        return SystemToolError(error_type=error_type, code=code, message=message)
+    def _error(
+        error_type: str,
+        code: str,
+        message: str,
+        *,
+        detail: Any = None,
+    ) -> SystemToolError:
+        return SystemToolError(
+            error_type=error_type,
+            code=code,
+            message=message,
+            detail=detail,
+        )

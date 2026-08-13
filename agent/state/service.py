@@ -16,9 +16,6 @@ from sqlalchemy import delete, func, select, update
 
 from agent.memory.models import AgentNode, Checkpoint, TargetState
 from agent.memory.redaction import redact_value
-from agent.prompts import render_prompt
-from scan.contracts import extract_task_contract, task_contract_json
-from .capabilities import fingerprint_secret
 from .clock import active_seconds, aware, utc_now
 from .database import StateDatabase
 from .errors import StateConflict, StateError, StateNotFound, StatePermission
@@ -63,10 +60,15 @@ from .schemas import (
     ChallengeSyncResult,
     CreateCycleInput,
     FindingInput,
+    FindingResolutionInput,
+    HypothesisInput,
     StagnationExtensionInput,
     VerificationUpdateInput,
 )
 from .wakeup import StateSignalBus
+
+
+EVIDENCE_BACKED_PROGRESS_CONFIDENCE = 0.8
 
 
 def _json_value(value: Any) -> Any:
@@ -120,6 +122,12 @@ HINT_ACTIVE_STATUSES = frozenset({"queued", "reserved", "running", "analyzing"})
 HINT_TERMINAL_AGENT_STATES = frozenset(
     {"completed", "failed", "stopped", "cancelled", "interrupted"}
 )
+ACTIVE_EXECUTION_STATUSES = frozenset(
+    {"pending", "queued", "reserved", "starting", "running", "working"}
+)
+VALIDATION_DEBT_CATEGORIES = frozenset(
+    {"vulnerability", "credential", "privilege", "attack_path", "flag"}
+)
 
 
 class StateService:
@@ -130,11 +138,17 @@ class StateService:
         database: StateDatabase | Path | str,
         *,
         run_root: Path | None = None,
+        workspace_root: Path | None = None,
         clock: Callable[[], datetime] = utc_now,
         notifier: StateSignalBus | None = None,
     ) -> None:
         self.db = database if isinstance(database, StateDatabase) else StateDatabase(Path(database))
         self.run_root = run_root
+        self.workspace_root = (
+            workspace_root.resolve()
+            if workspace_root is not None
+            else None
+        )
         self.clock = clock
         self.notifier = notifier or StateSignalBus()
         self._lock = asyncio.Lock()
@@ -419,6 +433,9 @@ class StateService:
                     )
                 ).all()
             )
+            validation_debt = await self._validation_debt(
+                session, run_id, unique_code
+            )
             return {
                 "challenge": self._challenge_dict(challenge),
                 "findings": [self._finding_dict(item) for item in findings],
@@ -450,6 +467,7 @@ class StateService:
                         "branch_key": item.branch_key,
                         "hypothesis_key": item.hypothesis_key,
                         "kind": item.kind,
+                        "task_stage": item.task_stage,
                         "status": item.status,
                         "priority": item.priority,
                         "mission": item.mission,
@@ -457,6 +475,7 @@ class StateService:
                     }
                     for item in branch_rows
                 ],
+                "validation_debt": validation_debt,
                 "recent_cycles": [self._cycle_dict(item) for item in cycle_rows],
                 "task_ledger": [
                     {
@@ -465,6 +484,7 @@ class StateService:
                         "task_key": item.task_key,
                         "branch_key": item.branch_key,
                         "kind": item.kind,
+                        "task_stage": item.task_stage,
                         "mission": item.mission,
                         "status": item.status,
                         "context_refs": item.context_refs,
@@ -474,6 +494,11 @@ class StateService:
                         "terminal_report_id": item.terminal_report_id,
                         "report_summary": (
                             item.final_report.get("summary")
+                            if isinstance(item.final_report, Mapping)
+                            else None
+                        ),
+                        "hypothesis_outcome": (
+                            item.final_report.get("hypothesis_outcome")
                             if isinstance(item.final_report, Mapping)
                             else None
                         ),
@@ -511,6 +536,7 @@ class StateService:
         unique_code: str | None = None,
         cycle_id: str | None = None,
         kind: str = "general",
+        task_stage: str | None = None,
         priority: int = 50,
         mission: str = "",
         initial_prompt: str | None = None,
@@ -520,6 +546,7 @@ class StateService:
         task_key: str | None = None,
         branch_key: str | None = None,
         timeout_seconds: int | None = None,
+        enqueue: bool = False,
     ) -> dict[str, Any]:
         if role not in {"chief", "challenge", "execution"}:
             raise StateError("invalid_role", "unknown Agent role", status_code=422)
@@ -543,10 +570,16 @@ class StateService:
                     if role == "execution" and (not unique_code or parent.unique_code != unique_code):
                         raise StatePermission("challenge_binding_required", "Execution Agent must remain bound to its parent challenge")
                 if role == "execution":
-                    if not hypothesis_key or not task_key:
+                    if not hypothesis_key or not task_key or task_stage is None:
                         raise StateError(
                             "execution_task_keys_required",
-                            "Execution Agents require hypothesis_key and task_key",
+                            "Execution Agents require hypothesis_key, task_key, and task_stage",
+                            status_code=422,
+                        )
+                    if task_stage not in {"discovery", "validation", "exploitation"}:
+                        raise StateError(
+                            "invalid_task_stage",
+                            "Execution task_stage is invalid",
                             status_code=422,
                         )
                     duplicate = await session.scalar(
@@ -564,13 +597,6 @@ class StateService:
                     resolved_branch_key = branch_key or (
                         f"{hypothesis_key}:{kind}" if hypothesis_key else None
                     )
-                    await self._validate_hypothesis_admission(
-                        session,
-                        run_id=run_id,
-                        unique_code=str(unique_code),
-                        hypothesis_key=hypothesis_key,
-                        context_refs=context_refs or [],
-                    )
                     await self._validate_branch_admission(
                         session,
                         run_id=run_id,
@@ -578,7 +604,59 @@ class StateService:
                         hypothesis_key=hypothesis_key,
                         branch_key=resolved_branch_key,
                         task_key=task_key,
+                        task_stage=task_stage,
                         context_refs=context_refs or [],
+                    )
+                    challenge = await self._require_challenge(
+                        session, run_id, str(unique_code)
+                    )
+                    await self._validate_validation_debt_tasks(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                    )
+                    await self._validate_discovery_wave(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "hypothesis_key": hypothesis_key,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                    )
+                    await self._upsert_hypothesis(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        hypothesis=HypothesisInput(
+                            key=hypothesis_key,
+                            statement=mission or hypothesis_key,
+                            based_on_observations=list(context_refs or []),
+                        ),
+                        created_by=parent_id,
+                        status="active",
+                    )
+                    await self._reserve_warning_pivot_for_tasks(
+                        session,
+                        run_id=run_id,
+                        challenge=challenge,
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                        agent_id=parent_id,
+                        cycle_id=cycle_id,
                     )
                     await self._upsert_branch(
                         session,
@@ -587,6 +665,7 @@ class StateService:
                         branch_key=resolved_branch_key,
                         hypothesis_key=hypothesis_key,
                         kind=kind,
+                        task_stage=task_stage,
                         priority=priority,
                         mission=mission,
                         agent_id=agent_id,
@@ -613,6 +692,7 @@ class StateService:
                     cycle_id=cycle_id,
                     role=role,
                     kind=kind,
+                    task_stage=task_stage,
                     priority=priority,
                     mission=mission,
                     initial_prompt=initial_prompt if initial_prompt is not None else mission,
@@ -625,11 +705,42 @@ class StateService:
                     timeout_seconds=timeout_seconds,
                 )
                 session.add(record)
+                admission: AdmissionRecord | None = None
+                if role == "execution" and enqueue:
+                    admission = AdmissionRecord(
+                        admission_id=f"admission_{uuid4().hex}",
+                        run_id=run_id,
+                        agent_id=agent_id,
+                        unique_code=unique_code,
+                        role="execution",
+                        priority=priority,
+                        status="queued",
+                    )
+                    session.add(admission)
+                    record.status = "queued"
                 await self._event(session, run_id, "agent_created", {
                     "agent_id": agent_id, "role": role, "parent_id": parent_id,
                     "unique_code": unique_code, "cycle_id": cycle_id,
+                    "kind": kind, "task_stage": task_stage,
                 }, agent_id=agent_id, cycle_id=cycle_id)
-        return self._agent_dict(record)
+                if admission is not None:
+                    await self._event(
+                        session,
+                        run_id,
+                        "agent_admission_queued",
+                        {
+                            "agent_id": agent_id,
+                            "admission_id": admission.admission_id,
+                            "priority": priority,
+                        },
+                        agent_id=agent_id,
+                        cycle_id=cycle_id,
+                    )
+        result = self._agent_dict(record)
+        if admission is not None:
+            result["admission_id"] = admission.admission_id
+            result["admission_status"] = admission.status
+        return result
 
     async def _validate_hypothesis_admission(
         self,
@@ -723,6 +834,7 @@ class StateService:
         hypothesis_key: str,
         branch_key: str | None,
         task_key: str,
+        task_stage: str,
         context_refs: list[str],
     ) -> None:
         """Shared preconditions for creating one Execution Branch task."""
@@ -733,11 +845,23 @@ class StateService:
                 "run_not_active", "Execution tasks require an active Run"
             )
         challenge = await self._require_challenge(session, run_id, unique_code)
-        if challenge.is_completed or challenge.work_status in {"paused", "closed"}:
+        if challenge.is_completed or challenge.work_status in {
+            "paused",
+            "closed",
+            "completed",
+            "extended",
+        }:
             raise StateConflict(
                 "challenge_not_active",
                 "The challenge no longer accepts execution tasks",
             )
+        await self._validate_hypothesis_admission(
+            session,
+            run_id=run_id,
+            unique_code=unique_code,
+            hypothesis_key=hypothesis_key,
+            context_refs=context_refs,
+        )
         if branch_key:
             active_branch = await session.scalar(
                 select(ExecutionBranchRecord).where(
@@ -768,21 +892,418 @@ class StateService:
                 "The task key already exists",
                 {"agent_id": duplicate_task.agent_id, "status": duplicate_task.status},
             )
-        await self._validate_hypothesis_admission(
+    async def _scoped_evidence_refs(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        context_refs: Iterable[str],
+    ) -> set[str]:
+        """Return references that resolve inside the bound Run and Challenge."""
+
+        valid: set[str] = set()
+        for reference in context_refs:
+            kind, separator, identifier = reference.partition(":")
+            if not separator or not identifier:
+                continue
+            row: Any | None = None
+            if kind == "report":
+                row = await session.get(ReportRecord, identifier)
+            elif kind == "finding":
+                row = await session.get(FindingRecord, identifier)
+            elif kind == "observation":
+                row = await session.get(ObservationRecord, identifier)
+            if (
+                row is not None
+                and row.run_id == run_id
+                and row.unique_code == unique_code
+            ):
+                valid.add(reference)
+        return valid
+
+    async def _validate_stage_references(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        task_stage: str,
+        context_refs: list[str],
+    ) -> set[str]:
+        valid_refs = await self._scoped_evidence_refs(
             session,
             run_id=run_id,
             unique_code=unique_code,
-            hypothesis_key=hypothesis_key,
             context_refs=context_refs,
+        )
+        if task_stage in {"validation", "exploitation"} and not valid_refs:
+            raise StateConflict(
+                "task_evidence_reference_required",
+                "Validation and exploitation tasks require a same-challenge report, finding, or observation reference",
+            )
+        return valid_refs
+
+    async def _validation_debt(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+    ) -> list[dict[str, Any]]:
+        findings = list(
+            (
+                await session.scalars(
+                    select(FindingRecord)
+                    .where(
+                        FindingRecord.run_id == run_id,
+                        FindingRecord.unique_code == unique_code,
+                        FindingRecord.verification_status == "candidate",
+                        FindingRecord.confidence
+                        >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE,
+                        FindingRecord.category.in_(VALIDATION_DEBT_CATEGORIES),
+                    )
+                    .order_by(
+                        FindingRecord.confidence.desc(),
+                        FindingRecord.first_seen_at,
+                    )
+                )
+            ).all()
+        )
+        findings = [item for item in findings if item.evidence_paths]
+        if not findings:
+            return []
+        agents = list(
+            (
+                await session.scalars(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "execution",
+                        AgentRecord.task_stage.in_(["validation", "exploitation"]),
+                        AgentRecord.status.in_(ACTIVE_EXECUTION_STATUSES),
+                    )
+                )
+            ).all()
+        )
+        result: list[dict[str, Any]] = []
+        for finding in findings:
+            finding_ref = f"finding:{finding.finding_id}"
+            covering_agent_ids = [
+                agent.agent_id
+                for agent in agents
+                if finding_ref in (agent.context_refs or [])
+            ]
+            result.append(
+                {
+                    "finding_ref": finding_ref,
+                    "reference": finding_ref,
+                    "summary": finding.summary,
+                    "confidence": finding.confidence,
+                    "source_agent_id": finding.agent_id,
+                    "source_agent": finding.agent_id,
+                    "covered": bool(covering_agent_ids),
+                    "covered_by": covering_agent_ids,
+                    "covering_agent_ids": covering_agent_ids,
+                }
+            )
+        return result
+
+    async def _validate_validation_debt_tasks(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        tasks: Iterable[Any],
+    ) -> None:
+        task_values = list(tasks)
+        for task in task_values:
+            task_stage = str(
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            context_refs = list(
+                task.context_refs
+                if hasattr(task, "context_refs")
+                else task.get("context_refs", [])
+            )
+            await self._validate_stage_references(
+                session,
+                run_id=run_id,
+                unique_code=unique_code,
+                task_stage=task_stage,
+                context_refs=context_refs,
+            )
+        if not task_values:
+            return
+        debt = await self._validation_debt(session, run_id, unique_code)
+        if not debt:
+            return
+        debt_refs = {item["finding_ref"] for item in debt}
+        covered = any(
+            (
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            in {"validation", "exploitation"}
+            and bool(
+                debt_refs
+                & set(
+                    task.context_refs
+                    if hasattr(task, "context_refs")
+                    else task.get("context_refs", [])
+                )
+            )
+            for task in task_values
+        )
+        if not covered:
+            raise StateConflict(
+                "validation_wave_required",
+                "A non-empty plan must validate or exploit at least one pending high-value finding",
+                {"validation_debt": sorted(debt_refs)},
+            )
+
+    async def _validate_discovery_wave(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        tasks: Iterable[Any],
+    ) -> None:
+        """Require a validation/exploitation wave after ordinary discovery.
+
+        Direction probing is deliberately excluded: it is a one-time routing
+        task, not a reason to keep expanding reconnaissance indefinitely.
+        The latest persisted ordinary wave is the authoritative boundary, so
+        this check also applies to the direct Execution creation endpoint.
+        """
+
+        task_values = list(tasks)
+
+        def value(task: Any, name: str, default: Any = None) -> Any:
+            return getattr(task, name, default) if hasattr(task, name) else task.get(name, default)
+
+        if not task_values:
+            return
+        has_validation = any(
+            value(task, "task_stage") in {"validation", "exploitation"}
+            for task in task_values
+        )
+        ordinary_discovery = [
+            task
+            for task in task_values
+            if value(task, "task_stage") == "discovery"
+            and value(task, "hypothesis_key") != "challenge-direction"
+        ]
+        if not has_validation and not ordinary_discovery:
+            return
+        if not has_validation and all(
+            value(task, "hypothesis_key") == "challenge-direction"
+            for task in task_values
+        ):
+            return
+
+        cycles = list(
+            (
+                await session.scalars(
+                    select(CycleRecord)
+                    .where(
+                        CycleRecord.run_id == run_id,
+                        CycleRecord.unique_code == unique_code,
+                    )
+                    .order_by(CycleRecord.cycle_number.desc())
+                )
+            ).all()
+        )
+        for cycle in cycles:
+            plan_tasks = list((cycle.plan or {}).get("tasks", []))
+            ordinary_plan = [
+                task
+                for task in plan_tasks
+                if value(task, "hypothesis_key") != "challenge-direction"
+            ]
+            if not ordinary_plan:
+                continue
+            if all(value(task, "task_stage") == "discovery" for task in ordinary_plan):
+                if not has_validation:
+                    raise StateConflict(
+                        "validation_wave_required",
+                        "The next non-empty wave must contain a validation or exploitation task and cite the prior wave",
+                        {
+                            "previous_cycle_id": cycle.cycle_id,
+                            "required_task_stages": ["validation", "exploitation"],
+                            "required_tool": "challenge_submit_analysis_plan",
+                        },
+                    )
+                prior_agents = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == unique_code,
+                                AgentRecord.cycle_id == cycle.cycle_id,
+                            )
+                        )
+                    ).all()
+                )
+                prior_agent_ids = {item.agent_id for item in prior_agents}
+                prior_reports = list(
+                    (
+                        await session.scalars(
+                            select(ReportRecord).where(
+                                ReportRecord.run_id == run_id,
+                                ReportRecord.unique_code == unique_code,
+                                ReportRecord.agent_id.in_(prior_agent_ids),
+                            )
+                        )
+                    ).all()
+                ) if prior_agent_ids else []
+                prior_findings = list(
+                    (
+                        await session.scalars(
+                            select(FindingRecord).where(
+                                FindingRecord.run_id == run_id,
+                                FindingRecord.unique_code == unique_code,
+                                FindingRecord.agent_id.in_(prior_agent_ids),
+                            )
+                        )
+                    ).all()
+                ) if prior_agent_ids else []
+                prior_refs = {
+                    *(f"report:{item.report_id}" for item in prior_reports),
+                    *(f"finding:{item.finding_id}" for item in prior_findings),
+                }
+                current_refs = {
+                    reference
+                    for task in task_values
+                    if value(task, "task_stage") in {"validation", "exploitation"}
+                    for reference in (value(task, "context_refs", []) or [])
+                }
+                if not prior_refs.intersection(current_refs):
+                    raise StateConflict(
+                        "validation_wave_required",
+                        "The validation wave must cite a report or Finding produced by the prior discovery wave",
+                        {
+                            "previous_cycle_id": cycle.cycle_id,
+                            "required_task_stages": ["validation", "exploitation"],
+                            "required_context_ref": "report:<id> or finding:<id>",
+                            "required_tool": "challenge_submit_analysis_plan",
+                        },
+                    )
+                return
+            return
+
+    async def _reserve_warning_pivot_for_tasks(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        challenge: ChallengeRecord,
+        tasks: Iterable[Any],
+        agent_id: str | None,
+        cycle_id: str | None,
+    ) -> None:
+        task_values = list(tasks)
+        discovery_tasks = [
+            task
+            for task in task_values
+            if (
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            == "discovery"
+        ]
+        if not discovery_tasks or challenge.work_status != "warning":
+            return
+        if len(discovery_tasks) > 1 or challenge.warning_pivot_used:
+            raise StateConflict(
+                "warning_discovery_limit",
+                "A warning episode permits at most one discovery pivot",
+            )
+        discovery = discovery_tasks[0]
+        context_refs = list(
+            discovery.context_refs
+            if hasattr(discovery, "context_refs")
+            else discovery.get("context_refs", [])
+        )
+        evidence_refs = await self._scoped_evidence_refs(
+            session,
+            run_id=run_id,
+            unique_code=challenge.unique_code,
+            context_refs=context_refs,
+        )
+        gap_refs = {
+            reference
+            for reference in context_refs
+            if reference.startswith("gap:") and reference.removeprefix("gap:").strip()
+        }
+        if not evidence_refs and not gap_refs:
+            raise StateConflict(
+                "warning_discovery_reference_required",
+                "A warning discovery pivot must cite concrete evidence or an information gap",
+            )
+        challenge.warning_pivot_used = True
+        challenge.version += 1
+        await self._event(
+            session,
+            run_id,
+            "warning_pivot_reserved",
+            {"unique_code": challenge.unique_code},
+            agent_id=agent_id,
+            cycle_id=cycle_id,
         )
 
     async def get_assignment(self, run_id: str, agent_id: str, context: CapabilityContext) -> dict[str, Any]:
-        async with self.db.sessions() as session:
+        async with self.db.sessions.begin() as session:
             agent = await self._authorize(session, context, roles={"chief", "challenge", "execution"}, agent_id=agent_id)
+            if not agent.unique_code:
+                return {"agent": self._agent_dict(agent), "challenge": None}
+            challenge = await self._require_challenge(session, run_id, agent.unique_code)
+            challenge_data = self._challenge_dict(challenge)
+            assignment: dict[str, Any] = {
+                "mission": agent.mission,
+                "task_stage": agent.task_stage,
+                "success_criteria": list(agent.success_criteria or []),
+                "context_refs": list(agent.context_refs or []),
+                "evidence_root": challenge_data["evidence_root"],
+            }
+            # Only material referenced context crosses the Execution boundary.
+            # Full cycles, all Agents, and unrelated history remain Challenge-owned.
+            referenced: list[dict[str, Any]] = []
+            for reference in agent.context_refs or []:
+                if reference.startswith("finding:"):
+                    finding = await session.get(FindingRecord, reference.removeprefix("finding:"))
+                    if finding is not None and finding.run_id == run_id and finding.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "finding", "summary": finding.summary, "confidence": finding.confidence, "verification_status": finding.verification_status, "evidence_paths": list(finding.evidence_paths or [])})
+                elif reference.startswith("observation:"):
+                    observation = await session.get(ObservationRecord, reference.removeprefix("observation:"))
+                    if observation is not None and observation.run_id == run_id and observation.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "observation", "summary": observation.summary, "confidence": observation.confidence})
+                elif reference.startswith("report:"):
+                    report = await session.get(ReportRecord, reference.removeprefix("report:"))
+                    if report is not None and report.run_id == run_id and report.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "report", "summary": str((report.payload or {}).get("summary", ""))[:1000], "status": report.status})
+            challenge_data = {
+                "run_id": challenge_data["run_id"],
+                "unique_code": challenge_data["unique_code"],
+                "description": challenge_data["description"],
+                "target": challenge_data["container_addr"],
+                "direction": challenge_data["direction"],
+                "work_status": challenge_data["work_status"],
+                "container_status": challenge_data["container_status"],
+                "container_addr": challenge_data["container_addr"],
+                "evidence_root": challenge_data["evidence_root"],
+                "referenced_context": referenced,
+            }
             return {
                 "agent": self._agent_dict(agent),
-                "challenge": await self.get_challenge_context(run_id, agent.unique_code, context) if agent.unique_code else None,
-                "task_contract": extract_task_contract(agent.initial_prompt),
+                "assignment": assignment,
+                "challenge": challenge_data,
+                "evidence_root": challenge_data["evidence_root"],
             }
 
     async def run_exists(self, run_id: str) -> bool:
@@ -1945,6 +2466,7 @@ class StateService:
                     status="cancelled",
                     summary="Execution Agent was interrupted by the Runtime",
                     failure_code=failure_code,
+                    hypothesis_outcome="inconclusive",
                 ),
                 terminal_status="interrupted",
                 allow_inactive=True,
@@ -2172,9 +2694,26 @@ class StateService:
                     .limit(1)
                 )
                 if open_cycle is not None:
-                    return self._cycle_dict(open_cycle)
+                    raise StateConflict(
+                        "cycle_already_in_progress",
+                        "a Cycle is already in progress; read its authoritative state before continuing",
+                        {
+                            **self._cycle_recovery_detail(open_cycle),
+                            "required_tool": "challenge_get_state",
+                            "retry_same_arguments": False,
+                        },
+                    )
                 if challenge.version != payload.expected_challenge_version:
-                    raise StateConflict("state_conflict", "challenge state changed", {"current_version": challenge.version})
+                    raise StateConflict(
+                        "state_conflict",
+                        "challenge state changed",
+                        {
+                            "current_version": challenge.version,
+                            "current_status": challenge.work_status,
+                            "cycle_id": None,
+                            "allowed_tools": ["challenge_get_state"],
+                        },
+                    )
                 existing = await session.scalar(select(func.max(CycleRecord.cycle_number)).where(CycleRecord.run_id == run_id, CycleRecord.unique_code == unique_code))
                 cycle_number = int(existing or 0) + 1
                 cycle = CycleRecord(
@@ -2339,30 +2878,28 @@ class StateService:
             async with self.db.sessions.begin() as session:
                 cycle = await self._require_cycle(session, run_id, cycle_id)
                 await self._authorize(session, context, roles={"challenge"}, unique_code=cycle.unique_code)
-                self._check_version(cycle.version, payload.expected_version)
+                self._check_version(
+                    cycle.version,
+                    payload.expected_version,
+                    detail=self._cycle_recovery_detail(cycle),
+                )
                 if cycle.status not in {"state", "analysis"}:
-                    raise StateConflict("invalid_cycle_phase", "cycle is not accepting analysis and plan")
-                challenge = await self._require_challenge(
-                    session, run_id, cycle.unique_code
-                )
-                await self._validate_domain_plan(
+                    raise StateConflict(
+                        "invalid_cycle_phase",
+                        "cycle is not accepting analysis and plan",
+                        self._cycle_recovery_detail(cycle),
+                    )
+                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
+                tasks = list(payload.tasks)
+                await self._validate_discovery_wave(
                     session,
                     run_id=run_id,
                     unique_code=cycle.unique_code,
-                    payload=payload,
-                )
-                await self._validate_plan_dependencies(
-                    session,
-                    run_id=run_id,
-                    unique_code=cycle.unique_code,
-                    tasks=payload.tasks,
+                    tasks=tasks,
                 )
                 cycle.analysis = {
                     "summary": payload.analysis_summary,
-                    "domain": payload.domain,
-                    "domain_confidence": payload.domain_confidence,
-                    "domain_evidence_refs": payload.domain_evidence_refs,
-                    "scanner_profile": payload.scanner_profile,
+                    "direction": payload.direction,
                     "hypotheses": [
                         item.model_dump(mode="json") for item in payload.hypotheses
                     ],
@@ -2382,48 +2919,61 @@ class StateService:
                 cycle.execute_at = self.clock()
                 cycle.version += 1
                 admissions: list[dict[str, Any]] = []
-                tasks = list(payload.tasks)
+                await self._validate_validation_debt_tasks(
+                    session,
+                    run_id=run_id,
+                    unique_code=cycle.unique_code,
+                    tasks=tasks,
+                )
+                await self._reserve_warning_pivot_for_tasks(
+                    session,
+                    run_id=run_id,
+                    challenge=challenge,
+                    tasks=tasks,
+                    agent_id=context.agent_id,
+                    cycle_id=cycle_id,
+                )
+                if payload.direction != "unknown" and challenge.direction != payload.direction:
+                    if challenge.direction != "unknown":
+                        direction_refs = [
+                            reference
+                            for hypothesis in payload.hypotheses
+                            for reference in hypothesis.based_on_observations
+                        ]
+                        direction_refs.extend(
+                            reference
+                            for task in tasks
+                            for reference in task.context_refs
+                        )
+                        if not any(
+                            reference.startswith(("report:", "observation:"))
+                            for reference in direction_refs
+                        ):
+                            raise StateConflict(
+                                "direction_change_requires_evidence",
+                                "Changing a classified direction requires a new report or observation reference",
+                            )
+                    previous_direction = challenge.direction
+                    challenge.direction = payload.direction
+                    challenge.version += 1
+                    await self._event(
+                        session,
+                        run_id,
+                        "challenge_direction_changed",
+                        {
+                            "unique_code": cycle.unique_code,
+                            "previous_direction": previous_direction,
+                            "direction": payload.direction,
+                            "source": "analysis_plan",
+                        },
+                        agent_id=context.agent_id,
+                        cycle_id=cycle_id,
+                    )
                 if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
                     if tasks:
                         raise StateConflict(
                             "challenge_paused",
                             "Paused or extended challenges do not accept execution tasks",
-                        )
-                elif challenge.stagnation_level >= 1:
-                    if len(tasks) > 1 or any(
-                        item.kind != "exploration" or not item.context_refs
-                        for item in tasks
-                    ):
-                        raise StateConflict(
-                            "exploration_only",
-                            "Warning state accepts one exploration task with a concrete context reference",
-                        )
-                    existing_explorer = await session.scalar(
-                        select(AgentRecord).where(
-                            AgentRecord.run_id == run_id,
-                            AgentRecord.unique_code == cycle.unique_code,
-                            AgentRecord.kind == "exploration",
-                            AgentRecord.status.in_(
-                                ["pending", "queued", "starting", "running", "working"]
-                            ),
-                        )
-                    )
-                    if existing_explorer is not None or challenge.l2_explorer_created:
-                        if tasks:
-                            raise StateConflict(
-                                "stagnation_explorer_limit",
-                                "This warning episode already used its exploration Agent",
-                            )
-                    elif tasks:
-                        challenge.l2_explorer_created = True
-                        challenge.version += 1
-                        await self._event(
-                            session,
-                            run_id,
-                            "stagnation_explorer_reserved",
-                            {"unique_code": cycle.unique_code, "source": "cycle_plan"},
-                            agent_id=context.agent_id,
-                            cycle_id=cycle_id,
                         )
                 if len({task.task_key for task in tasks}) != len(tasks):
                     raise StateConflict(
@@ -2439,6 +2989,19 @@ class StateService:
                     for hypothesis in payload.hypotheses
                 }
                 for task in tasks:
+                    if task.hypothesis_key == "challenge-direction":
+                        existing_probe = await session.scalar(
+                            select(AgentRecord).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == cycle.unique_code,
+                                AgentRecord.hypothesis_key == "challenge-direction",
+                            )
+                        )
+                        if existing_probe is not None:
+                            raise StateConflict(
+                                "direction_probe_exists",
+                                "Only one challenge-direction probe is allowed for this challenge",
+                            )
                     branch_key = task.branch_key or (
                         f"{task.hypothesis_key}:{task.kind}"
                     )
@@ -2449,6 +3012,7 @@ class StateService:
                         hypothesis_key=task.hypothesis_key,
                         branch_key=branch_key,
                         task_key=task.task_key,
+                        task_stage=task.task_stage,
                         context_refs=task.context_refs,
                     )
                     agent_id = f"execution_{uuid4().hex}"
@@ -2468,6 +3032,7 @@ class StateService:
                         branch_key=branch_key,
                         hypothesis_key=task.hypothesis_key,
                         kind=task.kind,
+                        task_stage=task.task_stage,
                         priority=task.priority,
                         mission=task.objective,
                         agent_id=agent_id,
@@ -2476,7 +3041,8 @@ class StateService:
                     agent = AgentRecord(
                         agent_id=agent_id, run_id=run_id, parent_id=context.agent_id,
                         unique_code=cycle.unique_code, cycle_id=cycle.cycle_id,
-                        role="execution", kind=task.kind, priority=task.priority,
+                        role="execution", kind=task.kind,
+                        task_stage=task.task_stage, priority=task.priority,
                         hypothesis_key=task.hypothesis_key,
                         task_key=task.task_key,
                         branch_key=branch_key,
@@ -2524,11 +3090,19 @@ class StateService:
             async with self.db.sessions.begin() as session:
                 cycle = await self._require_cycle(session, run_id, cycle_id)
                 await self._authorize(session, context, roles={"challenge"}, unique_code=cycle.unique_code)
-                self._check_version(cycle.version, payload.expected_version)
+                self._check_version(
+                    cycle.version,
+                    payload.expected_version,
+                    detail=self._cycle_recovery_detail(cycle),
+                )
                 if cycle.status not in {"execute", "verify"}:
-                    raise StateConflict("invalid_cycle_phase", "cycle is not ready for verification")
+                    raise StateConflict(
+                        "invalid_cycle_phase",
+                        "cycle is not ready for verification",
+                        self._cycle_recovery_detail(cycle),
+                    )
                 cycle.status = "completed"
-                cycle.verification = {"summary": payload.summary, "outcome": payload.outcome, "rejected_finding_ids": payload.rejected_finding_ids}
+                cycle.verification = {"summary": payload.summary, "outcome": payload.outcome}
                 cycle.state_update = {
                     "next_steps": payload.next_steps,
                     "outcome": payload.outcome,
@@ -2540,74 +3114,36 @@ class StateService:
                 cycle.verify_at = self.clock()
                 cycle.update_at = self.clock()
                 cycle.version += 1
-                valid_progress, added = await self._record_findings(
-                    session,
-                    run_id,
-                    cycle.unique_code,
-                    context.agent_id,
-                    payload.findings,
-                )
-                attack_paths = [
-                    FindingInput(
-                        category="attack_path",
-                        summary=path.summary,
-                        detail={"verification_steps": path.verification_steps},
-                        confidence=path.confidence,
-                        verification_status="candidate",
-                        evidence_paths=path.evidence_paths,
-                    )
-                    for path in payload.new_attack_paths
-                ]
-                attack_path_progress, added_paths = await self._record_findings(
-                    session,
-                    run_id,
-                    cycle.unique_code,
-                    context.agent_id,
-                    attack_paths,
-                    count_candidate_attack_paths=True,
-                )
-                valid_progress = valid_progress or attack_path_progress
-                added.extend(added_paths)
-                for finding_id in payload.rejected_finding_ids:
-                    finding = await session.get(FindingRecord, finding_id)
-                    if finding and finding.run_id == run_id and finding.unique_code == cycle.unique_code:
-                        finding.verification_status = "rejected"
-                        finding.version += 1
+                # Execution reports are the sole source of Finding mutations.
+                # Cycle commit stores only the Challenge's compact summary and
+                # references; copying report findings here used to create a
+                # second semantic event and incorrectly reset stagnation.
+                added: list[dict[str, Any]] = []
+                progress_kinds: set[str] = set()
+                valid_progress = False
                 for credential in payload.credentials:
                     await self._record_credential(session, run_id, cycle.unique_code, None, credential)
-                if any(credential.verified for credential in payload.credentials):
-                    valid_progress = True
-                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
-                if valid_progress:
-                    self._mark_progress(challenge)
-                    progress_kinds = []
-                    if attack_path_progress:
-                        progress_kinds.append("new_attack_path")
-                    if valid_progress and not attack_path_progress:
-                        progress_kinds.append("verified_evidence")
-                    if any(credential.verified for credential in payload.credentials):
-                        progress_kinds.append("verified_credential")
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": cycle.unique_code,
-                            "progress_kinds": progress_kinds,
-                        },
-                        agent_id=context.agent_id,
-                        cycle_id=cycle_id,
-                    )
                 cycle.completed_at = self.clock()
                 await self._event(
                     session,
                     run_id,
                     "cycle_committed",
-                    {"cycle_id": cycle_id, "finding_count": len(added), "valid_progress": valid_progress, "outcome": payload.outcome},
+                    {
+                        "cycle_id": cycle_id,
+                        "finding_count": len(added),
+                        "valid_progress": valid_progress,
+                        "progress_kinds": sorted(progress_kinds),
+                        "outcome": payload.outcome,
+                    },
                     agent_id=context.agent_id,
                     cycle_id=cycle_id,
                 )
-        return {"cycle": self._cycle_dict(cycle), "findings": added, "valid_progress": valid_progress}
+        return {
+            "cycle": self._cycle_dict(cycle),
+            "findings": added,
+            "valid_progress": valid_progress,
+            "progress_kinds": sorted(progress_kinds),
+        }
 
     async def mark_invalid_cycle(self, run_id: str, cycle_id: str, context: CapabilityContext, reason: str = "missing_structured_output") -> dict[str, Any]:
         async with self._lock:
@@ -2632,39 +3168,39 @@ class StateService:
                             "challenge_not_active",
                             "The challenge no longer accepts Execution Agent progress",
                         )
-                agent.status = "running" if payload.status == "working" else payload.status
+                # Progress is never a lifecycle terminal.  Only the atomic
+                # terminal report path may finish an Execution Agent.
+                agent.status = "running"
                 agent.last_heartbeat_at = self.clock()
                 agent.version += 1
+                report_evidence_paths = (
+                    self._validate_evidence_paths(
+                        run_id,
+                        str(agent.unique_code),
+                        payload.evidence_paths,
+                        evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                        if agent.unique_code and self.workspace_root is not None
+                        else None,
+                    )
+                    if agent.unique_code
+                    else list(payload.evidence_paths)
+                )
                 finding_values = [
                     item
-                    if item.evidence_paths or not payload.evidence_paths
-                    else item.model_copy(update={"evidence_paths": payload.evidence_paths})
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
                     for item in payload.findings
                 ]
-                if agent.kind == "domain_recognition":
-                    finding_values = [
-                        item.model_copy(update={"verification_status": "candidate"})
-                        for item in finding_values
-                    ]
-                valid, findings = await self._record_findings(
-                    session, run_id, agent.unique_code, agent_id, finding_values
+                progress_kinds, findings = await self._record_findings(
+                    session,
+                    run_id,
+                    agent.unique_code,
+                    agent_id,
+                    finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
                 )
-                if agent.kind == "domain_recognition":
-                    valid = False
-                if agent.unique_code and valid:
-                    challenge = await self._require_challenge(session, run_id, agent.unique_code)
-                    self._mark_progress(challenge)
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": agent.unique_code,
-                            "progress_kinds": ["verified_evidence"],
-                        },
-                        agent_id=agent_id,
-                        cycle_id=agent.cycle_id,
-                    )
+                valid = False
                 await self._event(
                     session,
                     run_id,
@@ -2676,12 +3212,18 @@ class StateService:
                         "summary": payload.summary,
                         "finding_count": len(findings),
                         "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
                         "expected_result_seconds": payload.expected_result_seconds,
                     },
                     agent_id=agent_id,
                     cycle_id=agent.cycle_id,
                 )
-        return {"agent": self._agent_dict(agent), "findings": findings, "valid_progress": valid}
+        return {
+            "agent": self._agent_dict(agent),
+            "findings": findings,
+            "valid_progress": valid,
+            "progress_kinds": sorted(progress_kinds),
+        }
 
     async def submit_report(self, run_id: str, agent_id: str, context: CapabilityContext, payload: AgentReportInput) -> dict[str, Any]:
         if context.role == "execution" and payload.status != "working":
@@ -2700,6 +3242,18 @@ class StateService:
                             "challenge_not_active",
                             "The challenge no longer accepts Agent reports",
                         )
+                report_evidence_paths = (
+                    self._validate_evidence_paths(
+                        run_id,
+                        str(agent.unique_code),
+                        payload.evidence_paths,
+                        evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                        if agent.unique_code and self.workspace_root is not None
+                        else None,
+                    )
+                    if agent.unique_code
+                    else list(payload.evidence_paths)
+                )
                 if payload.status == "working":
                     agent.status = "running"
                 else:
@@ -2709,45 +3263,33 @@ class StateService:
                 agent.version += 1
                 finding_values = [
                     item
-                    if item.evidence_paths or not payload.evidence_paths
-                    else item.model_copy(update={"evidence_paths": payload.evidence_paths})
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
                     for item in payload.findings
                 ]
-                if agent.kind == "domain_recognition":
-                    finding_values = [
-                        item.model_copy(update={"verification_status": "candidate"})
-                        for item in finding_values
-                    ]
-                valid, findings = await self._record_findings(
-                    session, run_id, agent.unique_code, agent_id, finding_values
+                progress_kinds, findings = await self._record_findings(
+                    session,
+                    run_id,
+                    agent.unique_code,
+                    agent_id,
+                    finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
                 )
-                if agent.kind == "domain_recognition":
-                    valid = False
-                if agent.unique_code and valid:
-                    self._mark_progress(challenge)
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": agent.unique_code,
-                            "progress_kinds": ["verified_evidence"],
-                        },
-                        agent_id=agent_id,
-                        cycle_id=agent.cycle_id,
-                    )
+                valid = False
                 safe_payload = {
                     "status": payload.status,
                     "summary": payload.summary,
-                    "findings": [item.model_dump(mode="json") for item in finding_values],
-                    "evidence_paths": payload.evidence_paths,
+                    "findings": findings,
+                    "evidence_paths": report_evidence_paths,
                     "next_steps": payload.next_steps,
                     "confidence": payload.confidence,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
                 }
                 if payload.failure_code is not None:
                     safe_payload["failure_code"] = payload.failure_code
                 if payload.candidate_flag is not None:
-                    safe_payload["candidate_flag"] = {"sha256": fingerprint_secret(payload.candidate_flag), "length": len(payload.candidate_flag)}
+                    safe_payload["candidate_flag"] = payload.candidate_flag
                 sequence = await self._next_sequence(session, run_id)
                 report = ReportRecord(
                     report_id=f"report_{uuid4().hex}", run_id=run_id, sequence=sequence,
@@ -2762,11 +3304,24 @@ class StateService:
                     run_id,
                     sequence,
                     "agent_report",
-                    {"report_id": report.report_id, "agent_id": agent_id, "status": payload.status, "valid_progress": valid},
+                    {
+                        "report_id": report.report_id,
+                        "agent_id": agent_id,
+                        "status": payload.status,
+                        "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
+                    },
                     agent_id=agent_id,
                     cycle_id=agent.cycle_id,
                 )
-                result = {"report_id": report.report_id, "sequence": sequence, "status": payload.status, "valid_progress": valid, "findings": findings}
+                result = {
+                    "report_id": report.report_id,
+                    "sequence": sequence,
+                    "status": payload.status,
+                    "valid_progress": valid,
+                    "progress_kinds": sorted(progress_kinds),
+                    "findings": findings,
+                }
                 if payload.candidate_flag is not None:
                     self._ephemeral_reports[report.report_id] = payload.candidate_flag
         if agent.parent_id:
@@ -2813,7 +3368,13 @@ class StateService:
                         "report_id": existing.report_id,
                         "sequence": existing.sequence,
                         "status": existing.status,
+                        "hypothesis_outcome": (
+                            existing.payload.get("hypothesis_outcome")
+                            if isinstance(existing.payload, Mapping)
+                            else None
+                        ),
                         "valid_progress": False,
+                        "progress_kinds": [],
                         "findings": [],
                         "idempotent": True,
                     }
@@ -2833,26 +3394,53 @@ class StateService:
                             "challenge_not_active",
                             "The challenge no longer accepts Agent reports",
                         )
+                report_evidence_paths = self._validate_evidence_paths(
+                    run_id,
+                    str(agent.unique_code),
+                    payload.evidence_paths,
+                    evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                    if challenge is not None
+                    else None,
+                ) if agent.unique_code else list(payload.evidence_paths)
                 finding_values = [
                     item
-                    if item.evidence_paths or not payload.evidence_paths
-                    else item.model_copy(update={"evidence_paths": payload.evidence_paths})
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
                     for item in payload.findings
                 ]
-                if agent.kind == "domain_recognition":
-                    finding_values = [
-                        item.model_copy(update={"verification_status": "candidate"})
-                        for item in finding_values
-                    ]
-                valid, findings = await self._record_findings(
+                normalized_resolutions = [
+                    item.model_copy(
+                        update={
+                            "evidence_paths": self._validate_evidence_paths(
+                                run_id,
+                                str(agent.unique_code),
+                                item.evidence_paths,
+                                evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                                if challenge is not None and self.workspace_root is not None
+                                else None,
+                            )
+                        }
+                    )
+                    for item in payload.finding_resolutions
+                ]
+                report_payload = payload.model_copy(
+                    update={"finding_resolutions": normalized_resolutions}
+                )
+                progress_kinds, findings = await self._record_findings(
                     session,
                     run_id,
                     agent.unique_code,
                     agent_id,
                     finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
                 )
-                if agent.kind == "domain_recognition":
-                    valid = False
+                progress_kinds.update(
+                    await self._apply_finding_resolutions(
+                        session, run_id, agent, report_payload
+                    )
+                )
+                valid = bool(progress_kinds)
                 if challenge is not None and valid:
                     self._mark_progress(challenge)
                     await self._event(
@@ -2861,7 +3449,7 @@ class StateService:
                         "stagnation_progress_recorded",
                         {
                             "unique_code": agent.unique_code,
-                            "progress_kinds": ["verified_evidence"],
+                            "progress_kinds": sorted(progress_kinds),
                         },
                         agent_id=agent_id,
                         cycle_id=agent.cycle_id,
@@ -2869,20 +3457,20 @@ class StateService:
                 safe_payload: dict[str, Any] = {
                     "status": payload.status,
                     "summary": payload.summary,
-                    "findings": [
-                        item.model_dump(mode="json") for item in finding_values
-                    ],
-                    "evidence_paths": payload.evidence_paths,
+                    "findings": findings,
+                    "evidence_paths": report_evidence_paths,
                     "next_steps": payload.next_steps,
                     "confidence": payload.confidence,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
+                    "finding_resolutions": [
+                        item.model_dump(mode="json")
+                        for item in normalized_resolutions
+                    ],
                 }
                 if payload.failure_code is not None:
                     safe_payload["failure_code"] = payload.failure_code
                 if payload.candidate_flag is not None:
-                    safe_payload["candidate_flag"] = {
-                        "sha256": fingerprint_secret(payload.candidate_flag),
-                        "length": len(payload.candidate_flag),
-                    }
+                    safe_payload["candidate_flag"] = payload.candidate_flag
                 sequence = await self._next_sequence(session, run_id)
                 report = ReportRecord(
                     report_id=f"report_{uuid4().hex}",
@@ -2927,7 +3515,6 @@ class StateService:
                 agent.last_heartbeat_at = self.clock()
                 agent.ended_at = self.clock()
                 agent.version += 1
-                cancelled_branches: list[str] = []
                 if agent.branch_key and agent.unique_code:
                     branch = await session.get(
                         ExecutionBranchRecord,
@@ -2948,6 +3535,8 @@ class StateService:
                             "report_id": report.report_id,
                             "status": resolved_status,
                             "valid_progress": valid,
+                            "progress_kinds": sorted(progress_kinds),
+                            "hypothesis_outcome": payload.hypothesis_outcome,
                         }
                         branch.updated_at = self.clock()
                         branch.version += 1
@@ -2957,23 +3546,9 @@ class StateService:
                             (run_id, agent.unique_code, agent.hypothesis_key),
                         )
                         if hypothesis is not None:
-                            if resolved_status == "completed" and valid:
-                                hypothesis.status = "verified"
-                            elif resolved_status == "completed":
-                                hypothesis.status = "rejected"
+                            hypothesis.status = str(payload.hypothesis_outcome)
                             hypothesis.updated_at = self.clock()
                             hypothesis.version += 1
-                    if (
-                        agent.kind != "domain_recognition"
-                        and resolved_status == "completed"
-                        and valid
-                    ):
-                        cancelled_branches = await self._cancel_sibling_branches(
-                            session,
-                            run_id,
-                            agent.unique_code,
-                            except_branch=agent.branch_key,
-                        )
                 admission = await session.scalar(
                     select(AdmissionRecord).where(
                         AdmissionRecord.run_id == run_id,
@@ -2994,6 +3569,8 @@ class StateService:
                         "status": payload.status,
                         "agent_status": resolved_status,
                         "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
+                        "hypothesis_outcome": payload.hypothesis_outcome,
                         "terminal": True,
                     },
                     agent_id=agent_id,
@@ -3005,9 +3582,10 @@ class StateService:
                     "sequence": sequence,
                     "status": payload.status,
                     "agent_status": resolved_status,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
                     "valid_progress": valid,
+                    "progress_kinds": sorted(progress_kinds),
                     "findings": findings,
-                    "cancelled_branches": cancelled_branches,
                     "idempotent": False,
                 }
                 if payload.candidate_flag is not None:
@@ -3193,35 +3771,6 @@ class StateService:
                         "unique_code": unique_code,
                         "container_status": challenge.container_status,
                     },
-                )
-        await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
-        return self._challenge_dict(challenge)
-
-    async def reserve_stagnation_explorer(
-        self, run_id: str, unique_code: str
-    ) -> dict[str, Any]:
-        async with self._lock:
-            async with self.db.sessions.begin() as session:
-                challenge = await self._require_challenge(session, run_id, unique_code)
-                if challenge.stagnation_level < 1:
-                    return self._challenge_dict(challenge)
-                if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
-                    raise StateConflict(
-                        "stagnation_explorer_not_allowed",
-                        "Exploration is not allowed after the first stagnation level",
-                    )
-                if challenge.l2_explorer_created:
-                    raise StateConflict(
-                        "stagnation_explorer_limit",
-                        "This stagnation episode already used its exploration Agent",
-                    )
-                challenge.l2_explorer_created = True
-                challenge.version += 1
-                event_sequence = await self._event(
-                    session,
-                    run_id,
-                    "stagnation_explorer_reserved",
-                    {"unique_code": unique_code},
                 )
         await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
         return self._challenge_dict(challenge)
@@ -4010,6 +4559,97 @@ class StateService:
         """Recovery boundary: unresolved platform operations become indeterminate."""
         return await self.mark_indeterminate_operations(run_id)
 
+    async def _apply_finding_resolutions(
+        self,
+        session: Any,
+        run_id: str,
+        agent: AgentRecord,
+        payload: AgentReportInput,
+    ) -> set[str]:
+        resolutions = list(payload.finding_resolutions or [])
+        if not resolutions:
+            actionable_verified = any(
+                item.category in VALIDATION_DEBT_CATEGORIES
+                and item.verification_status in {"verified", "rejected"}
+                for item in payload.findings
+            )
+            if actionable_verified:
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Actionable Finding verification requires finding_resolutions",
+                    status_code=422,
+                )
+            return set()
+        if agent.task_stage not in {"validation", "exploitation"}:
+            raise StateError(
+                "invalid_finding_resolution",
+                "Only validation and exploitation tasks may resolve Findings",
+                status_code=422,
+            )
+        if payload.hypothesis_outcome not in {"supported", "rejected"}:
+            raise StateError(
+                "invalid_finding_resolution",
+                "Finding resolutions require a supported or rejected hypothesis outcome",
+                status_code=422,
+            )
+        expected_outcome = (
+            "verified" if payload.hypothesis_outcome == "supported" else "rejected"
+        )
+        progress: set[str] = set()
+        seen: set[str] = set()
+        challenge = await self._require_challenge(session, run_id, str(agent.unique_code))
+        evidence_root = self._ensure_evidence_root_dir(challenge)
+        for resolution in resolutions:
+            if not resolution.finding_ref.startswith("finding:"):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "finding_ref must use finding:<id> format",
+                    status_code=422,
+                )
+            if resolution.outcome != expected_outcome:
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding resolution outcome does not match hypothesis_outcome",
+                    status_code=422,
+                )
+            if resolution.finding_ref in seen or resolution.finding_ref not in (agent.context_refs or []):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding resolution must reference a cited same-challenge candidate",
+                    status_code=422,
+                )
+            seen.add(resolution.finding_ref)
+            normalized = self._validate_evidence_paths(
+                run_id,
+                str(agent.unique_code),
+                resolution.evidence_paths,
+                evidence_root_path=evidence_root,
+            )
+            finding = await session.get(
+                FindingRecord, resolution.finding_ref.removeprefix("finding:")
+            )
+            if (
+                finding is None
+                or finding.run_id != run_id
+                or finding.unique_code != agent.unique_code
+                or finding.verification_status != "candidate"
+            ):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding is missing, out of scope, or no longer candidate",
+                    status_code=422,
+                )
+            finding.verification_status = resolution.outcome
+            finding.evidence_paths = list(dict.fromkeys([*finding.evidence_paths, *normalized]))
+            finding.verified_at = self.clock() if resolution.outcome == "verified" else None
+            finding.version += 1
+            progress.add(
+                "verified_finding"
+                if resolution.outcome == "verified"
+                else "rejected_finding"
+            )
+        return progress
+
     async def _record_findings(
         self,
         session: Any,
@@ -4018,30 +4658,33 @@ class StateService:
         agent_id: str | None,
         values: Iterable[FindingInput],
         *,
+        task_stage: str | None = None,
         count_candidate_attack_paths: bool = False,
-    ) -> tuple[bool, list[dict[str, Any]]]:
+        count_evidence_backed_candidates: bool = False,
+    ) -> tuple[set[str], list[dict[str, Any]]]:
         if not unique_code:
-            return False, []
+            return set(), []
         added: list[dict[str, Any]] = []
-        valid_progress = False
+        progress_kinds: set[str] = set()
         challenge = await self._require_challenge(session, run_id, unique_code)
         for value in values:
-            self._validate_evidence_paths(run_id, unique_code, value.evidence_paths)
+            if (
+                task_stage == "discovery"
+                and value.category in VALIDATION_DEBT_CATEGORIES
+                and value.verification_status != "candidate"
+            ):
+                value = value.model_copy(update={"verification_status": "candidate"})
+            normalized_paths = self._validate_evidence_paths(
+                run_id,
+                unique_code,
+                value.evidence_paths,
+                evidence_root_path=self._ensure_evidence_root_dir(challenge),
+            )
+            if normalized_paths != value.evidence_paths:
+                value = value.model_copy(update={"evidence_paths": normalized_paths})
             fingerprint = _fingerprint(value.category, value.summary, value.detail)
             summary = value.summary
             detail = value.detail
-            if value.category == "flag":
-                raw_candidate = json.dumps(
-                    {"summary": value.summary, "detail": value.detail},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
-                summary = "Flag candidate"
-                detail = {
-                    "sha256": fingerprint_secret(raw_candidate),
-                    "length": len(raw_candidate),
-                }
             existing = await session.scalar(select(FindingRecord).where(FindingRecord.run_id == run_id, FindingRecord.unique_code == unique_code, FindingRecord.category == value.category, FindingRecord.fingerprint == fingerprint))
             now = self.clock()
             if existing is None:
@@ -4068,27 +4711,60 @@ class StateService:
                     confidence=value.confidence,
                     challenge=challenge,
                 )
-                if value.verification_status == "verified" and value.evidence_paths:
-                    valid_progress = True
-                elif (
+                if (
                     count_candidate_attack_paths
                     and value.category == "attack_path"
                     and value.evidence_paths
                     and value.detail.get("verification_steps")
                 ):
-                    valid_progress = True
+                    progress_kinds.add("new_attack_path")
+                elif (
+                    task_stage in {"validation", "exploitation"}
+                    and value.category == "attack_path"
+                    and value.evidence_paths
+                    and value.detail.get("verification_steps")
+                ):
+                    progress_kinds.add("new_attack_path")
+                elif (
+                    task_stage != "discovery"
+                    and count_evidence_backed_candidates
+                    and value.verification_status == "candidate"
+                    and value.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and value.evidence_paths
+                ):
+                    progress_kinds.add("evidence_backed_discovery")
             else:
                 existing.last_seen_at = now
+                was_evidence_backed_candidate = (
+                    existing.verification_status == "candidate"
+                    and existing.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and bool(existing.evidence_paths)
+                )
+                previous_confidence = existing.confidence
+                previous_evidence_paths = list(existing.evidence_paths)
                 existing.confidence = max(existing.confidence, value.confidence)
                 existing.evidence_paths = list(dict.fromkeys([*existing.evidence_paths, *value.evidence_paths]))
+                changed = (
+                    existing.confidence != previous_confidence
+                    or existing.evidence_paths != previous_evidence_paths
+                )
                 if existing.verification_status != "verified" and value.verification_status == "verified":
                     existing.verification_status = "verified"
                     existing.verified_at = now
+                    changed = True
+                elif (
+                    task_stage != "discovery"
+                    and count_evidence_backed_candidates
+                    and not was_evidence_backed_candidate
+                    and existing.verification_status == "candidate"
+                    and existing.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and existing.evidence_paths
+                ):
+                    progress_kinds.add("evidence_backed_discovery")
+                if changed:
                     existing.version += 1
-                    if existing.evidence_paths:
-                        valid_progress = True
             added.append(self._finding_dict(existing))
-        return valid_progress, added
+        return progress_kinds, added
 
     async def _record_credential(self, session: Any, run_id: str, unique_code: str, finding_id: str | None, value: Any) -> CredentialRecord:
         record = CredentialRecord(credential_id=f"credential_{uuid4().hex}", run_id=run_id, unique_code=unique_code, finding_id=finding_id, kind=value.kind, principal=value.principal, secret_value=value.secret_value, scope=value.scope, verified=value.verified)
@@ -4168,6 +4844,8 @@ class StateService:
         challenge = await session.get(ChallengeRecord, (run_id, unique_code))
         if challenge is None:
             raise StateNotFound("challenge_not_found", "challenge was not found")
+        self._ensure_evidence_root(challenge)
+        self._ensure_evidence_root_dir(challenge)
         return challenge
 
     async def _require_cycle(self, session: Any, run_id: str, cycle_id: str) -> CycleRecord:
@@ -4191,9 +4869,45 @@ class StateService:
         return agent
 
     @staticmethod
-    def _check_version(current: int, expected: int) -> None:
+    def _cycle_recovery_detail(cycle: CycleRecord) -> dict[str, Any]:
+        """Describe the authoritative next actions for a Cycle conflict."""
+
+        if cycle.status in {"state", "analysis"}:
+            allowed_tools = ["challenge_submit_analysis_plan"]
+        elif cycle.status in {"execute", "verify"}:
+            allowed_tools = [
+                "challenge_get_execution_reports",
+                "challenge_commit_cycle",
+            ]
+        elif cycle.status in {"completed", "invalid_cycle_output"}:
+            allowed_tools = ["challenge_begin_cycle"]
+        else:
+            allowed_tools = ["challenge_get_state"]
+        return {
+            "cycle_id": cycle.cycle_id,
+            "current_status": cycle.status,
+            "current_version": cycle.version,
+            "allowed_tools": allowed_tools,
+            "required_tool": "challenge_get_state",
+            "retry_same_arguments": False,
+        }
+
+    @staticmethod
+    def _check_version(
+        current: int,
+        expected: int,
+        *,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
         if current != expected:
-            raise StateConflict("state_conflict", "state version is stale", {"current_version": current})
+            conflict_detail = {"current_version": current}
+            if detail:
+                conflict_detail.update(detail)
+            raise StateConflict(
+                "state_conflict",
+                "state version is stale",
+                conflict_detail,
+            )
 
     def _mark_progress(self, challenge: ChallengeRecord) -> None:
         now = self.clock()
@@ -4202,7 +4916,7 @@ class StateService:
         challenge.stagnation_level = 0
         challenge.hint_eligible = False
         challenge.work_status = "completed" if challenge.is_completed else "active"
-        challenge.l2_explorer_created = False
+        challenge.warning_pivot_used = False
         challenge.extension_cycle_pending = False
         challenge.control_state = "ok"
         challenge.control_since = None
@@ -4223,12 +4937,51 @@ class StateService:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def _ensure_evidence_root(self, challenge: ChallengeRecord) -> str:
-        if not challenge.evidence_root:
-            challenge.evidence_root = (
-                f"challenges/{challenge.unique_code}/evidence/"
-                f"{self._target_fingerprint(challenge)}"
+        target_fingerprint = self._target_fingerprint(challenge)
+        relative = Path(
+            ".aion",
+            "runs",
+            challenge.run_id,
+            "challenges",
+            challenge.unique_code,
+            "evidence",
+            target_fingerprint,
+        )
+        if self.workspace_root is None and self.run_root is not None:
+            relative = Path(
+                "challenges",
+                challenge.unique_code,
+                "evidence",
+                target_fingerprint,
             )
+        if not challenge.evidence_root or Path(challenge.evidence_root).name != target_fingerprint:
+            challenge.evidence_root = relative.as_posix()
         return challenge.evidence_root
+
+    def _ensure_evidence_root_dir(self, challenge: ChallengeRecord) -> Path | None:
+        if self.run_root is None:
+            return None
+        path = (
+            self.run_root
+            / challenge.run_id
+            / "challenges"
+            / challenge.unique_code
+            / "evidence"
+            / self._target_fingerprint(challenge)
+        ).resolve()
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for parent in (
+            path,
+            path.parent,
+            path.parent.parent,
+            path.parent.parent.parent,
+            path.parent.parent.parent.parent,
+        ):
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
+        return path
 
     async def _record_observation_locked(
         self,
@@ -4341,6 +5094,7 @@ class StateService:
         branch_key: str,
         hypothesis_key: str | None,
         kind: str,
+        task_stage: str,
         priority: int,
         mission: str | None,
         agent_id: str | None = None,
@@ -4361,6 +5115,7 @@ class StateService:
                 existing.priority = priority
             if mission:
                 existing.mission = mission
+            existing.task_stage = task_stage
             existing.updated_at = now
             existing.version += 1
             return False
@@ -4372,6 +5127,7 @@ class StateService:
                 target_fingerprint=target,
                 hypothesis_key=hypothesis_key,
                 kind=kind,
+                task_stage=task_stage,
                 status=status,
                 priority=priority,
                 mission=mission,
@@ -4382,13 +5138,13 @@ class StateService:
         )
         return True
 
-    async def _cancel_sibling_branches(
+    async def _cancel_live_branches(
         self,
         session: Any,
         run_id: str,
         unique_code: str,
         *,
-        except_branch: str | None,
+        reason: str,
     ) -> list[str]:
         rows = list(
             (
@@ -4406,13 +5162,11 @@ class StateService:
         cancelled: list[str] = []
         now = self.clock()
         for branch in rows:
-            if branch.branch_key == except_branch:
-                continue
-            branch.status = "superseded"
+            branch.status = "cancelled"
             branch.outcome = {
                 **branch.outcome,
                 "cancelled_at": _json_value(now),
-                "reason": "sibling_success",
+                "reason": reason,
             }
             branch.updated_at = now
             branch.version += 1
@@ -4420,33 +5174,58 @@ class StateService:
         return cancelled
 
     def _validate_evidence_paths(
-        self, run_id: str, unique_code: str, paths: Iterable[str]
-    ) -> None:
+        self,
+        run_id: str,
+        unique_code: str,
+        paths: Iterable[str],
+        *,
+        evidence_root_path: Path | None = None,
+    ) -> list[str]:
         """Reject evidence paths that escape the challenge evidence directory."""
 
+        normalized: list[str] = []
+        evidence_root: Path | None = None
+        if self.run_root is not None and self.workspace_root is not None:
+            evidence_root = evidence_root_path or (
+                self.run_root / run_id / "challenges" / unique_code / "evidence"
+            ).resolve()
         for raw in paths:
             path = str(raw or "")
-            if not path or "://" in path:
+            if not path:
+                continue
+            if "://" in path:
+                if self.workspace_root is not None:
+                    raise StateError(
+                        "invalid_evidence_path",
+                        "evidence path must be a file below the exact challenge evidence directory",
+                        status_code=422,
+                    )
+                normalized.append(path)
                 continue
             value = Path(path)
-            if value.is_absolute():
-                if self.run_root is None:
-                    continue
-                evidence_root = (
-                    self.run_root / run_id / "challenges" / unique_code / "evidence"
-                ).resolve()
-                if not value.resolve().is_relative_to(evidence_root):
+            if evidence_root is None:
+                if value.is_absolute() or ".." in value.parts:
                     raise StateError(
                         "invalid_evidence_path",
                         "evidence path must be inside the challenge evidence directory",
                         status_code=422,
                     )
-            elif ".." in value.parts:
+                normalized.append(path)
+                continue
+            workspace_root = self.workspace_root or self.run_root.parent
+            candidate = value if value.is_absolute() else workspace_root / value
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(evidence_root):
                 raise StateError(
                     "invalid_evidence_path",
-                    "evidence path must not traverse outside the challenge evidence directory",
+                    "evidence path must be inside the exact challenge evidence directory",
                     status_code=422,
                 )
+            if self.workspace_root is not None:
+                normalized.append(resolved.relative_to(self.workspace_root).as_posix())
+            else:
+                normalized.append(resolved.as_posix())
+        return normalized
 
     async def record_observation(
         self,
@@ -4459,8 +5238,7 @@ class StateService:
         source: str,
         source_ref: str | None = None,
         confidence: float = 0.5,
-        mark_progress: bool = True,
-        route_branches: bool = True,
+        mark_progress: bool = False,
     ) -> dict[str, Any]:
         """Persist one deduplicated Observation and route capability branches."""
 
@@ -4513,6 +5291,7 @@ class StateService:
                             branch_key=route.branch_key,
                             hypothesis_key=None,
                             kind=route.kind,
+                            task_stage=route.task_stage,
                             priority=route.priority,
                             mission=route.mission,
                             status="proposed",
@@ -4610,6 +5389,7 @@ class StateService:
                     "target_fingerprint": item.target_fingerprint,
                     "hypothesis_key": item.hypothesis_key,
                     "kind": item.kind,
+                    "task_stage": item.task_stage,
                     "status": item.status,
                     "priority": item.priority,
                     "mission": item.mission,
@@ -4628,16 +5408,16 @@ class StateService:
         *,
         reason: str = "challenge_completed",
     ) -> list[str]:
-        """Mark every live branch of one challenge as superseded."""
+        """Cancel every live branch after an explicit Challenge termination."""
 
         async with self._lock:
             async with self.db.sessions.begin() as session:
                 await self._require_challenge(session, run_id, unique_code)
-                return await self._cancel_sibling_branches(
+                return await self._cancel_live_branches(
                     session,
                     run_id,
                     unique_code,
-                    except_branch=None,
+                    reason=reason,
                 )
 
     async def set_challenge_control_state(
@@ -4765,7 +5545,7 @@ class StateService:
                     challenge.resume_count += 1
                     challenge.stagnation_level = 0
                     challenge.extension_cycle_pending = False
-                    challenge.l2_explorer_created = False
+                    challenge.warning_pivot_used = False
                     challenge.control_state = "ok"
                     challenge.control_since = None
                     challenge.pause_reason = None
@@ -4855,14 +5635,11 @@ class StateService:
 
     @staticmethod
     def _challenge_dict(item: ChallengeRecord) -> dict[str, Any]:
-        return {"run_id": item.run_id, "unique_code": item.unique_code, "description": item.description, "difficulty": item.difficulty, "level": item.level, "total_score": item.total_score, "flag_count": item.flag_count, "correct_flag_count": item.correct_flag_count, "is_completed": item.is_completed, "platform_status": item.platform_status, "container_status": item.container_status, "slot_occupied": container_slot_occupied(item.container_status), "container_addr": item.container_addr, "work_status": item.work_status, "control_state": item.control_state, "control_since": _json_value(item.control_since), "pause_reason": item.pause_reason, "pass_number": item.pass_number, "resume_count": item.resume_count, "evidence_root": item.evidence_root, "stagnation_level": item.stagnation_level, "hint_eligible": item.hint_eligible, "hint_requested": item.hint_requested, "l2_explorer_created": item.l2_explorer_created, "extension_active": item.extension_cycle_pending, "exploration_seconds": item.exploration_seconds, "active_since": _json_value(item.active_since), "last_progress_at": _json_value(item.last_progress_at), "version": item.version}
+        return {"run_id": item.run_id, "unique_code": item.unique_code, "description": item.description, "difficulty": item.difficulty, "level": item.level, "total_score": item.total_score, "flag_count": item.flag_count, "correct_flag_count": item.correct_flag_count, "is_completed": item.is_completed, "platform_status": item.platform_status, "container_status": item.container_status, "slot_occupied": container_slot_occupied(item.container_status), "container_addr": item.container_addr, "direction": item.direction, "work_status": item.work_status, "control_state": item.control_state, "control_since": _json_value(item.control_since), "pause_reason": item.pause_reason, "pass_number": item.pass_number, "resume_count": item.resume_count, "evidence_root": item.evidence_root, "stagnation_level": item.stagnation_level, "hint_eligible": item.hint_eligible, "hint_requested": item.hint_requested, "warning_pivot_used": item.warning_pivot_used, "extension_active": item.extension_cycle_pending, "exploration_seconds": item.exploration_seconds, "active_since": _json_value(item.active_since), "last_progress_at": _json_value(item.last_progress_at), "version": item.version}
 
     @staticmethod
     def _agent_dict(item: AgentRecord, *, include_runtime: bool = False) -> dict[str, Any]:
-        data = {"agent_id": item.agent_id, "run_id": item.run_id, "parent_id": item.parent_id, "unique_code": item.unique_code, "cycle_id": item.cycle_id, "role": item.role, "kind": item.kind, "priority": item.priority, "mission": item.mission, "success_criteria": item.success_criteria, "context_refs": item.context_refs, "hypothesis_key": item.hypothesis_key, "task_key": item.task_key, "branch_key": item.branch_key, "terminal_report_id": item.terminal_report_id, "status": item.status, "timeout_seconds": item.timeout_seconds, "last_heartbeat_at": _json_value(item.last_heartbeat_at), "last_report_sequence": item.last_report_sequence, "report_cursor": item.report_cursor, "report_cursors": item.report_cursors, "controller_cursor": item.controller_cursor, "last_summarized_sequence": item.last_summarized_sequence, "started_at": _json_value(item.started_at), "ended_at": _json_value(item.ended_at), "stop_requested_at": _json_value(item.stop_requested_at), "updated_at": _json_value(item.updated_at), "version": item.version}
-        task_contract = extract_task_contract(item.initial_prompt)
-        if task_contract is not None:
-            data["task_contract"] = task_contract
+        data = {"agent_id": item.agent_id, "run_id": item.run_id, "parent_id": item.parent_id, "unique_code": item.unique_code, "cycle_id": item.cycle_id, "role": item.role, "kind": item.kind, "task_stage": item.task_stage, "priority": item.priority, "mission": item.mission, "success_criteria": item.success_criteria, "context_refs": item.context_refs, "hypothesis_key": item.hypothesis_key, "task_key": item.task_key, "branch_key": item.branch_key, "terminal_report_id": item.terminal_report_id, "status": item.status, "timeout_seconds": item.timeout_seconds, "last_heartbeat_at": _json_value(item.last_heartbeat_at), "last_report_sequence": item.last_report_sequence, "report_cursor": item.report_cursor, "report_cursors": item.report_cursors, "controller_cursor": item.controller_cursor, "last_summarized_sequence": item.last_summarized_sequence, "started_at": _json_value(item.started_at), "ended_at": _json_value(item.ended_at), "stop_requested_at": _json_value(item.stop_requested_at), "updated_at": _json_value(item.updated_at), "version": item.version}
         if include_runtime:
             data.update({"initial_prompt": item.initial_prompt, "session_memory": item.session_memory, "final_report": item.final_report})
         return data

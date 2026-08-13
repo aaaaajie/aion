@@ -143,6 +143,8 @@ async def test_hint_rejects_active_execution_and_late_stagnation_window(
         unique_code="target",
         hypothesis_key="late-path",
         task_key="late-path-1",
+        task_stage="validation",
+        context_refs=[evidence_ref],
         mission="verify the blocker",
     )
     active = await service.evaluate_hint_admission(

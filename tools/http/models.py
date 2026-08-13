@@ -166,7 +166,7 @@ class HttpRequestArguments(HttpModel):
 class HttpProbeArguments(HttpModel):
     cases: list[HttpProbeCase] = Field(
         min_length=1,
-        description="Use one case for a variable matrix. Do not put response-dependent chained steps in one batch; make separate calls with a Session.",
+        description="Use one case for a finite variable matrix. Place variables with exactly {{name}} in method, URL, query, headers, cookies, or body; single-brace {name} is invalid. Do not put response-dependent chained steps in one batch; make separate calls with a Session.",
     )
     concurrency: int = Field(default=8, gt=0)
     rate_limit_per_second: float | None = Field(default=None, gt=0)
@@ -181,7 +181,7 @@ class HttpProbeArguments(HttpModel):
         ge=0,
         description="20 seconds by default; 0 returns immediately; null waits for request execution to finish.",
     )
-    result_limit: int = Field(default=100, gt=0)
+    result_limit: int = Field(default=10, gt=0)
 
 
 class HttpOutputFilters(HttpModel):

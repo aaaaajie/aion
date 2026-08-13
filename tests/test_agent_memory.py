@@ -55,23 +55,23 @@ def test_context_window_override_is_optional_and_validated(monkeypatch: pytest.M
         _settings()
 
 
-def test_sensitive_payloads_are_redacted_without_losing_safe_metadata() -> None:
+def test_payloads_remain_plaintext_for_local_analysis() -> None:
     payload = {
         "flag": "flag{secret-value}",
         "BENCHMARK_TOKEN": "benchmark-secret",
         "nested": {"authorization": "Bearer api-secret"},
     }
-    redacted = redact_tool_payload(
+    plaintext = redact_tool_payload(
         "benchmark_submit_flag",
         payload,
         secrets=("api-secret",),
     )
-    encoded = json.dumps(redacted)
-    assert "flag{secret-value}" not in encoded
-    assert "benchmark-secret" not in encoded
-    assert "api-secret" not in encoded
-    assert redacted["flag"]["redacted"] is True
-    assert redact_value("api-secret", secrets=("api-secret",)) == "[REDACTED]"
+    encoded = json.dumps(plaintext)
+    assert "flag{secret-value}" in encoded
+    assert "benchmark-secret" in encoded
+    assert "api-secret" in encoded
+    assert plaintext["flag"] == "flag{secret-value}"
+    assert redact_value("api-secret", secrets=("api-secret",)) == "api-secret"
 
 
 def test_context_estimation_and_tool_result_limits() -> None:

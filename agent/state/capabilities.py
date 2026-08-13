@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import secrets
 from dataclasses import dataclass
@@ -71,12 +70,6 @@ class CapabilityRegistry:
 
     def __len__(self) -> int:
         return len(self._items)
-
-
-def fingerprint_secret(value: str) -> str:
-    """Return a non-reversible identifier for a candidate secret."""
-
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def constant_time_equal(left: str, right: str) -> bool:

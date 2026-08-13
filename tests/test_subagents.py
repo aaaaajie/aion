@@ -9,19 +9,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from agent.config import AgentSettings
 from agent.runner import ToolRegistry
 from agent.skills import SkillTools
 from agent.state import StateService
-from agent.state.models import ChallengeRecord
-from agent.state.schemas import ExecutionTaskInput
+from agent.state.models import ChallengeRecord, StateEventRecord
 from agent.subagents import (
     AgentSupervisor,
     ChallengeAgentTools,
     ChiefAgentTools,
     ExecutionAgentTools,
+    ExecutionReport,
     SubagentError,
 )
 from agent.subagents.policy import AgentPolicy
@@ -33,6 +34,38 @@ def _settings() -> AgentSettings:
         llm_model="test-model",
         llm_api_key="llm-secret",
     )
+
+
+def test_execution_report_contract_is_strict_and_outcome_is_terminal() -> None:
+    with pytest.raises(ValidationError):
+        ExecutionReport.model_validate(
+            {"status": "completed", "summary": "missing outcome"}
+        )
+    with pytest.raises(ValidationError):
+        ExecutionReport.model_validate(
+            {
+                "status": "working",
+                "summary": "legacy finding",
+                "findings": ["free-form finding"],
+            }
+        )
+    with pytest.raises(ValidationError):
+        ExecutionReport.model_validate(
+            {
+                "status": "completed",
+                "summary": "unsupported claim",
+                "hypothesis_outcome": "supported",
+            }
+        )
+    accepted = ExecutionReport.model_validate(
+        {
+            "status": "completed",
+            "summary": "evidence-backed rejection",
+            "hypothesis_outcome": "rejected",
+            "evidence_paths": ["evidence/rejection.json"],
+        }
+    )
+    assert accepted.hypothesis_outcome == "rejected"
 
 
 def _challenge(code: str) -> dict[str, Any]:
@@ -285,11 +318,39 @@ async def test_role_tools_are_fixed_and_do_not_cross_permissions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_domain_triage_creates_only_four_bounded_probes(
-    tmp_path: Path,
-) -> None:
+async def test_agent_control_tool_schemas_match_state_payloads(tmp_path: Path) -> None:
+    challenge_definition = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in ChallengeAgentTools.tool_definitions()
+    }
+    execution_definition = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in ExecutionAgentTools.tool_definitions()
+    }
+
+    plan_schema = challenge_definition["challenge_submit_analysis_plan"]
+    assert "payload" not in plan_schema["properties"]
+    assert {
+        "cycle_id",
+        "expected_version",
+        "analysis_summary",
+        "direction",
+        "hypotheses",
+        "information_gaps",
+        "avoid_repeating",
+        "tasks",
+    } <= set(plan_schema["properties"])
+    assert "payload" not in challenge_definition["challenge_commit_cycle"]["properties"]
+    assert challenge_definition["challenge_create_execution_agent"]["properties"]["branch_key"]["type"] == "string"
+    assert "task_stage" in challenge_definition["challenge_create_execution_agent"]["required"]
+    assert "hypothesis_outcome" in execution_definition["execution_report"]["required"]
+    assert "working" not in execution_definition["execution_report"]["properties"]["status"]["enum"]
+    finding_schema = execution_definition["execution_update_progress"]["properties"]["findings"]["items"]
+    assert {"category", "summary", "detail", "confidence", "verification_status", "evidence_paths"} <= set(finding_schema["properties"])
+    assert finding_schema["additionalProperties"] is False
+
     service = StateService(
-        tmp_path / "runs" / "domain-low" / "state.sqlite3",
+        tmp_path / "runs" / "tool-contract" / "state.sqlite3",
         run_root=tmp_path / "runs",
     )
     supervisor = AgentSupervisor(
@@ -300,196 +361,274 @@ async def test_low_confidence_domain_triage_creates_only_four_bounded_probes(
         catalog_reconcile_interval_seconds=0,
         state_service=service,
     )
-    chief_id = await supervisor.prepare_chief("coordinate", run_id="domain-low")
-    challenge = await supervisor.create_challenge_agent(chief_id, "task-1")
-    challenge_id = challenge["data"]["agent_id"]
-
-    first = await supervisor.create_domain_probes(challenge_id)
-    assert first["ok"] is True
-    assert first["data"]["decision"] == "probe"
-    assert len(first["data"]["probes"]) == 4
-    overview = await service.get_overview("domain-low")
-    probes = [
-        item for item in overview["agents"] if item["kind"] == "domain_recognition"
-    ]
-    assert len(probes) == 4
-    assert {item["timeout_seconds"] for item in probes} == {120}
-    assert {
-        item["task_key"].split(":")[1] for item in probes
-    } == {"web", "blockchain", "ai", "other"}
-    ai_probe = next(
-        item
-        for item in probes
-        if item["task_key"].startswith("domain-recognition:ai")
+    chief_id = await supervisor.prepare_chief("coordinate", run_id="tool-contract")
+    created = await supervisor.create_challenge_agent(chief_id, "task-1")
+    challenge_id = created["data"]["agent_id"]
+    challenge = ChallengeAgentTools(
+        supervisor,
+        agent_id=challenge_id,
+        unique_code="task-1",
     )
-    assert "/chat, /completions, /generate, /v1/models, or /ask" in ai_probe["mission"]
-    assert "messages, prompt, input, system, model, temperature" in ai_probe["mission"]
-    assert "choices, role=assistant, content, usage" in ai_probe["mission"]
-    web_mission = next(
-        item["mission"]
-        for item in probes
-        if item["task_key"].startswith("domain-recognition:web")
+    state = await challenge.dispatch("challenge_get_state", {})
+    cycle = await challenge.dispatch(
+        "challenge_begin_cycle",
+        {"expected_challenge_version": state["data"]["challenge"]["version"]},
     )
-    assert "cross-domain AI evidence" in web_mission
-
-    second = await supervisor.create_domain_probes(challenge_id)
-    assert second["data"]["decision"] == "pending"
-    assert len(
-        [
-            item
-            for item in (await service.get_overview("domain-low"))["agents"]
-            if item["kind"] == "domain_recognition"
-        ]
-    ) == 4
-    before_progress = next(
-        item
-        for item in (await service.get_overview("domain-low"))["challenges"]
-        if item["unique_code"] == "task-1"
-    )["last_progress_at"]
-    web_probe = next(item for item in probes if item["task_key"].startswith("domain-recognition:web"))
-    probe_tools = ExecutionAgentTools(
-        supervisor, agent_id=web_probe["agent_id"], unique_code="task-1"
-    )
-    reported = await probe_tools.dispatch(
-        "execution_report",
+    cycle_data = cycle["data"]
+    plan = await challenge.dispatch(
+        "challenge_submit_analysis_plan",
         {
-            "status": "completed",
-            "summary": "DOMAIN_MATCH=true",
-            "confidence": 0.92,
-            "findings": [
+            "cycle_id": cycle_data["cycle_id"],
+            "expected_version": cycle_data["version"],
+            "analysis_summary": "test the explicit plan contract",
+            "direction": "web",
+            "hypotheses": [
                 {
-                    "category": "other",
-                    "summary": "Domain recognition result: web",
-                    "detail": {
-                        "domain": "web",
-                        "is_match": True,
-                        "confidence": 0.92,
-                        "signals": ["description:http"],
-                    },
-                    "verification_status": "verified",
+                    "key": "contract-hypothesis",
+                    "statement": "the explicit tool contract can create one bounded task",
+                }
+            ],
+            "information_gaps": ["contract result"],
+            "avoid_repeating": [],
+            "tasks": [
+                {
+                    "task_key": "contract-task-1",
+                    "hypothesis_key": "contract-hypothesis",
+                    "kind": "verification",
+                    "task_stage": "discovery",
+                    "objective": "verify the tool contract",
+                    "branch_key": "contract:tool:schema",
+                    "success_criteria": ["the task is persisted"],
+                    "context_refs": ["test:tool-contract"],
+                    "timeout_seconds": 30,
                 }
             ],
         },
     )
-    assert reported["ok"] is True
-    after = await service.get_overview("domain-low")
-    assert all(
-        item["status"] == "queued"
-        for item in after["agents"]
-        if item["kind"] == "domain_recognition"
-        and item["agent_id"] != web_probe["agent_id"]
+    assert plan["ok"] is True
+    committed = await challenge.dispatch(
+        "challenge_commit_cycle",
+        {
+            "cycle_id": cycle_data["cycle_id"],
+            "expected_version": plan["data"]["version"],
+            "summary": "the explicit cycle contract was accepted",
+            "findings": [],
+            "credentials": [],
+            "next_steps": [],
+            "new_attack_paths": [],
+            "outcome": "no_progress",
+        },
     )
-    assert next(
-        item for item in after["challenges"] if item["unique_code"] == "task-1"
-    )["last_progress_at"] == before_progress
-    for probe in probes:
-        if probe["agent_id"] == web_probe["agent_id"]:
-            continue
-        domain = probe["task_key"].split(":")[1]
-        result = await ExecutionAgentTools(
-            supervisor, agent_id=probe["agent_id"], unique_code="task-1"
-        ).dispatch(
-            "execution_report",
-            {
-                "status": "completed",
-                "summary": f"{domain}: no",
-                "confidence": 0.9,
-                "findings": [
-                    {
-                        "category": "other",
-                        "summary": f"Domain recognition result: {domain}",
-                        "detail": {
-                            "domain": domain,
-                            "is_match": False,
-                            "confidence": 0.9,
-                            "signals": ["metadata mismatch"],
-                        },
-                    }
-                ],
-            },
-        )
-        assert result["ok"] is True
-    resolved = await supervisor.create_domain_probes(challenge_id)
-    assert resolved["data"]["decision"] == "direct"
-    assert resolved["data"]["domain"] == "web"
-    assert resolved["data"]["scanner_profile"] == "web_light"
-    assert resolved["data"]["skill_id"] == "web.light_scanner"
-    assert "# Web Light Scanner Skill" in resolved["data"]["skill_instructions"]
-    assert resolved["data"]["evidence_refs"][0].startswith("observation:")
-    assert len(resolved["data"]["first_round_tasks"]) == 2
-    fingerprint_task = next(
-        task
-        for task in resolved["data"]["first_round_tasks"]
-        if task["task_key"] == "web-light-fingerprint-1"
+    assert committed["ok"] is True
+    created_execution = await challenge.dispatch(
+        "challenge_create_execution_agent",
+        {
+            "mission": "verify the progress contract",
+            "hypothesis_key": "challenge-direction",
+            "task_key": "direction-probe-1",
+            "kind": "verification",
+            "task_stage": "discovery",
+            "branch_key": "challenge:direction:probe",
+        },
     )
-    resolved_task = ExecutionTaskInput.model_validate(
-        fingerprint_task
+    assert created_execution["ok"] is True
+    execution_id = created_execution["data"]["agent_id"]
+
+    execution = ExecutionAgentTools(
+        supervisor,
+        agent_id=execution_id,
+        unique_code="task-1",
     )
-    assert resolved_task.scanner_profile == "web_light"
-    assert resolved_task.target_scope == ["challenge-metadata:task-1"]
-    assert set(resolved_task.tool_names) == {
-        "execution_get_assignment",
-        "system_web_fingerprint",
-        "system_http_output",
-        "system_http_analyze",
-        "execution_report",
-    }
+    progress = await execution.dispatch(
+        "execution_update_progress",
+        {
+            "status": "working",
+            "phase": "contract-check",
+            "summary": "persisting a canonical finding",
+            "findings": [
+                {
+                    "category": "service",
+                    "summary": "contract finding",
+                    "detail": {"source": "test"},
+                    "confidence": 0.9,
+                    "verification_status": "candidate",
+                    "evidence_paths": ["contract.json"],
+                }
+            ],
+            "evidence_paths": ["contract.json"],
+            "expected_result_seconds": 30,
+        },
+    )
+    assert progress["ok"] is True
+
+    before = await service.get_overview("tool-contract")
+    rejected_plan = await challenge.dispatch(
+        "challenge_submit_analysis_plan",
+        {
+            "cycle_id": cycle_data["cycle_id"],
+            "expected_version": 1,
+            "payload": {"analysis_summary": "obsolete payload"},
+        },
+    )
+    after = await service.get_overview("tool-contract")
+    assert rejected_plan["ok"] is False
+    assert rejected_plan["error"]["code"] == "invalid_arguments"
+    assert len(after["agents"]) == len(before["agents"])
+
+    rejected_progress = await execution.dispatch(
+        "execution_update_progress",
+        {
+            "status": "working",
+            "phase": "contract-check",
+            "summary": "reject legacy finding shape",
+            "findings": [{"title": "legacy finding"}],
+        },
+    )
+    assert rejected_progress["ok"] is False
+    assert rejected_progress["error"]["code"] == "invalid_arguments"
+
     await supervisor.close()
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_high_confidence_domain_triage_selects_profile_without_probe_agents(
+async def test_challenge_conflict_requires_authoritative_refresh(
     tmp_path: Path,
 ) -> None:
-    benchmark = _FakeBenchmark()
-    benchmark.challenges[0]["unique_code"] = "web-sqli"
-    benchmark.challenges[0]["description"] = (
-        "Inspect the Flask HTTP API for SQL injection"
-    )
-    benchmark.challenges[0]["container_addr"] = ["http://127.0.0.1:8000"]
     service = StateService(
-        tmp_path / "runs" / "domain-high" / "state.sqlite3",
+        tmp_path / "runs" / "refresh-gate" / "state.sqlite3",
         run_root=tmp_path / "runs",
     )
     supervisor = AgentSupervisor(
         _settings(),
-        benchmark=benchmark,
+        benchmark=_FakeBenchmark(),
         run_root=tmp_path / "runs",
         runner_factory=_FakeRunner,
         catalog_reconcile_interval_seconds=0,
         state_service=service,
     )
-    chief_id = await supervisor.prepare_chief("coordinate", run_id="domain-high")
-    challenge = await supervisor.create_challenge_agent(chief_id, "web-sqli")
-    result = await supervisor.create_domain_probes(challenge["data"]["agent_id"])
+    chief_id = await supervisor.prepare_chief("coordinate", run_id="refresh-gate")
+    first_created = await supervisor.create_challenge_agent(chief_id, "task-1")
+    second_created = await supervisor.create_challenge_agent(chief_id, "task-2")
+    first = ChallengeAgentTools(
+        supervisor,
+        agent_id=first_created["data"]["agent_id"],
+        unique_code="task-1",
+    )
+    second = ChallengeAgentTools(
+        supervisor,
+        agent_id=second_created["data"]["agent_id"],
+        unique_code="task-2",
+    )
 
-    assert result["data"]["decision"] == "direct"
-    assert result["data"]["domain"] == "web"
-    assert result["data"]["scanner_profile"] == "web_light"
-    assert result["data"]["skill_id"] == "web.light_scanner"
-    assert "# Web Light Scanner Skill" in result["data"]["skill_instructions"]
-    assert result["data"]["evidence_refs"][0].startswith("observation:")
-    assert len(result["data"]["first_round_tasks"]) == 2
-    fingerprint_task = next(
-        task
-        for task in result["data"]["first_round_tasks"]
-        if task["task_key"] == "web-light-fingerprint-1"
+    first_state = await first.dispatch("challenge_get_state", {})
+    first_cycle = await first.dispatch(
+        "challenge_begin_cycle",
+        {
+            "expected_challenge_version": first_state["data"]["challenge"]["version"]
+        },
     )
-    direct_task = ExecutionTaskInput.model_validate(
-        fingerprint_task
+    planned = await first.dispatch(
+        "challenge_submit_analysis_plan",
+        {
+            "cycle_id": first_cycle["data"]["cycle_id"],
+            "expected_version": first_cycle["data"]["version"],
+            "analysis_summary": "persist the first cycle",
+        },
     )
-    assert direct_task.scanner_profile == "web_light"
-    assert direct_task.target_scope == ["http://127.0.0.1:8000"]
-    assert set(direct_task.tool_names) == {
-        "execution_get_assignment",
-        "system_web_fingerprint",
-        "system_http_output",
-        "system_http_analyze",
-        "execution_report",
+    assert planned["ok"] is True
+
+    async with service.db.sessions() as session:
+        before_events = len(
+            (
+                await session.scalars(
+                    select(StateEventRecord).where(
+                        StateEventRecord.run_id == "refresh-gate"
+                    )
+                )
+            ).all()
+        )
+    stale_arguments = {
+        "cycle_id": first_cycle["data"]["cycle_id"],
+        "expected_version": first_cycle["data"]["version"],
+        "analysis_summary": "retry stale cycle state",
     }
-    overview = await service.get_overview("domain-high")
-    assert all(item["role"] != "execution" for item in overview["agents"])
+    stale = await first.dispatch("challenge_submit_analysis_plan", stale_arguments)
+    assert stale["ok"] is False
+    assert stale["error"]["code"] == "state_conflict"
+    assert stale["error"]["status_code"] == 409
+    assert stale["error"]["detail"]["required_tool"] == "challenge_get_state"
+    assert stale["error"]["detail"]["retry_same_arguments"] is False
+    assert stale["error"]["detail"]["cycle_id"] == first_cycle["data"]["cycle_id"]
+    assert stale["error"]["detail"]["current_status"] == "execute"
+    assert stale["error"]["detail"]["current_version"] == planned["data"]["version"]
+
+    # A newly constructed wrapper must observe the Supervisor-level gate.
+    rebuilt = ChallengeAgentTools(
+        supervisor,
+        agent_id=first_created["data"]["agent_id"],
+        unique_code="task-1",
+    )
+    repeated = await rebuilt.dispatch(
+        "challenge_submit_analysis_plan", stale_arguments
+    )
+    assert repeated["ok"] is False
+    assert repeated["error"]["code"] == "state_refresh_required"
+    assert repeated["error"]["detail"]["original_conflict_code"] == "state_conflict"
+    assert repeated["error"]["detail"]["required_tool"] == "challenge_get_state"
+    waiting = await rebuilt.dispatch("challenge_wait_for_state", {})
+    assert waiting["ok"] is False
+    assert waiting["error"]["code"] == "state_refresh_required"
+
+    async with service.db.sessions() as session:
+        after_events = len(
+            (
+                await session.scalars(
+                    select(StateEventRecord).where(
+                        StateEventRecord.run_id == "refresh-gate"
+                    )
+                )
+            ).all()
+        )
+    assert after_events == before_events
+
+    # The gate is scoped to one Challenge Agent.
+    second_state = await second.dispatch("challenge_get_state", {})
+    second_cycle = await second.dispatch(
+        "challenge_begin_cycle",
+        {
+            "expected_challenge_version": second_state["data"]["challenge"]["version"]
+        },
+    )
+    assert second_cycle["ok"] is True
+
+    refreshed = await rebuilt.dispatch("challenge_get_state", {})
+    assert refreshed["ok"] is True
+    current_cycle = refreshed["data"]["recent_cycles"][0]
+    wrong_phase = await rebuilt.dispatch(
+        "challenge_submit_analysis_plan",
+        {
+            "cycle_id": current_cycle["cycle_id"],
+            "expected_version": current_cycle["version"],
+            "analysis_summary": "plan after the cycle already entered execute",
+        },
+    )
+    assert wrong_phase["ok"] is False
+    assert wrong_phase["error"]["code"] == "invalid_cycle_phase"
+    assert wrong_phase["error"]["detail"]["current_status"] == "execute"
+    assert "challenge_commit_cycle" in wrong_phase["error"]["detail"]["allowed_tools"]
+
+    await rebuilt.dispatch("challenge_get_state", {})
+    committed = await rebuilt.dispatch(
+        "challenge_commit_cycle",
+        {
+            "cycle_id": current_cycle["cycle_id"],
+            "expected_version": current_cycle["version"],
+            "summary": "finish the empty test cycle",
+            "outcome": "no_progress",
+        },
+    )
+    assert committed["ok"] is True
     await supervisor.close()
     await service.close()
 
@@ -701,7 +840,7 @@ async def test_stagnant_pause_failure_keeps_slot_and_rejects_switch(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_warning_allows_one_explicit_exploration_only(tmp_path: Path) -> None:
+async def test_warning_allows_parallel_validation_and_one_discovery_pivot(tmp_path: Path) -> None:
     service = StateService(
         tmp_path / "runs" / "explorer" / "state.sqlite3", run_root=tmp_path / "runs"
     )
@@ -723,28 +862,72 @@ async def test_warning_allows_one_explicit_exploration_only(tmp_path: Path) -> N
         row.work_status = "warning"
         row.hint_eligible = True
 
-    generic = await supervisor.create_execution_agent(
-        challenge_id,
-        "generic sweep",
-        hypothesis_key="generic-sweep",
-        task_key="generic-sweep-1",
+    observation = await service.record_observation(
+        "explorer",
+        "task-1",
+        category="service",
+        summary="HTTP entry point found",
+        source="test",
+        mark_progress=False,
     )
-    assert generic["ok"] is False
-    assert generic["error"]["code"] == "exploration_only"
+    evidence_ref = f"observation:{observation['observation_id']}"
+
+    first_validation = await supervisor.create_execution_agent(
+        challenge_id,
+        "validate authorization behavior",
+        hypothesis_key="authorization-validation",
+        task_key="authorization-validation-1",
+        task_stage="validation",
+        context_refs=[evidence_ref],
+    )
+    assert first_validation["ok"] is True
+    second_validation = await supervisor.create_execution_agent(
+        challenge_id,
+        "validate input behavior",
+        hypothesis_key="input-validation",
+        task_key="input-validation-1",
+        task_stage="validation",
+        context_refs=[evidence_ref],
+    )
+    assert second_validation["ok"] is True
+    challenge_state = next(
+        item for item in await service.list_challenges("explorer")
+        if item["unique_code"] == "task-1"
+    )
+    assert challenge_state["warning_pivot_used"] is False
+
     missing_gap = await supervisor.create_execution_agent(
         challenge_id,
         "explore",
         hypothesis_key="missing-gap",
         task_key="missing-gap-1",
+        task_stage="discovery",
         kind="exploration",
     )
     assert missing_gap["ok"] is False
-    assert missing_gap["error"]["code"] == "information_gap_required"
+    assert missing_gap["error"]["code"] == "warning_discovery_reference_required"
+    failed_after_reservation = await supervisor.create_execution_agent(
+        challenge_id,
+        "pivot through an already active branch",
+        hypothesis_key="failed-pivot",
+        task_key="failed-pivot-1",
+        task_stage="discovery",
+        branch_key="authorization-validation:general",
+        context_refs=["gap:failed-pivot"],
+    )
+    assert failed_after_reservation["ok"] is False
+    assert failed_after_reservation["error"]["code"] == "branch_already_active"
+    challenge_state = next(
+        item for item in await service.list_challenges("explorer")
+        if item["unique_code"] == "task-1"
+    )
+    assert challenge_state["warning_pivot_used"] is False
     first = await supervisor.create_execution_agent(
         challenge_id,
         "verify the unauthenticated document endpoint",
         hypothesis_key="authorization-boundary",
         task_key="authorization-boundary-1",
+        task_stage="discovery",
         kind="exploration",
         context_refs=["gap:authorization-boundary"],
     )
@@ -754,17 +937,18 @@ async def test_warning_allows_one_explicit_exploration_only(tmp_path: Path) -> N
         "verify a second direction",
         hypothesis_key="second-direction",
         task_key="second-direction-1",
+        task_stage="discovery",
         kind="exploration",
         context_refs=["gap:second-direction"],
     )
     assert second["ok"] is False
-    assert second["error"]["code"] == "stagnation_explorer_limit"
+    assert second["error"]["code"] == "warning_discovery_limit"
     await supervisor.close()
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Path) -> None:
+async def test_supervisor_enforces_slots_reports_and_plaintext_flag(tmp_path: Path) -> None:
     benchmark = _FakeBenchmark()
     service = StateService(
         tmp_path / "runs" / "run-one" / "state.sqlite3",
@@ -803,11 +987,10 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
     execution = await challenge.dispatch(
         "challenge_create_execution_agent",
         {
-            **_atomic_task_arguments(
-                mission="inspect the service",
-                hypothesis_key="service-inspection",
-                task_key="service-inspection-1",
-            ),
+            "mission": "inspect the service",
+            "hypothesis_key": "service-inspection",
+            "task_key": "service-inspection-1",
+            "task_stage": "discovery",
             "timeout_seconds": 20,
         },
     )
@@ -821,7 +1004,17 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
             "status": "completed",
             "summary": "found a candidate",
             "candidate_flag": candidate,
-            "findings": [{"title": "test", "detail": "safe"}],
+            "hypothesis_outcome": "inconclusive",
+            "findings": [
+                {
+                    "category": "flag",
+                    "summary": "candidate Flag extracted",
+                    "detail": {"source": "test"},
+                    "confidence": 1.0,
+                    "verification_status": "candidate",
+                    "evidence_paths": ["evidence/flag-candidate.txt"],
+                }
+            ],
         },
     )
     assert report["ok"] is True
@@ -830,17 +1023,12 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
     assert reports["data"]["reports"][0]["candidate_flag"] == candidate
 
     stored_report = (tmp_path / "runs" / "run-one" / "agents" / execution_id / "report.json").read_text()
-    assert candidate not in stored_report
-    assert "sha256" in stored_report
+    assert candidate in stored_report
 
     submitted = await challenge.dispatch("challenge_submit_flag", {"flag": candidate})
     assert submitted["ok"] is True
     root_events = (tmp_path / "runs" / "run-one" / "events.jsonl").read_text()
     assert candidate not in root_events
-    assert all(
-        candidate.encode() not in path.read_bytes()
-        for path in (tmp_path / "runs" / "run-one").glob("state.sqlite3*")
-    )
     assert supervisor.state_service is not None
     operations = await supervisor.state_service.list_operations("run-one")
     assert operations
@@ -850,7 +1038,8 @@ async def test_supervisor_enforces_slots_reports_and_flag_redaction(tmp_path: Pa
         for item in operations
         if item["operation_type"] == "benchmark_submit_flag"
     )
-    assert submitted_operation["request_payload"]["flag"]["sha256"]
+    assert submitted_operation["request_payload"]["flag"] == candidate
+    assert submitted_operation["result_payload"]["data"]["correct"] is True
     assert submitted_operation["started_sequence"] < submitted_operation["completed_sequence"]
 
     for code in ("task-2", "task-3"):
@@ -965,6 +1154,7 @@ async def test_failed_execution_report_contains_safe_reason_and_advances_parent_
         "inspect the service",
         hypothesis_key="service-inspection-failure",
         task_key="service-inspection-failure-1",
+        task_stage="discovery",
     )
     execution_id = execution_result["data"]["agent_id"]
 
@@ -1035,6 +1225,7 @@ async def test_challenge_controller_waits_and_consumes_each_sequence_once(
         unique_code="task-1",
         hypothesis_key="controller-report",
         task_key="controller-report-1",
+        task_stage="discovery",
         mission="report fixture",
     )
     report = await service.publish_control_report(
@@ -1194,6 +1385,7 @@ async def test_execution_without_structured_report_has_one_failed_terminal_state
         "return without a report",
         hypothesis_key="missing-report",
         task_key="missing-report-1",
+        task_stage="discovery",
     )
     execution_id = execution["data"]["agent_id"]
     await supervisor.launch_execution_agent(execution_id)

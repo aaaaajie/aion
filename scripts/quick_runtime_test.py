@@ -27,6 +27,11 @@ Pass ``--vpn`` to start and own the single OpenVPN profile under
 """
 
 from __future__ import annotations
+from scripts.runtime_web import RuntimeMonitor
+from scripts.network_manager import VPNManager, discover_vpn_config
+from agent.runner import AgentRunner, ToolRegistry
+from agent.runtime import AgentRuntime
+from agent.config import AgentSettings
 
 import argparse
 import asyncio
@@ -40,12 +45,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.config import AgentSettings
-from agent.runtime import AgentRuntime
-from agent.runner import AgentRunner, ToolRegistry
-from scripts.network_manager import VPNManager, discover_vpn_config
-from scripts.runtime_web import RuntimeMonitor
-
 
 # Local-only challenge slots. The name becomes the internal SQLite challenge
 # key and the address is passed to Challenge/Execution Agents as target
@@ -53,7 +52,7 @@ from scripts.runtime_web import RuntimeMonitor
 CHALLENGES: list[dict[str, Any]] = [
     {
         "name": "test",
-        "description": "ctf-test",
+        "description": "test1",
         "address": "http://www.dlhayashi.com/",
         "mission": (
             "Test the configured CTF address with the available tools. Do not "
@@ -276,7 +275,8 @@ def _selected_challenges(override: str | None) -> list[dict[str, Any]]:
         if isinstance(raw_address, str):
             addresses = [raw_address.strip()] if raw_address.strip() else []
         elif isinstance(raw_address, list):
-            addresses = [str(value).strip() for value in raw_address if str(value).strip()]
+            addresses = [str(value).strip()
+                         for value in raw_address if str(value).strip()]
         else:
             addresses = []
         if not addresses:
@@ -544,7 +544,8 @@ async def run_test(
                     )
                     result_message = f"challenge agent failed: {unique_code}"
                     break
-                started_agents.append((unique_code, result["data"]["agent_id"]))
+                started_agents.append(
+                    (unique_code, result["data"]["agent_id"]))
                 print(f"[quick-test] challenge agent started: {unique_code}")
             else:
                 result_code = 0
@@ -568,11 +569,13 @@ async def run_test(
                 if expected_codes.issubset(actual_codes):
                     for item in overview["agents"]:
                         if item["role"] == "challenge" and item["unique_code"] in expected_codes:
-                            started_agents.append((item["unique_code"], item["agent_id"]))
+                            started_agents.append(
+                                (item["unique_code"], item["agent_id"]))
                     break
                 await asyncio.sleep(1)
             if len(started_agents) != len(expected_codes):
-                print("[quick-test] Chief did not create all configured Challenge Agents")
+                print(
+                    "[quick-test] Chief did not create all configured Challenge Agents")
                 result_message = "Chief did not create all configured Challenge Agents"
             else:
                 print("[quick-test] Chief created the configured Challenge Agents")
@@ -650,9 +653,11 @@ async def run_test(
                     if challenge and challenge["container_status"] in {"starting", "running"}:
                         close_result = await runtime.supervisor.close_challenge(challenge_agent_id)
                         if close_result.get("ok"):
-                            print(f"[quick-test] local challenge slot closed: {unique_code}")
+                            print(
+                                f"[quick-test] local challenge slot closed: {unique_code}")
                         else:
-                            print(f"[quick-test] local challenge slot close failed: {unique_code}")
+                            print(
+                                f"[quick-test] local challenge slot close failed: {unique_code}")
         finally:
             await runtime.close()
             if network_manager is not None:
@@ -662,10 +667,12 @@ async def run_test(
                     monitor.freeze(result_code, message=result_message)
                     print(f"[quick-test] monitor frozen: {monitor.url}")
                     if not monitor_exit_on_complete and not interrupted:
-                        print("[quick-test] press Ctrl-C to close the frozen monitor")
+                        print(
+                            "[quick-test] press Ctrl-C to close the frozen monitor")
                         await _wait_for_monitor_exit()
                 except Exception as exc:
-                    print(f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}")
+                    print(
+                        f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}")
                 finally:
                     monitor.close()
 

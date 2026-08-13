@@ -8,9 +8,10 @@ or Flag acquisition.
 <mission>
 $mission
 </mission>
-<execution_task_contract>
-$task_contract
-</execution_task_contract>
+
+<task_stage>
+$task_stage
+</task_stage>
 <target_addresses>
 $target_addresses
 </target_addresses>

@@ -6,17 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from scan.contracts import (
-    CostClass,
-    DomainName,
-    ScannerProfileName,
-    TaskPhase,
-    dependency_batches,
-    validate_domain_profile,
-    validate_profile_tools,
-    validate_task_budgets,
-)
-
 FindingCategory = Literal[
     "service",
     "vulnerability",
@@ -27,6 +16,10 @@ FindingCategory = Literal[
     "other",
 ]
 VerificationStatus = Literal["candidate", "verified", "rejected"]
+ChallengeDirection = Literal["unknown", "web", "binary", "ai", "blockchain"]
+CHALLENGE_DIRECTION_VALUES = frozenset(
+    {"unknown", "web", "binary", "ai", "blockchain"}
+)
 ExecutionKind = Literal[
     "general",
     "recon",
@@ -38,6 +31,8 @@ ExecutionKind = Literal[
     "exploration",
     "domain_recognition",
 ]
+TaskStage = Literal["discovery", "validation", "exploitation"]
+HypothesisOutcome = Literal["supported", "rejected", "inconclusive"]
 ChallengeWorkStatus = Literal[
     "unassigned",
     "active",
@@ -99,10 +94,7 @@ class ExecutionTaskInput(StrictModel):
         description="Stable capability branch key; defaults to hypothesis:kind when omitted.",
     )
     kind: ExecutionKind = "general"
-    task_phase: TaskPhase
-    entry_point: str = Field(min_length=1, max_length=2_000)
-    capability_class: str = Field(min_length=1, max_length=128)
-    verification_question: str = Field(min_length=1, max_length=2_000)
+    task_stage: TaskStage
     objective: str = Field(min_length=1, max_length=4_000)
     target_scope: list[str] = Field(min_length=1, max_length=20)
     tool_names: list[str] = Field(min_length=1, max_length=20)
@@ -201,6 +193,7 @@ class AnalysisPlanInput(StrictModel):
     domain_evidence_refs: list[str] = Field(min_length=1, max_length=20)
     scanner_profile: ScannerProfileName
     analysis_summary: str = Field(min_length=1, max_length=8_000)
+    direction: ChallengeDirection = "unknown"
     hypotheses: list[HypothesisInput] = Field(default_factory=list, max_length=50)
     information_gaps: list[str] = Field(default_factory=list, max_length=50)
     avoid_repeating: list[str] = Field(default_factory=list, max_length=50)
@@ -267,7 +260,6 @@ class VerificationUpdateInput(StrictModel):
     summary: str = Field(min_length=1, max_length=8_000)
     findings: list[FindingInput] = Field(default_factory=list, max_length=100)
     credentials: list[CredentialInput] = Field(default_factory=list, max_length=50)
-    rejected_finding_ids: list[str] = Field(default_factory=list, max_length=100)
     next_steps: list[str] = Field(default_factory=list, max_length=50)
     new_attack_paths: list[AttackPathInput] = Field(default_factory=list, max_length=20)
     outcome: Literal["progress", "no_progress", "completed", "blocked", "failed"]
@@ -282,6 +274,20 @@ class AgentProgressInput(StrictModel):
     expected_result_seconds: int | None = Field(default=None, ge=1, le=300)
 
 
+class FindingResolutionInput(StrictModel):
+    finding_ref: str = Field(min_length=1, max_length=256)
+    outcome: Literal["verified", "rejected"]
+    evidence_paths: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("finding_ref", "evidence_paths")
+    @classmethod
+    def non_blank_references(cls, value: Any) -> Any:
+        values = [value] if isinstance(value, str) else value
+        if any(not item.strip() for item in values):
+            raise ValueError("finding resolution references must not be blank")
+        return value
+
+
 class AgentReportInput(StrictModel):
     status: Literal["working", "completed", "blocked", "failed", "cancelled"]
     summary: str = Field(min_length=1, max_length=4_000)
@@ -291,6 +297,24 @@ class AgentReportInput(StrictModel):
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
     confidence: float | None = Field(default=None, ge=0, le=1)
+    hypothesis_outcome: HypothesisOutcome | None = None
+    finding_resolutions: list[FindingResolutionInput] = Field(
+        default_factory=list, max_length=50
+    )
+
+    @model_validator(mode="after")
+    def validate_terminal_outcome(self) -> "AgentReportInput":
+        if self.status != "working" and self.hypothesis_outcome is None:
+            raise ValueError("hypothesis_outcome is required for terminal reports")
+        if self.hypothesis_outcome in {"supported", "rejected"}:
+            has_evidence = bool(self.evidence_paths) or any(
+                finding.evidence_paths for finding in self.findings
+            ) or any(item.evidence_paths for item in self.finding_resolutions)
+            if not has_evidence:
+                raise ValueError(
+                    "supported or rejected outcomes require structured evidence"
+                )
+        return self
 
 
 class CreateCycleInput(StrictModel):
