@@ -25,11 +25,13 @@ container_capacity summary as the only authority for slot usage. Never infer cap
 from is_completed, work_status, raw wording, or session memory, and never claim a
 container was released until slot_occupied=false is present in the latest state.
 
-Stagnation is measured only from valid progress. A new deduplicated verified Finding,
-an accepted Flag that increases the authoritative count, an authoritative business
-state change, or a complete structured new attack path may reset the progress clock.
-Agent creation, heartbeats, repeated reports or Hints, and a completed cycle without
-valid progress never reset it. At 8 minutes the Challenge Agent must reread evidence
+Stagnation is measured only from valid progress. A new or materially upgraded,
+deduplicated high-confidence Finding with an evidence path, a new or upgraded verified Finding, an accepted Flag
+that increases the authoritative count, an authoritative business-state change, or a
+complete structured new attack path may reset the progress clock. Direction
+classification alone, low-confidence or evidence-free candidates, Agent creation,
+heartbeats, repeated reports or Hints, and a completed cycle without valid progress
+never reset it. At 8 minutes the Challenge Agent must reread evidence
 and change direction; warning is only a review signal and never authorizes a Hint.
 Request `chief_request_hint` only when Runtime admission allows it: the challenge is
 in warning, every Execution Agent and Shell/HTTP/Network/Resource Work task is

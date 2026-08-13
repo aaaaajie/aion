@@ -320,7 +320,7 @@ async def test_ownership_and_resource_disk_admission(tmp_path: Path) -> None:
     await service.close()
 
 
-def test_http_tool_contract_and_audit_redaction() -> None:
+def test_http_tool_contract_and_plaintext_audit() -> None:
     definitions = HttpTools.tool_definitions()
     names = [item["function"]["name"] for item in definitions]
     assert names == [
@@ -351,7 +351,7 @@ def test_http_tool_contract_and_audit_redaction() -> None:
     request_properties = request_schema["$defs"]["HttpRequestSpec"]["properties"]
     assert "http://" in request_properties["url"]["description"]
     assert "request_intent" in request_properties
-    redacted = redact_tool_payload(
+    plaintext = redact_tool_payload(
         "system_http_request",
         {
             "request": {
@@ -361,12 +361,12 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             }
         },
     )
-    encoded = json.dumps(redacted)
-    assert "Bearer secret" not in encoded
-    assert "sid=secret" not in encoded
-    assert '"value": "secret"' not in encoded
+    encoded = json.dumps(plaintext)
+    assert "Bearer secret" in encoded
+    assert "sid=secret" in encoded
+    assert '"value": "secret"' in encoded
 
-    path_redacted = redact_tool_payload(
+    path_plaintext = redact_tool_payload(
         "system_web_path_probe",
         {
             "url": "https://x.test/",
@@ -376,9 +376,9 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(path_redacted)
+    assert "secret" in json.dumps(path_plaintext)
 
-    fingerprint_redacted = redact_tool_payload(
+    fingerprint_plaintext = redact_tool_payload(
         "system_web_fingerprint",
         {
             "url": "https://x.test/",
@@ -386,7 +386,7 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(fingerprint_redacted)
+    assert "secret" in json.dumps(fingerprint_plaintext)
 
 
 def test_zip_expansion_and_unresolved_variables_are_validated(tmp_path: Path) -> None:

@@ -94,6 +94,7 @@ class ChallengeRecord(Base):
     platform_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     container_status: Mapped[str] = mapped_column(String(32), default="stopped", nullable=False)
     container_addr: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    direction: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
     work_status: Mapped[str] = mapped_column(String(32), default="unassigned", nullable=False)
     control_state: Mapped[str] = mapped_column(
         String(32), default="ok", nullable=False
@@ -111,7 +112,7 @@ class ChallengeRecord(Base):
     last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exploration_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    l2_explorer_created: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    warning_pivot_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     extension_cycle_pending: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -133,6 +134,7 @@ class AgentRecord(Base):
     cycle_id: Mapped[str | None] = mapped_column(String(128))
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), default="general", nullable=False)
+    task_stage: Mapped[str | None] = mapped_column(String(32))
     priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
     mission: Mapped[str] = mapped_column(Text, default="", nullable=False)
     initial_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -271,6 +273,7 @@ class ExecutionBranchRecord(Base):
     target_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     hypothesis_key: Mapped[str | None] = mapped_column(String(128))
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    task_stage: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(
         String(16), default="proposed", nullable=False
     )

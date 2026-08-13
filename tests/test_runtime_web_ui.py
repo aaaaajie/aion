@@ -67,6 +67,8 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
         "compareAgentStart",
         "executionStatusRank",
         "compareExecutionAgents",
+        "challengeStatusRank",
+        "compareChallengeAgents",
         "agentStartLabel",
         "executionAgentName",
         "started_at",
@@ -90,6 +92,10 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert '.sort(compareExecutionAgents)' in app
     assert 'if (["running", "working", "active"].includes(status)) return 0;' in app
     assert 'if (["queued", "pending", "starting"].includes(status)) return 1;' in app
+    assert '.sort(compareChallengeAgents)' in app
+    assert 'if (["running", "working", "active", "waiting"].includes(status)) return 0;' in app
+    assert 'return compareAgentStart(left, right);' in app
+    assert 'latestAgentActivity(right) - latestAgentActivity(left)' not in app
     assert "grid-template-columns: var(--left-width) minmax(var(--min-center-width), 1fr) var(--right-width)" in css
     assert "height: 100vh" in css
     assert ".conversation-stream" in css

@@ -14,6 +14,7 @@ class BranchRoute:
     kind: str
     priority: int
     mission: str
+    task_stage: str = "validation"
     success_criteria: list[str] = field(default_factory=list)
 
 

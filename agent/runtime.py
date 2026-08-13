@@ -118,6 +118,8 @@ class AgentRuntime:
     ) -> str:
         if self.state_service is not None:
             raise RuntimeError("AgentRuntime is already started")
+        if not self.run_root.is_relative_to(self.project_root):
+            raise ValueError("run_root must be inside the SystemTools workspace")
         run_id = run_id or uuid4().hex
         run_dir = self.run_root / run_id
         database_path = run_dir / "state.sqlite3"
@@ -130,7 +132,12 @@ class AgentRuntime:
                 run_id=run_id,
             )
 
-        service = StateService(database_path, run_root=self.run_root, clock=self.clock)
+        service = StateService(
+            database_path,
+            run_root=self.run_root,
+            workspace_root=self.project_root,
+            clock=self.clock,
+        )
         await service.initialize()
         self.state_service = service
         self.run_id = run_id
@@ -315,6 +322,7 @@ class AgentRuntime:
                         status="failed",
                         summary="Execution Agent could not be started",
                         failure_code="agent_start_failed",
+                        hypothesis_outcome="inconclusive",
                     ),
                     allow_inactive=True,
                 )

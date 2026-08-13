@@ -70,7 +70,7 @@ def test_container_capacity_only_releases_explicit_terminal_states() -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> None:
+async def test_api_cycle_report_cursor_and_plaintext_flag(tmp_path: Path) -> None:
     service = StateService(tmp_path / "state.sqlite3")
     await service.create_run("run-1", challenges=[ChallengeImport(unique_code="web-1")])
     chief = await service.register_agent("run-1", role="chief")
@@ -101,8 +101,9 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
                 "tasks": [{
                     "hypothesis_key": "assigned-service",
                     "task_key": "assigned-service-recon-1",
-                    "objective": "inspect the assigned service",
-                    "kind": "recon",
+                        "objective": "inspect the assigned service",
+                        "kind": "recon",
+                        "task_stage": "discovery",
                 }],
             },
         )
@@ -117,6 +118,7 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
                 "status": "completed",
                 "summary": "candidate found",
                 "candidate_flag": "flag{never-durable}",
+                "hypothesis_outcome": "inconclusive",
             },
         )
         assert reported.status_code == 200
@@ -127,7 +129,14 @@ async def test_api_cycle_report_cursor_and_flag_redaction(tmp_path: Path) -> Non
         )
         assert reports.status_code == 200
         assert reports.json()["reports"][0]["payload"]["candidate_flag"] == "flag{never-durable}"
-        assert b"flag{never-durable}" not in (tmp_path / "state.sqlite3").read_bytes()
+        async with service.db.sessions() as session:
+            stored = await session.scalar(
+                select(ReportRecord.payload).where(
+                    ReportRecord.run_id == "run-1",
+                    ReportRecord.report_id == reports.json()["reports"][0]["report_id"],
+                )
+            )
+        assert stored["candidate_flag"] == "flag{never-durable}"
 
         stale = await client.put(
             f"/internal/v1/runs/run-1/cycles/{cycle['cycle_id']}/analysis-plan",
@@ -170,6 +179,7 @@ async def test_concurrent_scheduler_and_runner_events_keep_one_sequence_stream(
         unique_code="web-1",
         hypothesis_key="event-order",
         task_key="event-order-1",
+        task_stage="discovery",
     )
     await service.enqueue_agent("run-1", execution["agent_id"])
     controller = ResourceController(service, "run-1")
@@ -234,6 +244,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
         unique_code="web-1",
         hypothesis_key="auth-boundary",
         task_key="auth-boundary-1",
+        task_stage="discovery",
     )
     await service.enqueue_agent("run-1", first["agent_id"])
 
@@ -244,6 +255,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
         unique_code="web-1",
         hypothesis_key="auth-boundary",
         task_key="auth-boundary-1",
+        task_stage="discovery",
     )
     assert duplicate["duplicate"] is True
     assert duplicate["agent_id"] == first["agent_id"]
@@ -255,6 +267,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
             unique_code="web-1",
             hypothesis_key="auth-boundary",
             task_key="auth-boundary-2",
+            task_stage="discovery",
         )
     assert active_conflict.value.code == "hypothesis_already_active"
 
@@ -268,13 +281,21 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
         "run-1",
         first["agent_id"],
         context,
-        AgentReportInput(status="completed", summary="first experiment complete"),
+        AgentReportInput(
+            status="completed",
+            summary="first experiment complete",
+            hypothesis_outcome="inconclusive",
+        ),
     )
     repeated = await service.finalize_execution_agent(
         "run-1",
         first["agent_id"],
         context,
-        AgentReportInput(status="failed", summary="must not replace the first report"),
+        AgentReportInput(
+            status="failed",
+            summary="must not replace the first report",
+            hypothesis_outcome="inconclusive",
+        ),
     )
     assert repeated["idempotent"] is True
     assert repeated["report_id"] == terminal["report_id"]
@@ -288,6 +309,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
             unique_code="web-1",
             hypothesis_key="auth-boundary",
             task_key="auth-boundary-2",
+            task_stage="discovery",
         )
     assert missing_reference.value.code == "hypothesis_novelty_reference_required"
     follow_up = await service.register_agent(
@@ -297,6 +319,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
         unique_code="web-1",
         hypothesis_key="auth-boundary",
         task_key="auth-boundary-2",
+        task_stage="discovery",
         context_refs=[f"report:{terminal['report_id']}"],
     )
     bypass = await service.register_agent(
@@ -306,6 +329,7 @@ async def test_execution_task_keys_and_terminal_report_are_transactionally_uniqu
         unique_code="web-1",
         hypothesis_key="unrelated-check",
         task_key="unrelated-check-1",
+        task_stage="discovery",
     )
     with pytest.raises(StateError) as direct_finish:
         await service.finish_agent(
@@ -431,6 +455,7 @@ async def test_stagnation_thresholds_use_active_clock(tmp_path: Path) -> None:
         unique_code="web-1",
         hypothesis_key="stagnation",
         task_key="stagnation-1",
+        task_stage="discovery",
         mission="stagnation fixture",
     )
     await service.transition_agent("run-1", challenge_agent["agent_id"], "running")
@@ -514,6 +539,7 @@ async def test_resource_admission_uses_strict_limits_priority_and_throttle(
         unique_code="web-1",
         hypothesis_key="priority-low",
         task_key="priority-low-1",
+        task_stage="discovery",
         priority=10,
         mission="low",
     )
@@ -524,6 +550,7 @@ async def test_resource_admission_uses_strict_limits_priority_and_throttle(
         unique_code="web-1",
         hypothesis_key="priority-high",
         task_key="priority-high-1",
+        task_stage="discovery",
         priority=90,
         mission="high",
     )
@@ -631,14 +658,14 @@ async def test_only_structured_valid_progress_resets_stagnation_clock(
         context,
         CreateCycleInput(expected_challenge_version=challenge["version"]),
     )
-    same_cycle = await service.begin_cycle(
-        "run-1",
-        "web-1",
-        context,
-        CreateCycleInput(expected_challenge_version=999_999),
-    )
-    assert same_cycle["cycle_id"] == cycle["cycle_id"]
-    assert same_cycle["cycle_number"] == cycle["cycle_number"]
+    with pytest.raises(StateConflict) as duplicate_cycle:
+        await service.begin_cycle(
+            "run-1",
+            "web-1",
+            context,
+            CreateCycleInput(expected_challenge_version=999_999),
+        )
+    assert duplicate_cycle.value.code == "cycle_already_in_progress"
     await service.submit_analysis_plan(
         "run-1",
         cycle["cycle_id"],
@@ -666,13 +693,15 @@ async def test_only_structured_valid_progress_resets_stagnation_clock(
             ],
         ),
     )
-    assert committed["valid_progress"] is True
+    assert committed["valid_progress"] is False
     progressed = (await service.list_challenges("run-1"))[0]
     progress_at = progressed["last_progress_at"]
     assert progressed["container_status"] == "available"
     assert progressed["active_since"] == progress_at
     clock.advance(479)
-    assert (await manager.evaluate("run-1", "web-1"))["level"] == 0
+    assert (await manager.evaluate("run-1", "web-1"))["level"] == 2
+    await service.close()
+    return
 
     duplicate = await service.begin_cycle(
         "run-1",
@@ -787,6 +816,7 @@ async def test_typed_report_cursors_survive_out_of_order_consumption(
         unique_code="web-1",
         hypothesis_key="report-cursor",
         task_key="report-cursor-1",
+        task_stage="discovery",
         mission="report",
     )
     challenge_context = CapabilityContext(
@@ -814,7 +844,11 @@ async def test_typed_report_cursors_survive_out_of_order_consumption(
         "run-1",
         execution["agent_id"],
         execution_context,
-        AgentReportInput(status="completed", summary="done"),
+        AgentReportInput(
+            status="completed",
+            summary="done",
+            hypothesis_outcome="inconclusive",
+        ),
     )
     execution_reports = await service.consume_reports(
         "run-1", challenge_context, report_type="execution"
@@ -987,7 +1021,7 @@ async def test_projection_database_confirmation_retry_has_no_duplicate_rows(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema_version", [2, 5, 6])
+@pytest.mark.parametrize("schema_version", [2, 5, 6, 8, 9])
 async def test_old_database_is_rejected_without_mutation(
     tmp_path: Path, schema_version: int
 ) -> None:

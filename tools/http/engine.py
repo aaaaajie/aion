@@ -106,6 +106,7 @@ class HttpInteractionEngine:
         ordinal = 0
         for case_index, case in enumerate(cases):
             names = list(case.variables)
+            self._preflight_template(case, declared_names=set(names))
             sources = [self._source_values(case.variables[name]) for name in names]
             if case.combine == "zip":
                 lengths = {len(values) for values in sources}
@@ -132,6 +133,60 @@ class HttpInteractionEngine:
                     )
                 )
         return expanded
+
+    @classmethod
+    def _preflight_template(
+        cls, case: HttpProbeCase, *, declared_names: set[str]
+    ) -> None:
+        """Validate matrix placeholders before reading sources or creating work."""
+
+        model = case.request.model_dump(mode="python")
+        strings: list[tuple[str, bool]] = []
+
+        def collect(value: Any, *, reject_single: bool = True) -> None:
+            if isinstance(value, str):
+                strings.append((value, reject_single))
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    collect(key, reject_single=reject_single)
+                    collect(item, reject_single=reject_single)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item, reject_single=reject_single)
+
+        # A raw body is opaque application data; braces there are not
+        # necessarily template syntax. All request-construction fields and
+        # structured body types are unambiguous template locations.
+        for key in ("method", "url", "query", "headers", "cookies"):
+            collect(model.get(key))
+        body = model.get("body")
+        if isinstance(body, dict):
+            collect(body.get("value"), reject_single=body.get("type") != "raw")
+
+        single = re.compile(r"(?<!\{)\{([A-Za-z_]\w*)\}(?!\})")
+        double = re.compile(r"\{\{([A-Za-z_]\w*)\}\}")
+        used: set[str] = set()
+        for value, reject_single in strings:
+            malformed = single.search(value) if reject_single else None
+            if malformed:
+                raise cls._validation(
+                    "invalid_template_syntax",
+                    f"Use {{{{{malformed.group(1)}}}}} for matrix variables; single-brace placeholders are not accepted",
+                )
+            for match in double.finditer(value):
+                name = match.group(1)
+                if name not in declared_names:
+                    raise cls._validation(
+                        "unknown_template_variable",
+                        f"Template variable '{name}' is not declared in variables",
+                    )
+                used.add(name)
+        unused = sorted(declared_names - used)
+        if unused:
+            raise cls._validation(
+                "unused_template_variable",
+                f"Declared template variables are not used: {', '.join(unused)}",
+            )
 
     async def execute(
         self,
@@ -420,6 +475,7 @@ class HttpInteractionEngine:
         values["url"] = self._render(values["url"], bindings, sources, "url")
         values["query"] = self._render(values["query"], bindings, sources, "query")
         values["headers"] = self._render(values["headers"], bindings, sources, "none")
+        values["cookies"] = self._render(values["cookies"], bindings, sources, "none")
         if values.get("body") is not None:
             body_type = values["body"]["type"]
             location = "form" if body_type in {"form", "multipart"} else "json"

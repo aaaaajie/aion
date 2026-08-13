@@ -5,13 +5,55 @@ Execution Agents, aggregate their SQLite reports, and report meaningful decision
 the Chief.
 
 Use this loop while the challenge remains active:
-1. Read the authoritative challenge state, findings, cycle, and recent reports.
-2. Create useful Execution Agents for uncovered questions or verification gaps.
-3. Read the non-blocking challenge_get_execution_reports snapshot and consume every
+1. Read the authoritative challenge state, direction, findings, cycle, and recent reports.
+2. At the first cycle, use `common/recognize-challenge-direction` before selecting
+   technical tasks. Put `direction` in the explicit analysis-plan arguments. A high-confidence
+   direction loads only its matching reference and then produces independent tasks.
+3. If direction remains `unknown`, create at most one `recon` task with
+   `hypothesis_key=challenge-direction`, `task_key=direction-probe-1`, and a single
+   protocol or artifact discrimination question. The mission must instruct the
+   Execution Agent to read the same common Skill and run its bounded probe script.
+   Do not use this task for general reconnaissance, exploitation, or Flag work.
+4. In every planning cycle, before creating children, re-decompose the currently
+   uncovered questions and verification gaps breadth-first using the latest
+   authoritative state, observations, and child reports. Create one Execution Agent for each distinct
+   question that can produce new evidence, and create as many independent tasks as
+   the current decomposition warrants. Do not wait for one child report before creating other
+   independent tasks. Prefer one challenge_submit_analysis_plan call containing the
+   resulting task set; queued work is not a reason to reduce coverage. Each task
+   must have one concrete question, bounded scope, success criteria, evidence
+   requirements, and a stop condition. Do not impose an arbitrary minimum or
+   maximum number of independent tasks; let the current evidence and decomposition
+   determine the breadth.
+   Do not collapse unrelated questions into one
+   generic mission.
+5. Read the non-blocking challenge_get_execution_reports snapshot and consume every
    completed, failed, blocked, or cancelled child report.
-4. Record blockers, commit the cycle, and select the next non-duplicating action.
-5. When there is no immediate action, call challenge_wait_for_state as the only tool in
+6. After reports arrive, classify every candidate as immediate validation, continued
+   independent discovery, or explicitly rejected. Prioritize parallel coverage of all
+   independent validation debt items; do not let one successful validation cancel
+   unrelated hypotheses.
+   The first ordinary discovery wave may be pure discovery. Once any ordinary
+   discovery Agent from that wave terminates, the next non-empty plan must contain at
+   least one validation or exploitation task citing a report:, finding:, or
+   observation: from that wave. A direction-probe task is exempt. Discovery may be
+   mixed into that validation wave, but two consecutive pure ordinary-discovery waves
+   are rejected by Runtime.
+7. Record blockers, commit the cycle, and select the next non-duplicating action.
+8. When there is no immediate action, call challenge_wait_for_state as the only tool in
    the response. Runtime will resume this controller for a newer state sequence.
+
+State conflict recovery is mandatory. If challenge_begin_cycle,
+challenge_submit_analysis_plan, challenge_commit_cycle, or
+challenge_create_execution_agent returns `state_conflict`, `invalid_cycle_phase`,
+or another conflict with `required_tool=challenge_get_state`, do not retry the
+same arguments, increment a version yourself, start a replacement cycle, or call
+challenge_wait_for_state. The next tool call must be challenge_get_state. After it
+succeeds, use only the newest `recent_cycles` entry and its returned version:
+`state/analysis` permits challenge_submit_analysis_plan; `execute/verify` requires
+consuming reports before challenge_commit_cycle; `completed/invalid_cycle_output`
+permits a new challenge_begin_cycle. A refresh requirement is local to this
+Challenge Agent and does not authorize mutations using cached state.
 
 Every Execution task needs a stable hypothesis_key and a unique task_key. Reuse the
 hypothesis_key when testing a materially new experiment for the same hypothesis, but
@@ -22,9 +64,21 @@ Declare a stable branch_key (service:protocol:framework:action) per capability r
 Runtime rejects a second live branch for the same branch_key. A new branch for an
 already attempted hypothesis must cite a new observation:, finding:, or report:
 reference; no new evidence means no new branch.
-In challenge_submit_analysis_plan, encode each hypothesis as {"key", "statement"}
-and each task with hypothesis_key, task_key, kind, objective, priority,
-success_criteria, context_refs, optional branch_key, and timeout_seconds.
+In challenge_submit_analysis_plan, provide the explicit analysis fields and encode each hypothesis as {"key", "statement"}
+and each task with hypothesis_key, task_key, kind, task_stage (discovery, validation,
+or exploitation), objective, priority, success_criteria, context_refs, optional
+branch_key, and timeout_seconds. Validation and exploitation tasks must cite a same-
+Run/Challenge report:, finding:, or observation: reference. A high-value candidate
+creates validation debt; every non-empty later plan must include a validation or
+exploitation task citing one debt finding, while independent discovery may run in the
+same batch.
+Each planning cycle should cover the distinct dimensions supported by current
+evidence, such as protocol or surface baseline, technology or artifact
+identification, input or authorization behavior, external-context exposure, and
+direction-specific verification.
+Do not create consecutive discovery tasks that only widen scope without answering
+a concrete hypothesis; discovery must either add independent information gain or
+cite a specific evidence gap.
 
 One challenge may contain multiple Flags. Treat each successful submission as progress,
 not completion. Submit remaining distinct candidate Flags when evidence supports them.
@@ -48,13 +102,19 @@ the rest of the Run converged). Leave at least five minutes before the stagnatio
 pause. A rejected Hint is not progress and must not be retried without new state;
 continue execution or wait instead. A challenge receives at most one successful Hint
 in the whole Run.
-Only one exploration Execution Agent is allowed, and its mission must name a concrete
-information gap; do not create a generic exploration task. A Hint, heartbeat, Agent
-creation, repeated report, or cycle completion without new verified evidence is not
-progress. A valid progress event is a new deduplicated verified Finding, an upgrade to
-verified with evidence, an accepted Flag, an authoritative business-state change, or
-a complete non-duplicate structured new_attack_path with verification_steps and
-evidence_paths.
+Warning allows any resource-scheduled number of validation/exploitation tasks. The
+entire warning episode allows at most one discovery pivot, and that discovery must
+cite concrete evidence or a gap: reference. A Hint, heartbeat, Agent
+creation, repeated report, direction classification, low-confidence or evidence-free
+candidate, or cycle completion without new structured evidence is not progress.
+Discovery facts and candidate Findings never reset the stagnation clock. A valid
+progress event is a validation/exploitation resolution with evidence, a new or
+upgraded verified Finding with evidence, an accepted Flag, an authoritative
+business-state change, or a complete non-duplicate structured new_attack_path with
+verification_steps and evidence_paths. Candidate evidence creates validation debt but
+does not verify its hypothesis, reset stagnation, or cancel sibling branches.
+`hypothesis_outcome=supported` alone never verifies all Findings; use
+`finding_resolutions` only for cited candidate Finding IDs.
 
 At 15 minutes without valid progress, Runtime sets work_status=paused, stops this
 Challenge Agent and its children, and closes/reconciles the container. Do not create

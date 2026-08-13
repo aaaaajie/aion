@@ -120,10 +120,10 @@ class _LifecycleRunner:
                     {
                         "category": "service",
                         "summary": "local file round-trip verified",
-                        "verification_status": "verified",
+                        "verification_status": "candidate",
                     }
                 ],
-                "evidence_paths": ["runtime-fixture.txt"],
+                "hypothesis_outcome": "inconclusive",
             },
         )
         assert report["ok"] is True
@@ -137,7 +137,7 @@ class _LifecycleRunner:
 async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> None:
     project_root = tmp_path / "workspace"
     project_root.mkdir()
-    run_root = tmp_path / "runs"
+    run_root = project_root / "runs"
     runtime = AgentRuntime(
         _settings(),
         benchmark=_Benchmark(),
@@ -166,26 +166,25 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
     cycle = await supervisor.begin_cycle(challenge_id, challenge_version)
     plan = await supervisor.submit_analysis_plan(
         challenge_id,
+        cycle["data"]["cycle_id"],
         cycle["data"]["version"],
-        {
-            "cycle_id": cycle["data"]["cycle_id"],
-            "analysis_summary": "exercise the local report path",
-            "hypotheses": [],
-            "information_gaps": [],
-            "avoid_repeating": [],
-            "tasks": [
-                {
-                    "hypothesis_key": "local-file-roundtrip",
-                    "task_key": "local-file-roundtrip-1",
-                    "kind": "verification",
-                    "objective": "round-trip one local file and report it",
-                    "priority": 80,
-                    "success_criteria": ["read content matches"],
-                    "context_refs": [],
-                    "timeout_seconds": 30,
-                }
-            ],
-        },
+        analysis_summary="exercise the local report path",
+        hypotheses=[],
+        information_gaps=[],
+        avoid_repeating=[],
+        tasks=[
+            {
+                "hypothesis_key": "local-file-roundtrip",
+                "task_key": "local-file-roundtrip-1",
+                "kind": "verification",
+                "task_stage": "discovery",
+                "objective": "round-trip one local file and report it",
+                "priority": 80,
+                "success_criteria": ["read content matches"],
+                "context_refs": [],
+                "timeout_seconds": 30,
+            }
+        ],
     )
     execution_id = plan["data"]["admissions"][0]["agent_id"]
     admitted = await runtime.admission_once()
@@ -196,27 +195,17 @@ async def test_runtime_sqlite_only_three_layer_closed_loop(tmp_path: Path) -> No
     assert reports["data"]["reports"][0]["summary"] == "local tool round completed"
     committed = await supervisor.commit_cycle(
         challenge_id,
+        cycle["data"]["cycle_id"],
         plan["data"]["version"],
-        {
-            "cycle_id": cycle["data"]["cycle_id"],
-            "summary": "worker evidence accepted",
-            "findings": [
-                {
-                    "category": "service",
-                    "summary": "local file round-trip verified",
-                    "detail": {},
-                    "confidence": 1.0,
-                    "verification_status": "verified",
-                    "evidence_paths": ["runtime-fixture.txt"],
-                }
-            ],
-            "credentials": [],
-            "rejected_finding_ids": [],
-            "next_steps": [],
-            "outcome": "progress",
-        },
+        summary="worker evidence accepted",
+        findings=[],
+        credentials=[],
+        next_steps=[],
+        outcome="no_progress",
     )
-    assert committed["data"]["valid_progress"] is True
+    # The discovery report is intentionally non-progress; cycle commit only
+    # stores the Challenge summary and does not copy report Findings.
+    assert committed["data"]["valid_progress"] is False
     assert (project_root / "runtime-fixture.txt").read_text() == "sqlite closed loop"
     await runtime.project_once()
     assert (run_root / "closed-loop" / "state.sqlite3").is_file()

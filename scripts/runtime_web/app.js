@@ -417,6 +417,19 @@
     return compareAgentStart(left, right);
   }
 
+  function challengeStatusRank(agent) {
+    const status = String(agent?.status || "").toLowerCase();
+    if (["running", "working", "active", "waiting"].includes(status)) return 0;
+    if (["queued", "pending", "starting"].includes(status)) return 1;
+    return 2;
+  }
+
+  function compareChallengeAgents(left, right) {
+    const statusDiff = challengeStatusRank(left) - challengeStatusRank(right);
+    if (statusDiff) return statusDiff;
+    return compareAgentStart(left, right);
+  }
+
   function agentStartLabel(agent) {
     return agent?.started_at ? `启用 ${clock(agent.started_at)}` : "待启用";
   }
@@ -445,13 +458,7 @@
   function challengeAgents() {
     return allAgents()
       .filter((agent) => agent.role === "challenge")
-      .sort((left, right) => {
-        const activeDiff = Number(isActive(right)) - Number(isActive(left));
-        if (activeDiff) return activeDiff;
-        const activityDiff = latestAgentActivity(right) - latestAgentActivity(left);
-        if (activityDiff) return activityDiff;
-        return String(left.unique_code || left.agent_id).localeCompare(String(right.unique_code || right.agent_id), "zh-CN");
-      });
+      .sort(compareChallengeAgents);
   }
 
   function chiefAgent() {

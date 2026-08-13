@@ -34,7 +34,6 @@ from agent.state.schemas import (
     AnalysisPlanInput,
     CapabilityContext,
     CreateCycleInput,
-    FindingInput,
     StagnationExtensionInput,
     VerificationUpdateInput,
 )
@@ -129,6 +128,9 @@ class AgentSupervisor:
         self._poll_task: asyncio.Task[None] | None = None
         self._container_operation_lock = asyncio.Lock()
         self._hint_locks: dict[str, asyncio.Lock] = {}
+        # Keep this in the Supervisor so the requirement survives Runner and
+        # Tool wrapper reconstruction while a controller is waiting.
+        self._challenge_state_refresh_required: dict[str, dict[str, Any]] = {}
         self._pausing = False
         self._shell_tasks: ShellTaskManager | None = None
         self._http_interactions: HttpProbeManager | None = None
@@ -599,6 +601,9 @@ class AgentSupervisor:
                     payload.get("error_code", ""),
                 )
 
+            await self._service().cancel_challenge_branches(
+                self._run_id(), unique_code, reason="challenge_paused"
+            )
             if released:
                 await self.stop_execution_agents(unique_code)
                 overview = await self._service().get_overview(self._run_id())
@@ -875,6 +880,7 @@ class AgentSupervisor:
         *,
         hypothesis_key: str,
         task_key: str,
+        task_stage: str,
         cycle_id: str | None = None,
         kind: str = "general",
         priority: int = 50,
@@ -892,76 +898,38 @@ class AgentSupervisor:
         timeout = timeout_seconds or self.default_execution_timeout
         agent_id = f"execution_{uuid4().hex}"
         challenge = await self._challenge_record(parent["unique_code"])
-        if challenge["stagnation_level"] >= 2 or challenge.get("work_status") in {"paused", "extended"}:
-            return self._error(
-                "challenge_paused",
-                "Runtime has paused this challenge; execution work is stopped",
-                error_type="conflict",
-            )
-        if challenge["stagnation_level"] >= 1 and kind != "exploration":
-            return self._error(
-                "exploration_only",
-                "Warning state permits only one explicit exploration task for a named knowledge gap",
-                error_type="conflict",
-            )
-        if challenge["stagnation_level"] >= 1 and not context_refs:
-            return self._error(
-                "information_gap_required",
-                "The warning exploration must cite at least one concrete information gap",
-                error_type="validation",
-            )
-        if challenge["stagnation_level"] >= 1:
-            if challenge.get("l2_explorer_created"):
-                return self._error(
-                    "stagnation_explorer_limit",
-                    "This warning episode already used its exploration Agent",
-                    error_type="conflict",
-                )
-            overview = await self._service().get_overview(self._run_id())
-            if any(
-                item["role"] == "execution"
-                and item["unique_code"] == parent["unique_code"]
-                and item["kind"] == "exploration"
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-                for item in overview["agents"]
-            ):
-                return self._error(
-                    "exploration_exists",
-                    "The warning challenge already has an exploration task",
-                    error_type="conflict",
-                )
-            try:
-                await self._service().reserve_stagnation_explorer(
-                    self._run_id(), parent["unique_code"]
-                )
-            except StateError as exc:
-                return self._error(
-                    exc.code,
-                    exc.message,
-                    error_type="conflict",
-                )
         prompt = self._execution_prompt(
             mission,
             challenge.get("container_addr") or [],
+            task_stage,
         )
-        record = await self._service().register_agent(
-            self._run_id(),
-            agent_id=agent_id,
-            role="execution",
-            parent_id=caller_id,
-            unique_code=parent["unique_code"],
-            cycle_id=cycle_id,
-            kind=kind,
-            priority=priority,
-            mission=mission,
-            initial_prompt=prompt,
-            success_criteria=success_criteria or [],
-            context_refs=context_refs or [],
-            hypothesis_key=hypothesis_key,
-            task_key=task_key,
-            branch_key=branch_key,
-            timeout_seconds=timeout,
-        )
+        try:
+            record = await self._service().register_agent(
+                self._run_id(),
+                agent_id=agent_id,
+                role="execution",
+                parent_id=caller_id,
+                unique_code=parent["unique_code"],
+                cycle_id=cycle_id,
+                kind=kind,
+                task_stage=task_stage,
+                priority=priority,
+                mission=mission,
+                initial_prompt=prompt,
+                success_criteria=success_criteria or [],
+                context_refs=context_refs or [],
+                hypothesis_key=hypothesis_key,
+                task_key=task_key,
+                branch_key=branch_key,
+                timeout_seconds=timeout,
+                enqueue=True,
+            )
+        except StateError as exc:
+            return self._error(
+                exc.code,
+                exc.message,
+                error_type="conflict" if exc.status_code == 409 else "validation",
+            )
         if record.get("duplicate"):
             return self._ok(
                 {
@@ -971,12 +939,12 @@ class AgentSupervisor:
                     "status": record["status"],
                     "hypothesis_key": record["hypothesis_key"],
                     "task_key": record["task_key"],
+                    "task_stage": record["task_stage"],
                     "duplicate": True,
                     "terminal_report_id": record.get("terminal_report_id"),
                     "final_report": record.get("final_report"),
                 }
             )
-        admission = await self._service().enqueue_agent(self._run_id(), agent_id)
         self._state_capabilities[agent_id] = self.capability_registry.issue(
             self._run_id(), agent_id, "execution", parent["unique_code"]
         ).context
@@ -986,9 +954,10 @@ class AgentSupervisor:
                 "agent_id": agent_id,
                 "role": record["role"],
                 "unique_code": record["unique_code"],
-                "status": admission["status"],
+                "status": record["admission_status"],
                 "hypothesis_key": hypothesis_key,
                 "task_key": task_key,
+                "task_stage": task_stage,
                 "timeout_seconds": timeout,
             }
         )
@@ -1253,28 +1222,17 @@ class AgentSupervisor:
         payload = AgentReportInput(
             status=report.status,
             summary=report.summary,
-            findings=[self._finding_input(item, report.confidence) for item in report.findings],
+            findings=report.findings,
             evidence_paths=report.evidence_paths,
             next_steps=report.next_steps,
             candidate_flag=report.candidate_flag,
             confidence=report.confidence,
+            hypothesis_outcome=report.hypothesis_outcome,
+            finding_resolutions=report.finding_resolutions,
         )
         saved = await self._service().submit_report(
             self._run_id(), caller_id, self._state_context(caller_id), payload
         )
-        cancelled_branches = saved.get("cancelled_branches") or []
-        if cancelled_branches:
-            overview = await self._service().get_overview(self._run_id())
-            stale_agents = [
-                item["agent_id"]
-                for item in overview["agents"]
-                if item["role"] == "execution"
-                and item.get("branch_key") in cancelled_branches
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-            ]
-            await asyncio.gather(
-                *(self._stop_agent(agent_id) for agent_id in stale_agents)
-            )
         await self._project()
         await self._sync_nodes()
         return self._ok(
@@ -1282,7 +1240,8 @@ class AgentSupervisor:
                 "agent_id": caller_id,
                 "sequence": saved["sequence"],
                 "status": report.status,
-                "terminal": report.status != "working",
+                "hypothesis_outcome": report.hypothesis_outcome,
+                "terminal": True,
                 "report_id": saved.get("report_id"),
                 "idempotent": saved.get("idempotent", False),
             }
@@ -1307,6 +1266,50 @@ class AgentSupervisor:
             )
         )
 
+    def mark_challenge_state_refresh_required(
+        self,
+        agent_id: str,
+        conflict_code: str,
+        conflict_detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Require a fresh authoritative snapshot before another mutation."""
+
+        self._challenge_state_refresh_required[agent_id] = {
+            "original_conflict_code": conflict_code,
+            "conflict_detail": dict(conflict_detail or {}),
+        }
+
+    def clear_challenge_state_refresh_required(self, agent_id: str) -> None:
+        self._challenge_state_refresh_required.pop(agent_id, None)
+
+    def challenge_state_refresh_error(
+        self,
+        agent_id: str,
+        tool_name: str,
+    ) -> dict[str, Any] | None:
+        """Return the enforced refresh response for a gated Challenge tool."""
+
+        pending = self._challenge_state_refresh_required.get(agent_id)
+        if pending is None:
+            return None
+        return {
+            "ok": False,
+            "error": {
+                "type": "conflict",
+                "code": "state_refresh_required",
+                "message": (
+                    "Authoritative challenge state must be reread before "
+                    f"{tool_name} can be called"
+                ),
+                "status_code": 409,
+                "detail": {
+                    "required_tool": "challenge_get_state",
+                    "retry_same_arguments": False,
+                    **pending,
+                },
+            },
+        }
+
     async def begin_cycle(self, caller_id: str, expected_challenge_version: int) -> dict[str, Any]:
         node = self._require_role(caller_id, "challenge")
         if not node.unique_code:
@@ -1323,44 +1326,66 @@ class AgentSupervisor:
     async def submit_analysis_plan(
         self,
         caller_id: str,
+        cycle_id: str,
         expected_version: int,
-        payload: Mapping[str, Any],
+        *,
+        analysis_summary: str,
+        direction: str = "unknown",
+        hypotheses: list[Mapping[str, Any]] | None = None,
+        information_gaps: list[str] | None = None,
+        avoid_repeating: list[str] | None = None,
+        tasks: list[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._require_role(caller_id, "challenge")
-        cycle_id = str(payload.get("cycle_id", ""))
-        if not cycle_id:
-            return self._error("cycle_required", "cycle_id is required in the structured plan payload")
-        data = dict(payload)
-        data.pop("cycle_id", None)
-        data["expected_version"] = expected_version
         return self._ok(
             await self._service().submit_analysis_plan(
                 self._run_id(),
                 cycle_id,
                 self._state_context(caller_id),
-                AnalysisPlanInput.model_validate(data),
+                AnalysisPlanInput.model_validate(
+                    {
+                        "expected_version": expected_version,
+                        "analysis_summary": analysis_summary,
+                        "direction": direction,
+                        "hypotheses": hypotheses or [],
+                        "information_gaps": information_gaps or [],
+                        "avoid_repeating": avoid_repeating or [],
+                        "tasks": tasks or [],
+                    }
+                ),
             )
         )
 
     async def commit_cycle(
         self,
         caller_id: str,
+        cycle_id: str,
         expected_version: int,
-        payload: Mapping[str, Any],
+        *,
+        summary: str,
+        findings: list[Mapping[str, Any]] | None = None,
+        credentials: list[Mapping[str, Any]] | None = None,
+        next_steps: list[str] | None = None,
+        new_attack_paths: list[Mapping[str, Any]] | None = None,
+        outcome: str,
     ) -> dict[str, Any]:
         self._require_role(caller_id, "challenge")
-        cycle_id = str(payload.get("cycle_id", ""))
-        if not cycle_id:
-            return self._error("cycle_required", "cycle_id is required in the structured update payload")
-        data = dict(payload)
-        data.pop("cycle_id", None)
-        data["expected_version"] = expected_version
         return self._ok(
             await self._service().commit_cycle(
                 self._run_id(),
                 cycle_id,
                 self._state_context(caller_id),
-                VerificationUpdateInput.model_validate(data),
+                VerificationUpdateInput.model_validate(
+                    {
+                        "expected_version": expected_version,
+                        "summary": summary,
+                        "findings": findings or [],
+                        "credentials": credentials or [],
+                        "next_steps": next_steps or [],
+                        "new_attack_paths": new_attack_paths or [],
+                        "outcome": outcome,
+                    }
+                ),
             )
         )
 
@@ -1444,6 +1469,7 @@ class AgentSupervisor:
             except Exception:
                 pass
         self._runners.clear()
+        self._challenge_state_refresh_required.clear()
         await self._project()
 
     async def pause(self) -> None:
@@ -2137,6 +2163,7 @@ class AgentSupervisor:
             findings=[],
             evidence_paths=[],
             next_steps=[],
+            hypothesis_outcome="inconclusive",
         )
         await self._service().finalize_execution_agent(
             self._run_id(),
@@ -2262,6 +2289,7 @@ class AgentSupervisor:
                         status="cancelled",
                         summary="Execution Agent was stopped by its owner",
                         failure_code="owner_stopped",
+                        hypothesis_outcome="inconclusive",
                     ),
                     terminal_status="stopped",
                     allow_inactive=True,
@@ -2428,34 +2456,6 @@ class AgentSupervisor:
         }
 
     @staticmethod
-    def _finding_input(value: str | dict[str, Any], confidence: float | None) -> FindingInput:
-        if isinstance(value, str):
-            return FindingInput(
-                category="other",
-                summary=value[:2_000],
-                detail={},
-                confidence=confidence if confidence is not None else 0.5,
-            )
-        category = value.get("category", "other")
-        if category not in {
-            "service", "vulnerability", "credential", "privilege",
-            "attack_path", "flag", "other",
-        }:
-            category = "other"
-        summary = str(value.get("summary") or value.get("title") or value.get("detail") or "finding")
-        detail = value.get("detail")
-        if not isinstance(detail, Mapping):
-            detail = {"value": detail} if detail is not None else dict(value)
-        return FindingInput(
-            category=category,
-            summary=summary[:2_000],
-            detail=dict(detail),
-            confidence=float(value.get("confidence", confidence if confidence is not None else 0.5)),
-            verification_status=value.get("verification_status", "candidate"),
-            evidence_paths=list(value.get("evidence_paths") or []),
-        )
-
-    @staticmethod
     async def _ignore_cancel(task: asyncio.Task[Any]) -> None:
         try:
             await task
@@ -2480,11 +2480,14 @@ class AgentSupervisor:
         )
 
     @staticmethod
-    def _execution_prompt(mission: str, addresses: list[str]) -> str:
+    def _execution_prompt(
+        mission: str, addresses: list[str], task_stage: str = "discovery"
+    ) -> str:
         return render_prompt(
             "execution_agent.txt",
             mission=mission[:4_000],
             target_addresses=json.dumps(addresses),
+            task_stage=task_stage,
         )
 
     @staticmethod

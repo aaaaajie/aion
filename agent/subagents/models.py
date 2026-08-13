@@ -6,6 +6,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agent.state.schemas import (
+    AttackPathInput,
+    ChallengeDirection,
+    CredentialInput,
+    ExecutionKind,
+    ExecutionTaskInput,
+    FindingInput,
+    FindingResolutionInput,
+    HypothesisOutcome,
+    HypothesisInput,
+    TaskStage,
+)
+
 AgentRole = Literal["chief", "challenge", "execution"]
 HintBasis = Literal[
     "high_probability_path",
@@ -62,9 +75,11 @@ class CreateExecutionArguments(_Arguments):
     task_key: str = Field(min_length=1, max_length=128)
     cycle_id: str | None = Field(default=None, min_length=1, max_length=128)
     kind: Literal["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"] = "general"
+    task_stage: TaskStage
     priority: int = Field(default=50, ge=0, le=100)
     success_criteria: list[str] = Field(default_factory=list, max_length=20)
     context_refs: list[str] = Field(default_factory=list, max_length=50)
+    branch_key: str | None = Field(default=None, min_length=1, max_length=256)
     timeout_seconds: int = Field(default=1_800, ge=1, le=3_600)
 
     @field_validator("mission")
@@ -83,17 +98,33 @@ class CycleArguments(_Arguments):
     expected_challenge_version: int = Field(ge=1)
 
 
-class CycleVersionArguments(_Arguments):
+class AnalysisPlanArguments(_Arguments):
     cycle_id: str = Field(min_length=1, max_length=128)
     expected_version: int = Field(ge=1)
-    payload: dict[str, Any] = Field(default_factory=dict)
+    analysis_summary: str = Field(min_length=1, max_length=8_000)
+    direction: ChallengeDirection = "unknown"
+    hypotheses: list[HypothesisInput] = Field(default_factory=list, max_length=50)
+    information_gaps: list[str] = Field(default_factory=list, max_length=50)
+    avoid_repeating: list[str] = Field(default_factory=list, max_length=50)
+    tasks: list[ExecutionTaskInput] = Field(default_factory=list, max_length=50)
+
+
+class CommitCycleArguments(_Arguments):
+    cycle_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
+    summary: str = Field(min_length=1, max_length=8_000)
+    findings: list[FindingInput] = Field(default_factory=list, max_length=100)
+    credentials: list[CredentialInput] = Field(default_factory=list, max_length=50)
+    next_steps: list[str] = Field(default_factory=list, max_length=50)
+    new_attack_paths: list[AttackPathInput] = Field(default_factory=list, max_length=20)
+    outcome: Literal["progress", "no_progress", "completed", "blocked", "failed"]
 
 
 class ProgressArguments(_Arguments):
     status: Literal["working", "blocked", "completed", "failed", "cancelled"]
     phase: str = Field(min_length=1, max_length=64)
     summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
     evidence_paths: list[str] = Field(default_factory=list, max_length=50)
     expected_result_seconds: int | None = Field(default=None, ge=1, le=300)
 
@@ -150,17 +181,33 @@ class SubmitFlagArguments(_Arguments):
     flag: str = Field(min_length=1, max_length=4_096)
 
 
-ExecutionReportStatus = Literal["working", "completed", "blocked", "failed", "cancelled"]
+ExecutionReportStatus = Literal["completed", "blocked", "failed", "cancelled"]
 
 
 class ExecutionReport(_Arguments):
     status: ExecutionReportStatus
     summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[str | dict[str, Any]] = Field(default_factory=list, max_length=50)
+    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
     evidence_paths: list[str] = Field(default_factory=list, max_length=50)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    hypothesis_outcome: HypothesisOutcome
+    finding_resolutions: list[FindingResolutionInput] = Field(
+        default_factory=list, max_length=50
+    )
+
+    @model_validator(mode="after")
+    def validate_terminal_outcome(self) -> "ExecutionReport":
+        if self.hypothesis_outcome in {"supported", "rejected"}:
+            has_evidence = bool(self.evidence_paths) or any(
+                finding.evidence_paths for finding in self.findings
+            ) or any(item.evidence_paths for item in self.finding_resolutions)
+            if not has_evidence:
+                raise ValueError(
+                    "supported or rejected outcomes require structured evidence"
+                )
+        return self
 
 
 class AgentReport(_Arguments):
@@ -169,7 +216,7 @@ class AgentReport(_Arguments):
     unique_code: str | None = None
     status: str = Field(min_length=1, max_length=64)
     summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[str | dict[str, Any]] = Field(default_factory=list, max_length=50)
+    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
     evidence_paths: list[str] = Field(default_factory=list, max_length=50)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
