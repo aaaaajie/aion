@@ -23,7 +23,7 @@ def _get_json(url: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_flight_recorder_reads_graph_history_and_redacts_secrets(tmp_path: Path) -> None:
+async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) -> None:
     state_path = tmp_path / "run" / "state.sqlite3"
     service = StateService(state_path)
     await service.create_run(
@@ -49,6 +49,9 @@ async def test_flight_recorder_reads_graph_history_and_redacts_secrets(tmp_path:
         role="execution",
         parent_id=challenge["agent_id"],
         unique_code="fixture-1",
+        hypothesis_key="monitor-flight-recorder",
+        task_key="monitor-flight-recorder-1",
+        task_stage="discovery",
         initial_prompt="execution prompt",
     )
     await service.append_agent_event(
@@ -93,7 +96,11 @@ async def test_flight_recorder_reads_graph_history_and_redacts_secrets(tmp_path:
         "web-run",
         execution["agent_id"],
         context,
-        AgentReportInput(status="completed", summary="local report"),
+        AgentReportInput(
+            status="completed",
+            summary="local report",
+            hypothesis_outcome="inconclusive",
+        ),
     )
     await service.finish_agent("web-run", execution["agent_id"], status="completed")
     operation_id = await service.mark_operation_started(
@@ -134,11 +141,11 @@ async def test_flight_recorder_reads_graph_history_and_redacts_secrets(tmp_path:
     assert any(item["event_type"] == "tool_call" for item in snapshot["events"])
     assert snapshot["reports"][0]["sequence"] == report["sequence"]
     assert snapshot["credentials"][0]["principal"] == "local-user"
-    assert "secret_value" not in snapshot["credentials"][0]
-    assert "flag{monitor-secret}" not in body
-    assert "flag{operation-secret}" not in body
-    assert "operation-secret" not in body
-    assert "credential-secret" not in body
+    assert snapshot["credentials"][0]["secret_value"] == "credential-secret"
+    assert "flag{monitor-secret}" in body
+    assert "flag{operation-secret}" in body
+    assert "operation-secret" in body
+    assert "credential-secret" in body
 
     detail = _get_json(f"{url}api/agents/{execution['agent_id']}")
     detail_body = json.dumps(detail, ensure_ascii=False)

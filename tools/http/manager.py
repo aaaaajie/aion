@@ -9,8 +9,8 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -251,7 +251,7 @@ class HttpProbeManager:
         expected_response_bytes: int | None = None,
         priority: int = 50,
         wait_seconds: float | None = 20.0,
-        result_limit: int = 100,
+        result_limit: int = 10,
         kind: str = "probe",
     ) -> dict[str, Any]:
         self._require_open()
@@ -267,6 +267,7 @@ class HttpProbeManager:
                 "empty_http_interaction",
                 "HTTP interaction must expand to at least one request",
             )
+        expanded: list[ExpandedRequest] = []
         for item in requests:
             if item.spec.parent_request_id is not None and not await self._request_owned(
                 agent_id, item.spec.parent_request_id
@@ -284,6 +285,31 @@ class HttpProbeManager:
                     "request_group_not_found",
                     "Request group was not found",
                 )
+            context_id = item.spec.connection_context_id
+            if context_id:
+                sequence = item.spec.sequence_id
+                if sequence is None:
+                    sequence = await self._next_context_sequence(
+                        agent_id, context_id
+                    )
+                item = replace(
+                    item,
+                    spec=item.spec.model_copy(
+                        update={
+                            "connection_context_id": context_id,
+                            "sequence_id": sequence,
+                        }
+                    ),
+                )
+            expanded.append(item)
+        requests = expanded
+        template_summary = {
+            "case_count": len(cases),
+            "variable_names": sorted({name for case in cases for name in case.variables}),
+            "combinations": [case.combine for case in cases],
+            "expanded_requests": len(requests),
+            "url_samples": [item.spec.url for item in requests[:3]],
+        }
         interaction_dir = self._interaction_dir(agent_id, interaction_id)
         response_dir = interaction_dir / "responses"
         response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -303,6 +329,7 @@ class HttpProbeManager:
                     "concurrency": concurrency,
                     "rate_limit_per_second": rate_limit_per_second,
                     "requests": [self._request_json(item) for item in requests],
+                    "template_summary": template_summary,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -573,6 +600,7 @@ class HttpProbeManager:
         session_id: str | None = None,
         passive: bool = True,
         active: bool = True,
+        minimum_confidence: str = "medium",
         include_favicon: bool = True,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
@@ -608,6 +636,7 @@ class HttpProbeManager:
             url=url,
             passive=bool(passive),
             active=bool(active),
+            minimum_confidence=minimum_confidence,
             include_favicon=bool(include_favicon),
             headers=dict(headers or {}),
             cookies=dict(cookies or {}),
@@ -1027,6 +1056,12 @@ class HttpProbeManager:
                 "conflict",
                 "http_interaction_running",
                 "Active HTTP interaction must be stopped before cleanup",
+                detail={
+                    "interaction_id": interaction_id,
+                    "required_tool": "system_http_stop",
+                    "recommended_action": "stop_then_cleanup",
+                    "recommended_wait_seconds": 20,
+                },
             )
         if row["output_cleaned_at"] is not None:
             return {"interaction_id": interaction_id, "cleaned": False, "already_cleaned": True}
@@ -1213,20 +1248,41 @@ class HttpProbeManager:
 
         try:
             session_requests: dict[str, list[ExpandedRequest]] = {}
+            context_requests: dict[str, list[ExpandedRequest]] = {}
             independent: list[ExpandedRequest] = []
             for item in live.requests:
-                if item.spec.session_id:
+                if item.spec.connection_context_id:
+                    context_requests.setdefault(
+                        item.spec.connection_context_id, []
+                    ).append(item)
+                elif item.spec.session_id:
                     session_requests.setdefault(item.spec.session_id, []).append(item)
                 else:
                     independent.append(item)
 
-            async def session_sequence(items: list[ExpandedRequest]) -> None:
-                for item in sorted(items, key=lambda value: value.ordinal):
+            async def ordered_sequence(
+                items: list[ExpandedRequest],
+                *,
+                key: Callable[[ExpandedRequest], Any],
+            ) -> None:
+                for item in sorted(items, key=key):
                     await one(item)
 
             await asyncio.gather(
                 *(one(item) for item in independent),
-                *(session_sequence(items) for items in session_requests.values()),
+                *(
+                    ordered_sequence(items, key=lambda value: value.ordinal)
+                    for items in session_requests.values()
+                ),
+                *(
+                    ordered_sequence(
+                        items,
+                        key=lambda value: value.spec.sequence_id
+                        if value.spec.sequence_id is not None
+                        else value.ordinal,
+                    )
+                    for items in context_requests.values()
+                ),
             )
             if storage_failure:
                 raise OSError("HTTP response storage failed")
@@ -1714,6 +1770,9 @@ class HttpProbeManager:
             "version": match.version,
             "matched_path": match.matched_path,
             "evidence": match.evidence,
+            "confidence_score": match.confidence_score,
+            "confidence_level": match.confidence_level,
+            "confidence_reasons": match.confidence_reasons,
             "url": options.url,
         }
 
@@ -1741,6 +1800,8 @@ class HttpProbeManager:
             "errors": result.errors,
             "by_category": result.by_category,
             "rule_diagnostics": result.rule_diagnostics,
+            "minimum_confidence": options.minimum_confidence,
+            "suppressed_match_count": result.suppressed_match_count,
             "stopped": result.stopped,
             "started_at": result.started_at,
             "finished_at": result.finished_at,
@@ -1974,6 +2035,26 @@ class HttpProbeManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "recommended_wait_seconds": (
+                20
+                if row["status"] not in TERMINAL
+                or row["analysis_status"] in {"pending", "queued", "running"}
+                else 0
+            ),
+            "is_terminal": row["status"] in TERMINAL
+            and row["analysis_status"] not in {"pending", "queued", "running"},
+            "can_cleanup": row["status"] in TERMINAL
+            and row["analysis_status"] not in {"pending", "queued", "running"},
+            "recommended_action": (
+                "cleanup"
+                if row["status"] in TERMINAL
+                and row["analysis_status"] not in {"pending", "queued", "running"}
+                else "analyze"
+                if row["execution_status"] == "completed"
+                and row["analysis_status"] in {"pending", "queued", "running"}
+                else "output"
+            ),
+            "template_summary": self._plan(agent_id, interaction_id).get("template_summary"),
         }
         if row["kind"] in {"path_probe", "fingerprint"}:
             summary = self._load_summary(agent_id, interaction_id)
@@ -2052,6 +2133,20 @@ class HttpProbeManager:
         if filters.outcomes and record.get("outcome") not in filters.outcomes:
             return False
         if filters.request_group_id and record.get("request_group_id") != filters.request_group_id:
+            return False
+        if (
+            filters.connection_context_id
+            and record.get("connection_context_id") != filters.connection_context_id
+        ):
+            return False
+        sequence = record.get("sequence_id")
+        if filters.sequence_id_min is not None and (
+            sequence is None or int(sequence) < filters.sequence_id_min
+        ):
+            return False
+        if filters.sequence_id_max is not None and (
+            sequence is None or int(sequence) > filters.sequence_id_max
+        ):
             return False
         size = record.get("body_bytes")
         if filters.min_body_bytes is not None and (size is None or size < filters.min_body_bytes):
@@ -2364,6 +2459,38 @@ class HttpProbeManager:
             found_foreign = True
         return not found_foreign
 
+    async def _next_context_sequence(self, agent_id: str, context_id: str) -> int:
+        """Assign the next monotonic position for one Agent connection context."""
+
+        maximum = -1
+        for (owner_agent, _), items in self._plan_cache.items():
+            if owner_agent != agent_id:
+                continue
+            for item in items:
+                if (
+                    item.spec.connection_context_id == context_id
+                    and item.spec.sequence_id is not None
+                ):
+                    maximum = max(maximum, int(item.spec.sequence_id))
+        base = self._agent_root(agent_id) / "http-interactions"
+        if base.is_dir():
+            for plan_path in base.glob("*/plan.json"):
+                try:
+                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                for raw in plan.get("requests", []):
+                    spec = raw.get("spec") if isinstance(raw, Mapping) else None
+                    if not isinstance(spec, Mapping):
+                        continue
+                    if spec.get("connection_context_id") != context_id:
+                        continue
+                    try:
+                        maximum = max(maximum, int(spec.get("sequence_id") or 0))
+                    except (TypeError, ValueError):
+                        continue
+        return maximum + 1
+
     async def _historical_response_estimate(
         self, requests: list[ExpandedRequest]
     ) -> int:
@@ -2656,6 +2783,8 @@ class HttpProbeManager:
             "spec": item.spec.model_dump(mode="json"),
             "variables": item.variables,
             "request_group_id": item.request_group_id,
+            "connection_context_id": item.spec.connection_context_id,
+            "sequence_id": item.spec.sequence_id,
         }
 
     @staticmethod
@@ -2694,5 +2823,16 @@ class HttpProbeManager:
             raise self._error("conflict", "http_manager_closed", "HTTP manager is closed")
 
     @staticmethod
-    def _error(error_type: str, code: str, message: str) -> SystemToolError:
-        return SystemToolError(error_type=error_type, code=code, message=message)
+    def _error(
+        error_type: str,
+        code: str,
+        message: str,
+        *,
+        detail: Any = None,
+    ) -> SystemToolError:
+        return SystemToolError(
+            error_type=error_type,
+            code=code,
+            message=message,
+            detail=detail,
+        )

@@ -31,6 +31,8 @@ APP_ROOT = Path("/opt/aion")
 RUN_ROOT = Path("/var/lib/aion/runs")
 VPN_CONFIG = Path("/etc/aion/vpn/benchmark.ovpn")
 LOCAL_LOG_ROOT = PROJECT_ROOT / ".aion" / "remote-logs"
+RUNS_SHARE_ROOT = "/opt/aion/runs-share"
+RUNS_SHARE_SERVICE = "aion-runs.service"
 SOURCE_NAMES = (
     "agent",
     "tools",
@@ -173,6 +175,7 @@ def _local_verify() -> None:
             str(PROJECT_ROOT / "deploy" / "release_manager.py"),
             str(PROJECT_ROOT / "scripts" / "online_runtime.py"),
             str(PROJECT_ROOT / "scripts" / "export_run_bundle.py"),
+            str(PROJECT_ROOT / "scripts" / "runs_download_server.py"),
         ],
         cwd=PROJECT_ROOT,
     )
@@ -602,6 +605,128 @@ def _logs_pull(run_id: str, include_workspace: bool) -> Path:
     return destination
 
 
+def _validate_share_username(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) is None:
+        raise OperatorError("runs-share username contains invalid characters")
+    return value
+
+
+def _hash_share_password(password: bytes) -> bytes:
+    if not password or b"\n" in password or b"\r" in password:
+        raise OperatorError("runs-share password must be one non-empty line")
+    result = _run(
+        ["openssl", "passwd", "-apr1", "-stdin"],
+        capture_output=True,
+        input_data=password,
+    )
+    hashed = (result.stdout or b"").strip()
+    if not hashed.startswith(b"$apr1$"):
+        raise OperatorError("openssl did not return an Apache MD5 password hash")
+    return hashed
+
+
+def _upload_share_file(local: Path, remote: str) -> None:
+    _run(
+        ["scp", *_ssh_base()[1:], str(local), f"{SSH_TARGET}:{remote}"],
+        cwd=PROJECT_ROOT,
+    )
+
+
+def _install_share_file(local: Path, target: str, mode: str) -> None:
+    temporary = f"{RUNS_SHARE_ROOT}/.{Path(target).name}.incoming-{secrets.token_hex(6)}"
+    _upload_share_file(local, temporary)
+    try:
+        _ssh(["install", "-o", "root", "-g", "root", "-m", mode, temporary, target])
+    finally:
+        _ssh(["rm", "-f", temporary], check=False)
+
+
+def _install_share_credentials(username: str, hashed: bytes) -> None:
+    entry = username.encode("ascii") + b":" + hashed + b"\n"
+    script = """
+import os
+from pathlib import Path
+import sys
+
+target = Path('/etc/nginx/aion-runs.htpasswd')
+temporary = target.with_name(f'.{target.name}.{os.getpid()}.tmp')
+temporary.write_bytes(sys.stdin.buffer.read())
+os.chmod(temporary, 0o640)
+os.replace(temporary, target)
+"""
+    _ssh(["python3", "-c", script], input_data=entry)
+    _ssh(["chown", "root:nginx", "/etc/nginx/aion-runs.htpasswd"])
+
+
+def _runs_share(username: str, password: bytes) -> None:
+    username = _validate_share_username(username)
+    hashed = _hash_share_password(password)
+    before = _remote_state()
+    run_before = (before.get("run") or {}).get("run_id")
+    if not before.get("active") or not run_before:
+        raise OperatorError("runs-share requires the current AION Runtime to be active")
+
+    _ssh(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", RUNS_SHARE_ROOT])
+    _install_share_file(
+        PROJECT_ROOT / "scripts" / "runs_download_server.py",
+        f"{RUNS_SHARE_ROOT}/runs_download_server.py",
+        "0755",
+    )
+    _install_share_file(
+        PROJECT_ROOT / "deploy" / "aion-runs.service",
+        f"/etc/systemd/system/{RUNS_SHARE_SERVICE}",
+        "0644",
+    )
+    backup_script = """
+from pathlib import Path
+import shutil
+
+target = Path('/etc/nginx/conf.d/aion-monitor.conf')
+backup = target.with_name('aion-monitor.conf.before-runs-share')
+if target.is_file() and not backup.exists():
+    shutil.copy2(target, backup)
+"""
+    _ssh(["python3", "-c", backup_script])
+    _install_share_credentials(username, hashed)
+    _install_share_file(
+        PROJECT_ROOT / "deploy" / "aion-monitor.conf",
+        "/etc/nginx/conf.d/aion-monitor.conf",
+        "0644",
+    )
+    try:
+        _ssh(["systemctl", "daemon-reload"])
+        _ssh(["nginx", "-t"])
+        _ssh(["systemctl", "enable", "--now", RUNS_SHARE_SERVICE])
+        _ssh(["systemctl", "reload", "nginx"])
+    except Exception:
+        _ssh(["systemctl", "disable", "--now", RUNS_SHARE_SERVICE], check=False)
+        _ssh(
+            [
+                "install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0644",
+                "/etc/nginx/conf.d/aion-monitor.conf.before-runs-share",
+                "/etc/nginx/conf.d/aion-monitor.conf",
+            ],
+            check=False,
+        )
+        _ssh(["nginx", "-t"], check=False)
+        _ssh(["systemctl", "reload", "nginx"], check=False)
+        raise
+
+    after = _remote_state()
+    run_after = (after.get("run") or {}).get("run_id")
+    if not after.get("active") or run_after != run_before:
+        raise OperatorError("AION Runtime changed while enabling runs-share")
+    print("runs-share: https://vps.example.invalid:8443/runs/")
+    print(f"runs-share: user={username}")
+    print(f"runs-share: current run={run_after}")
+
+
 def _release_state() -> dict[str, Any]:
     current = _remote_state().get("release")
     if not current or RELEASE_PATTERN.fullmatch(str(current)) is None:
@@ -669,6 +794,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--run-id", default="latest")
     pull.add_argument("--include-workspace", action="store_true")
 
+    runs_share = subparsers.add_parser(
+        "runs-share",
+        help="enable the authenticated read-only run data download service",
+    )
+    runs_share.add_argument("--username", default="aion")
+    runs_share.add_argument(
+        "--password-stdin",
+        action="store_true",
+        required=True,
+        help="read the Basic Auth password from stdin",
+    )
+
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("--benchmark-token", required=True)
     subparsers.add_parser("doctor")
@@ -716,6 +853,11 @@ def main() -> None:
             _ssh(command)
         elif args.command == "logs" and args.logs_command == "pull":
             _logs_pull(args.run_id, args.include_workspace)
+        elif args.command == "runs-share":
+            password = sys.stdin.buffer.read()
+            if password.endswith(b"\n"):
+                password = password[:-1]
+            _runs_share(args.username, password)
         elif args.command == "rollback":
             token = _validate_token(args.benchmark_token)
             args.benchmark_token = ""

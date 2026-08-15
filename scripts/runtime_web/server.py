@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -32,24 +31,6 @@ WEB_ROOT = Path(__file__).resolve().parent
 POLL_SECONDS = 0.75
 GLOBAL_EVENT_LIMIT = 5_000
 AGENT_EVENT_LIMIT = 500
-
-_REDACTED = "[REDACTED]"
-_SENSITIVE_KEYS = {
-    "api_key",
-    "apikey",
-    "authorization",
-    "benchmark_token",
-    "candidate_flag",
-    "flag",
-    "flag_candidate",
-    "password",
-    "secret",
-    "secret_value",
-    "token",
-}
-_FLAG_PATTERN = re.compile(r"(?i)\b[a-z0-9_]{0,32}\{[^{}\r\n]{1,512}\}")
-_BEARER_PATTERN = re.compile(r"(?i)(bearer\s+)[^\s,;]+")
-
 
 LOGGER = logging.getLogger("aion.runtime_web")
 if not LOGGER.handlers:
@@ -74,17 +55,9 @@ def _json_load(value: Any, default: Any) -> Any:
 
 
 def _redact(value: Any, *, key: str | None = None) -> Any:
-    """Apply a second presentation-layer redaction to persisted JSON."""
+    """Return persisted JSON unchanged for local plaintext analysis."""
 
-    if key and key.lower() in _SENSITIVE_KEYS:
-        return _REDACTED
-    if isinstance(value, str):
-        value = _BEARER_PATTERN.sub(r"\1[REDACTED]", value)
-        return _FLAG_PATTERN.sub("[REDACTED_FLAG]", value)
-    if isinstance(value, dict):
-        return {str(item_key): _redact(item, key=str(item_key)) for item_key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
+    del key
     return value
 
 
@@ -256,7 +229,7 @@ def _report(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _credential(row: sqlite3.Row) -> dict[str, Any]:
-    """Expose credential metadata only; never select or serialize the secret."""
+    """Expose the complete credential record for local plaintext analysis."""
 
     return {
         "credential_id": row["credential_id"],
@@ -265,6 +238,7 @@ def _credential(row: sqlite3.Row) -> dict[str, Any]:
         "finding_id": row["finding_id"],
         "kind": row["kind"],
         "principal": row["principal"],
+        "secret_value": row["secret_value"],
         "scope": row["scope"],
         "verified": bool(row["verified"]),
         "created_at": _iso(row["created_at"]),
@@ -397,7 +371,7 @@ class _ReadOnlyStore:
                 for row in connection.execute(
                     """
                     SELECT credential_id, run_id, unique_code, finding_id,
-                           kind, principal, scope, verified, created_at
+                           kind, principal, secret_value, scope, verified, created_at
                     FROM credentials
                     WHERE run_id = ? ORDER BY created_at, credential_id
                     """,

@@ -114,7 +114,7 @@ class AgentStateStore:
             for item in await service.list_operations(run_id)
             if item["status"] == "indeterminate"
         ]
-        run_status = run["status"] if run["status"] in {"active", "completed", "failed", "interrupted"} else "active"
+        run_status = run["status"]
         manifest = RunManifest(
             run_id=run_id,
             model=run["model"] or "unknown",

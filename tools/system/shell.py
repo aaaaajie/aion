@@ -9,7 +9,7 @@ import platform
 import shutil
 import signal
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,8 +50,12 @@ class SandboxBackend:
         root: Path,
         executable: str | None = None,
         platform_name: str | None = None,
+        read_only_paths: Sequence[Path] = (),
     ) -> None:
         self.root = root
+        self.read_only_paths = tuple(
+            dict.fromkeys(path.expanduser().resolve(strict=True) for path in read_only_paths)
+        )
         self.platform = platform_name or platform.system()
         if executable is not None:
             self.executable = executable
@@ -71,7 +75,12 @@ class SandboxBackend:
             and os.access(self.executable, os.X_OK)
         )
 
-    def command(self, shell_command: str, cwd: Path | None = None) -> list[str]:
+    def command(
+        self,
+        shell_command: str,
+        cwd: Path | None = None,
+        temp_dir: Path | None = None,
+    ) -> list[str]:
         if self.platform not in {"Darwin", "Linux"}:
             raise SystemToolError(
                 error_type="execution",
@@ -95,10 +104,11 @@ class SandboxBackend:
                 "-lc",
                 shell_command,
             ]
-        return self._linux_command(shell_command, cwd)
+        return self._linux_command(shell_command, cwd, temp_dir)
 
     def _macos_profile(self) -> str:
         root = json.dumps(str(self.root))
+        read_only_paths = [json.dumps(str(path)) for path in self.read_only_paths]
         system_read_paths = [
             "/System",
             "/Library",
@@ -124,22 +134,31 @@ class SandboxBackend:
             f"(allow file-read* (subpath {json.dumps(path)}))"
             for path in system_read_paths
         )
+        lines.extend(f"(allow file-read* (subpath {path}))" for path in read_only_paths)
+        lines.extend(f"(deny file-write* (subpath {path}))" for path in read_only_paths)
         return "\n".join(lines)
 
-    def _linux_command(self, shell_command: str, cwd: Path | None) -> list[str]:
+    def _linux_command(
+        self,
+        shell_command: str,
+        cwd: Path | None,
+        temp_dir: Path | None,
+    ) -> list[str]:
         command = [
             self.executable,
             "--die-with-parent",
             "--new-session",
             "--tmpfs",
             "/",
-            "--tmpfs",
-            "/tmp",
             "--proc",
             "/proc",
             "--dev",
             "/dev",
         ]
+        if temp_dir is None:
+            command.extend(["--tmpfs", "/tmp"])
+        else:
+            command.extend(["--dir", "/tmp"])
         bind_paths: list[tuple[str, str]] = []
         for system_path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
             if Path(system_path).exists():
@@ -161,8 +180,13 @@ class SandboxBackend:
             if resolv_target is not None:
                 bind_paths.append((str(resolv_target), "/etc/resolv.conf"))
 
+        read_only_bind_paths = [
+            (str(path), str(path)) for path in self.read_only_paths
+        ]
         destination_parents: set[Path] = set()
-        for _, destination in bind_paths + [(str(self.root), str(self.root))]:
+        for _, destination in bind_paths + read_only_bind_paths + [
+            (str(self.root), str(self.root))
+        ]:
             parent = Path(destination).parent
             while parent != Path("/"):
                 destination_parents.add(parent)
@@ -171,7 +195,11 @@ class SandboxBackend:
             command.extend(["--dir", str(parent)])
         for source, destination in bind_paths:
             command.extend(["--ro-bind", source, destination])
+        if temp_dir is not None:
+            command.extend(["--bind", str(temp_dir), "/tmp"])
         command.extend(["--bind", str(self.root), str(self.root)])
+        for source, destination in read_only_bind_paths:
+            command.extend(["--ro-bind", source, destination])
         if cwd is not None:
             command.extend(["--chdir", str(cwd)])
         command.extend(["/bin/bash", "--noprofile", "--norc", "-lc", shell_command])
@@ -256,11 +284,16 @@ class ShellTaskManager:
         psutil_module: Any = psutil,
         clock: Callable[[], datetime] = utc_now,
         reap_interval_seconds: float = DEFAULT_REAP_INTERVAL_SECONDS,
+        read_only_paths: Sequence[Path] = (),
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.policy = policy
         self.service = service
         self.run_id = self._component(run_id, "run_id")
-        self.sandbox = sandbox or SandboxBackend(policy.root)
+        self.sandbox = sandbox or SandboxBackend(
+            policy.root, read_only_paths=read_only_paths
+        )
+        self.environment = dict(environment or {})
         self.psutil = psutil_module
         self.clock = clock
         self.reap_interval_seconds = reap_interval_seconds
@@ -340,7 +373,7 @@ class ShellTaskManager:
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
-                *self.sandbox.command(command, working_directory),
+                *self.sandbox.command(command, working_directory, temp_dir),
                 cwd=str(working_directory),
                 env=self._safe_environment(home_dir, temp_dir, working_directory),
                 stdin=asyncio.subprocess.DEVNULL,
@@ -823,7 +856,7 @@ class ShellTaskManager:
             "/usr/sbin",
             "/sbin",
         ]
-        return {
+        environment = {
             "HOME": str(home_dir),
             "TMPDIR": str(temp_dir),
             "TMP": str(temp_dir),
@@ -838,6 +871,8 @@ class ShellTaskManager:
             "USER": "sandbox",
             "LOGNAME": "sandbox",
         }
+        environment.update(self.environment)
+        return environment
 
     def _require_open(self) -> None:
         if not self._initialized or self._closed:

@@ -13,6 +13,7 @@ psutil==7.2.2
 pydantic==2.13.4
 pydantic-settings==2.14.2
 pydantic_core==2.46.4
+PyYAML==6.0.3
 python-dotenv==1.2.2
 setuptools==80.9.0
 SQLAlchemy==2.0.51

@@ -16,7 +16,6 @@ from sqlalchemy import delete, func, select, update
 
 from agent.memory.models import AgentNode, Checkpoint, TargetState
 from agent.memory.redaction import redact_value
-from .capabilities import fingerprint_secret
 from .clock import active_seconds, aware, utc_now
 from .database import StateDatabase
 from .errors import StateConflict, StateError, StateNotFound, StatePermission
@@ -28,9 +27,12 @@ from .models import (
     CredentialRecord,
     CycleRecord,
     DEFAULT_SESSION_MEMORY,
+    ExecutionBranchRecord,
     FindingRecord,
     HttpInteractionRecord,
+    HypothesisRecord,
     NetworkTaskRecord,
+    ObservationRecord,
     OperationRecord,
     ReportRecord,
     ResourceWorkRecord,
@@ -41,24 +43,32 @@ from .models import (
 )
 from .resources import (
     RELEASED_CONTAINER_STATUSES,
+    challenge_work_active,
     checkpoint_target_status,
     container_capacity_summary,
     container_slot_occupied,
 )
+from .routing import routes_for_observation
 from .schemas import (
     AgentProgressInput,
     AgentReportInput,
     AnalysisPlanInput,
     CapabilityContext,
+    CHALLENGE_CONTROL_STATE_VALUES,
     CHALLENGE_WORK_STATUS_VALUES,
     ChallengeImport,
     ChallengeSyncResult,
     CreateCycleInput,
     FindingInput,
+    FindingResolutionInput,
+    HypothesisInput,
     StagnationExtensionInput,
     VerificationUpdateInput,
 )
 from .wakeup import StateSignalBus
+
+
+EVIDENCE_BACKED_PROGRESS_CONFIDENCE = 0.8
 
 
 def _json_value(value: Any) -> Any:
@@ -102,6 +112,24 @@ def derive_phase(started_at: datetime, deadline_at: datetime, now: datetime | No
     return "mid"
 
 
+# Hint is deliberately a scarce, time-sensitive action.  These values are
+# policy constants rather than business configuration so every caller uses
+# the same admission window.
+HINT_STAGNATION_PAUSE_SECONDS = 15 * 60
+HINT_MIN_ACTION_WINDOW_SECONDS = 5 * 60
+HINT_NEAR_DEADLINE_SECONDS = 30 * 60
+HINT_ACTIVE_STATUSES = frozenset({"queued", "reserved", "running", "analyzing"})
+HINT_TERMINAL_AGENT_STATES = frozenset(
+    {"completed", "failed", "stopped", "cancelled", "interrupted"}
+)
+ACTIVE_EXECUTION_STATUSES = frozenset(
+    {"pending", "queued", "reserved", "starting", "running", "working"}
+)
+VALIDATION_DEBT_CATEGORIES = frozenset(
+    {"vulnerability", "credential", "privilege", "attack_path", "flag"}
+)
+
+
 class StateService:
     """All domain mutations for a run go through this service."""
 
@@ -110,11 +138,17 @@ class StateService:
         database: StateDatabase | Path | str,
         *,
         run_root: Path | None = None,
+        workspace_root: Path | None = None,
         clock: Callable[[], datetime] = utc_now,
         notifier: StateSignalBus | None = None,
     ) -> None:
         self.db = database if isinstance(database, StateDatabase) else StateDatabase(Path(database))
         self.run_root = run_root
+        self.workspace_root = (
+            workspace_root.resolve()
+            if workspace_root is not None
+            else None
+        )
         self.clock = clock
         self.notifier = notifier or StateSignalBus()
         self._lock = asyncio.Lock()
@@ -333,10 +367,146 @@ class StateService:
             else:
                 credentials = []
             findings = (await session.scalars(select(FindingRecord).where(FindingRecord.run_id == run_id, FindingRecord.unique_code == unique_code).order_by(FindingRecord.first_seen_at))).all()
+            task_rows = list(
+                (
+                    await session.scalars(
+                        select(AgentRecord)
+                        .where(
+                            AgentRecord.run_id == run_id,
+                            AgentRecord.unique_code == unique_code,
+                            AgentRecord.role == "execution",
+                        )
+                        .order_by(AgentRecord.created_at.desc())
+                        .limit(50)
+                    )
+                ).all()
+            )
+            cycle_rows = list(
+                (
+                    await session.scalars(
+                        select(CycleRecord)
+                        .where(
+                            CycleRecord.run_id == run_id,
+                            CycleRecord.unique_code == unique_code,
+                        )
+                        .order_by(CycleRecord.cycle_number.desc())
+                        .limit(10)
+                    )
+                ).all()
+            )
+            observation_rows = list(
+                (
+                    await session.scalars(
+                        select(ObservationRecord)
+                        .where(
+                            ObservationRecord.run_id == run_id,
+                            ObservationRecord.unique_code == unique_code,
+                        )
+                        .order_by(ObservationRecord.captured_at.desc())
+                        .limit(100)
+                    )
+                ).all()
+            )
+            hypothesis_rows = list(
+                (
+                    await session.scalars(
+                        select(HypothesisRecord)
+                        .where(
+                            HypothesisRecord.run_id == run_id,
+                            HypothesisRecord.unique_code == unique_code,
+                        )
+                        .order_by(HypothesisRecord.updated_at.desc())
+                        .limit(50)
+                    )
+                ).all()
+            )
+            branch_rows = list(
+                (
+                    await session.scalars(
+                        select(ExecutionBranchRecord)
+                        .where(
+                            ExecutionBranchRecord.run_id == run_id,
+                            ExecutionBranchRecord.unique_code == unique_code,
+                        )
+                        .order_by(ExecutionBranchRecord.priority.desc())
+                        .limit(50)
+                    )
+                ).all()
+            )
+            validation_debt = await self._validation_debt(
+                session, run_id, unique_code
+            )
             return {
                 "challenge": self._challenge_dict(challenge),
                 "findings": [self._finding_dict(item) for item in findings],
                 "credentials": credentials,
+                "observations": [
+                    {
+                        "observation_id": item.observation_id,
+                        "category": item.category,
+                        "summary": item.summary,
+                        "detail": item.detail,
+                        "source": item.source,
+                        "confidence": item.confidence,
+                        "captured_at": _json_value(item.captured_at),
+                    }
+                    for item in observation_rows
+                ],
+                "hypotheses": [
+                    {
+                        "hypothesis_key": item.hypothesis_key,
+                        "statement": item.statement,
+                        "confidence": item.confidence,
+                        "based_on_observations": item.based_on_observations,
+                        "status": item.status,
+                    }
+                    for item in hypothesis_rows
+                ],
+                "branches": [
+                    {
+                        "branch_key": item.branch_key,
+                        "hypothesis_key": item.hypothesis_key,
+                        "kind": item.kind,
+                        "task_stage": item.task_stage,
+                        "status": item.status,
+                        "priority": item.priority,
+                        "mission": item.mission,
+                        "agent_ids": item.agent_ids,
+                    }
+                    for item in branch_rows
+                ],
+                "validation_debt": validation_debt,
+                "recent_cycles": [self._cycle_dict(item) for item in cycle_rows],
+                "task_ledger": [
+                    {
+                        "agent_id": item.agent_id,
+                        "hypothesis_key": item.hypothesis_key,
+                        "task_key": item.task_key,
+                        "branch_key": item.branch_key,
+                        "kind": item.kind,
+                        "task_stage": item.task_stage,
+                        "mission": item.mission,
+                        "status": item.status,
+                        "context_refs": item.context_refs,
+                        "terminal_report_id": item.terminal_report_id,
+                        "report_summary": (
+                            item.final_report.get("summary")
+                            if isinstance(item.final_report, Mapping)
+                            else None
+                        ),
+                        "hypothesis_outcome": (
+                            item.final_report.get("hypothesis_outcome")
+                            if isinstance(item.final_report, Mapping)
+                            else None
+                        ),
+                        "evidence_paths": (
+                            list(item.final_report.get("evidence_paths") or [])
+                            if isinstance(item.final_report, Mapping)
+                            else []
+                        ),
+                    }
+                    for item in task_rows
+                ],
                 "active_agents": [
                     self._agent_dict(item)
                     for item in (
@@ -363,12 +533,17 @@ class StateService:
         unique_code: str | None = None,
         cycle_id: str | None = None,
         kind: str = "general",
+        task_stage: str | None = None,
         priority: int = 50,
         mission: str = "",
         initial_prompt: str | None = None,
         success_criteria: list[str] | None = None,
         context_refs: list[str] | None = None,
+        hypothesis_key: str | None = None,
+        task_key: str | None = None,
+        branch_key: str | None = None,
         timeout_seconds: int | None = None,
+        enqueue: bool = False,
     ) -> dict[str, Any]:
         if role not in {"chief", "challenge", "execution"}:
             raise StateError("invalid_role", "unknown Agent role", status_code=422)
@@ -391,6 +566,108 @@ class StateService:
                         raise StatePermission("invalid_parent_role", "parent role is not allowed")
                     if role == "execution" and (not unique_code or parent.unique_code != unique_code):
                         raise StatePermission("challenge_binding_required", "Execution Agent must remain bound to its parent challenge")
+                if role == "execution":
+                    if not hypothesis_key or not task_key or task_stage is None:
+                        raise StateError(
+                            "execution_task_keys_required",
+                            "Execution Agents require hypothesis_key, task_key, and task_stage",
+                            status_code=422,
+                        )
+                    if task_stage not in {"discovery", "validation", "exploitation"}:
+                        raise StateError(
+                            "invalid_task_stage",
+                            "Execution task_stage is invalid",
+                            status_code=422,
+                        )
+                    duplicate = await session.scalar(
+                        select(AgentRecord).where(
+                            AgentRecord.run_id == run_id,
+                            AgentRecord.unique_code == unique_code,
+                            AgentRecord.task_key == task_key,
+                        )
+                    )
+                    if duplicate is not None:
+                        data = self._agent_dict(duplicate)
+                        data["duplicate"] = True
+                        data["final_report"] = duplicate.final_report
+                        return data
+                    resolved_branch_key = branch_key or (
+                        f"{hypothesis_key}:{kind}" if hypothesis_key else None
+                    )
+                    await self._validate_branch_admission(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        hypothesis_key=hypothesis_key,
+                        branch_key=resolved_branch_key,
+                        task_key=task_key,
+                        task_stage=task_stage,
+                        context_refs=context_refs or [],
+                    )
+                    challenge = await self._require_challenge(
+                        session, run_id, str(unique_code)
+                    )
+                    await self._validate_validation_debt_tasks(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                    )
+                    await self._validate_discovery_wave(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "hypothesis_key": hypothesis_key,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                    )
+                    await self._upsert_hypothesis(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        hypothesis=HypothesisInput(
+                            key=hypothesis_key,
+                            statement=mission or hypothesis_key,
+                            based_on_observations=list(context_refs or []),
+                        ),
+                        created_by=parent_id,
+                        status="active",
+                    )
+                    await self._reserve_warning_pivot_for_tasks(
+                        session,
+                        run_id=run_id,
+                        challenge=challenge,
+                        tasks=[
+                            {
+                                "task_stage": task_stage,
+                                "context_refs": context_refs or [],
+                            }
+                        ],
+                        agent_id=parent_id,
+                        cycle_id=cycle_id,
+                    )
+                    await self._upsert_branch(
+                        session,
+                        run_id=run_id,
+                        unique_code=str(unique_code),
+                        branch_key=resolved_branch_key,
+                        hypothesis_key=hypothesis_key,
+                        kind=kind,
+                        task_stage=task_stage,
+                        priority=priority,
+                        mission=mission,
+                        agent_id=agent_id,
+                        status="queued",
+                    )
                 if unique_code is not None:
                     await self._require_challenge(session, run_id, unique_code)
                 if role == "challenge" and unique_code is not None:
@@ -412,27 +689,618 @@ class StateService:
                     cycle_id=cycle_id,
                     role=role,
                     kind=kind,
+                    task_stage=task_stage,
                     priority=priority,
                     mission=mission,
                     initial_prompt=initial_prompt if initial_prompt is not None else mission,
                     session_memory=DEFAULT_SESSION_MEMORY,
                     success_criteria=success_criteria or [],
                     context_refs=context_refs or [],
+                    hypothesis_key=hypothesis_key,
+                    task_key=task_key,
+                    branch_key=resolved_branch_key if role == "execution" else None,
                     timeout_seconds=timeout_seconds,
                 )
                 session.add(record)
+                admission: AdmissionRecord | None = None
+                if role == "execution" and enqueue:
+                    admission = AdmissionRecord(
+                        admission_id=f"admission_{uuid4().hex}",
+                        run_id=run_id,
+                        agent_id=agent_id,
+                        unique_code=unique_code,
+                        role="execution",
+                        priority=priority,
+                        status="queued",
+                    )
+                    session.add(admission)
+                    record.status = "queued"
                 await self._event(session, run_id, "agent_created", {
                     "agent_id": agent_id, "role": role, "parent_id": parent_id,
                     "unique_code": unique_code, "cycle_id": cycle_id,
+                    "kind": kind, "task_stage": task_stage,
                 }, agent_id=agent_id, cycle_id=cycle_id)
-        return self._agent_dict(record)
+                if admission is not None:
+                    await self._event(
+                        session,
+                        run_id,
+                        "agent_admission_queued",
+                        {
+                            "agent_id": agent_id,
+                            "admission_id": admission.admission_id,
+                            "priority": priority,
+                        },
+                        agent_id=agent_id,
+                        cycle_id=cycle_id,
+                    )
+        result = self._agent_dict(record)
+        if admission is not None:
+            result["admission_id"] = admission.admission_id
+            result["admission_status"] = admission.status
+        return result
+
+    async def _validate_hypothesis_admission(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        hypothesis_key: str,
+        context_refs: list[str],
+    ) -> None:
+        prior = list(
+            (
+                await session.scalars(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "execution",
+                        AgentRecord.hypothesis_key == hypothesis_key,
+                    )
+                )
+            ).all()
+        )
+        active = next(
+            (
+                item
+                for item in prior
+                if item.status
+                not in {"completed", "failed", "stopped", "cancelled", "interrupted"}
+            ),
+            None,
+        )
+        if active is not None:
+            raise StateConflict(
+                "hypothesis_already_active",
+                "Only one active task is allowed for a hypothesis",
+                {"agent_id": active.agent_id, "task_key": active.task_key},
+            )
+        if not prior:
+            return
+        valid_reference = False
+        for reference in context_refs:
+            kind, separator, identifier = reference.partition(":")
+            if (
+                not separator
+                or kind not in {"report", "finding", "observation"}
+                or not identifier
+            ):
+                continue
+            if kind == "report":
+                row = await session.get(ReportRecord, identifier)
+                source_agent = (
+                    await session.get(AgentRecord, row.agent_id)
+                    if row is not None
+                    else None
+                )
+                valid_reference = bool(
+                    row
+                    and row.run_id == run_id
+                    and row.unique_code == unique_code
+                    and source_agent is not None
+                    and source_agent.hypothesis_key == hypothesis_key
+                )
+            elif kind == "finding":
+                row = await session.get(FindingRecord, identifier)
+                valid_reference = bool(
+                    row
+                    and row.run_id == run_id
+                    and row.unique_code == unique_code
+                )
+            elif kind == "observation":
+                row = await session.get(ObservationRecord, identifier)
+                valid_reference = bool(
+                    row
+                    and row.run_id == run_id
+                    and row.unique_code == unique_code
+                )
+            if valid_reference:
+                break
+        if not valid_reference:
+            raise StateConflict(
+                "hypothesis_novelty_reference_required",
+                "A later task for the same hypothesis must reference a prior report or finding",
+            )
+
+    async def _validate_branch_admission(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        hypothesis_key: str,
+        branch_key: str | None,
+        task_key: str,
+        task_stage: str,
+        context_refs: list[str],
+    ) -> None:
+        """Shared preconditions for creating one Execution Branch task."""
+
+        run = await self._require_run(session, run_id)
+        if run.status != "active":
+            raise StateConflict(
+                "run_not_active", "Execution tasks require an active Run"
+            )
+        challenge = await self._require_challenge(session, run_id, unique_code)
+        if challenge.is_completed or challenge.work_status in {
+            "paused",
+            "closed",
+            "completed",
+            "extended",
+        }:
+            raise StateConflict(
+                "challenge_not_active",
+                "The challenge no longer accepts execution tasks",
+            )
+        await self._validate_hypothesis_admission(
+            session,
+            run_id=run_id,
+            unique_code=unique_code,
+            hypothesis_key=hypothesis_key,
+            context_refs=context_refs,
+        )
+        if branch_key:
+            active_branch = await session.scalar(
+                select(ExecutionBranchRecord).where(
+                    ExecutionBranchRecord.run_id == run_id,
+                    ExecutionBranchRecord.unique_code == unique_code,
+                    ExecutionBranchRecord.branch_key == branch_key,
+                    ExecutionBranchRecord.status.in_(
+                        ["proposed", "queued", "running"]
+                    ),
+                )
+            )
+            if active_branch is not None:
+                raise StateConflict(
+                    "branch_already_active",
+                    "Only one active branch is allowed for this capability key",
+                    {"branch_key": branch_key},
+                )
+        duplicate_task = await session.scalar(
+            select(AgentRecord).where(
+                AgentRecord.run_id == run_id,
+                AgentRecord.unique_code == unique_code,
+                AgentRecord.task_key == task_key,
+            )
+        )
+        if duplicate_task is not None:
+            raise StateConflict(
+                "duplicate_task_key",
+                "The task key already exists",
+                {"agent_id": duplicate_task.agent_id, "status": duplicate_task.status},
+            )
+    async def _scoped_evidence_refs(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        context_refs: Iterable[str],
+    ) -> set[str]:
+        """Return references that resolve inside the bound Run and Challenge."""
+
+        valid: set[str] = set()
+        for reference in context_refs:
+            kind, separator, identifier = reference.partition(":")
+            if not separator or not identifier:
+                continue
+            row: Any | None = None
+            if kind == "report":
+                row = await session.get(ReportRecord, identifier)
+            elif kind == "finding":
+                row = await session.get(FindingRecord, identifier)
+            elif kind == "observation":
+                row = await session.get(ObservationRecord, identifier)
+            if (
+                row is not None
+                and row.run_id == run_id
+                and row.unique_code == unique_code
+            ):
+                valid.add(reference)
+        return valid
+
+    async def _validate_stage_references(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        task_stage: str,
+        context_refs: list[str],
+    ) -> set[str]:
+        valid_refs = await self._scoped_evidence_refs(
+            session,
+            run_id=run_id,
+            unique_code=unique_code,
+            context_refs=context_refs,
+        )
+        if task_stage in {"validation", "exploitation"} and not valid_refs:
+            raise StateConflict(
+                "task_evidence_reference_required",
+                "Validation and exploitation tasks require a same-challenge report, finding, or observation reference",
+            )
+        return valid_refs
+
+    async def _validation_debt(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+    ) -> list[dict[str, Any]]:
+        findings = list(
+            (
+                await session.scalars(
+                    select(FindingRecord)
+                    .where(
+                        FindingRecord.run_id == run_id,
+                        FindingRecord.unique_code == unique_code,
+                        FindingRecord.verification_status == "candidate",
+                        FindingRecord.confidence
+                        >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE,
+                        FindingRecord.category.in_(VALIDATION_DEBT_CATEGORIES),
+                    )
+                    .order_by(
+                        FindingRecord.confidence.desc(),
+                        FindingRecord.first_seen_at,
+                    )
+                )
+            ).all()
+        )
+        findings = [item for item in findings if item.evidence_paths]
+        if not findings:
+            return []
+        agents = list(
+            (
+                await session.scalars(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "execution",
+                        AgentRecord.task_stage.in_(["validation", "exploitation"]),
+                        AgentRecord.status.in_(ACTIVE_EXECUTION_STATUSES),
+                    )
+                )
+            ).all()
+        )
+        result: list[dict[str, Any]] = []
+        for finding in findings:
+            finding_ref = f"finding:{finding.finding_id}"
+            covering_agent_ids = [
+                agent.agent_id
+                for agent in agents
+                if finding_ref in (agent.context_refs or [])
+            ]
+            result.append(
+                {
+                    "finding_ref": finding_ref,
+                    "reference": finding_ref,
+                    "summary": finding.summary,
+                    "confidence": finding.confidence,
+                    "source_agent_id": finding.agent_id,
+                    "source_agent": finding.agent_id,
+                    "covered": bool(covering_agent_ids),
+                    "covered_by": covering_agent_ids,
+                    "covering_agent_ids": covering_agent_ids,
+                }
+            )
+        return result
+
+    async def _validate_validation_debt_tasks(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        tasks: Iterable[Any],
+    ) -> None:
+        task_values = list(tasks)
+        for task in task_values:
+            task_stage = str(
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            context_refs = list(
+                task.context_refs
+                if hasattr(task, "context_refs")
+                else task.get("context_refs", [])
+            )
+            await self._validate_stage_references(
+                session,
+                run_id=run_id,
+                unique_code=unique_code,
+                task_stage=task_stage,
+                context_refs=context_refs,
+            )
+        if not task_values:
+            return
+        debt = await self._validation_debt(session, run_id, unique_code)
+        if not debt:
+            return
+        debt_refs = {item["finding_ref"] for item in debt}
+        covered = any(
+            (
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            in {"validation", "exploitation"}
+            and bool(
+                debt_refs
+                & set(
+                    task.context_refs
+                    if hasattr(task, "context_refs")
+                    else task.get("context_refs", [])
+                )
+            )
+            for task in task_values
+        )
+        if not covered:
+            raise StateConflict(
+                "validation_wave_required",
+                "A non-empty plan must validate or exploit at least one pending high-value finding",
+                {"validation_debt": sorted(debt_refs)},
+            )
+
+    async def _validate_discovery_wave(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        tasks: Iterable[Any],
+    ) -> None:
+        """Require a validation/exploitation wave after ordinary discovery.
+
+        Direction probing is deliberately excluded: it is a one-time routing
+        task, not a reason to keep expanding reconnaissance indefinitely.
+        The latest persisted ordinary wave is the authoritative boundary, so
+        this check also applies to the direct Execution creation endpoint.
+        """
+
+        task_values = list(tasks)
+
+        def value(task: Any, name: str, default: Any = None) -> Any:
+            return getattr(task, name, default) if hasattr(task, name) else task.get(name, default)
+
+        if not task_values:
+            return
+        has_validation = any(
+            value(task, "task_stage") in {"validation", "exploitation"}
+            for task in task_values
+        )
+        ordinary_discovery = [
+            task
+            for task in task_values
+            if value(task, "task_stage") == "discovery"
+            and value(task, "hypothesis_key") != "challenge-direction"
+        ]
+        if not has_validation and not ordinary_discovery:
+            return
+        if not has_validation and all(
+            value(task, "hypothesis_key") == "challenge-direction"
+            for task in task_values
+        ):
+            return
+
+        cycles = list(
+            (
+                await session.scalars(
+                    select(CycleRecord)
+                    .where(
+                        CycleRecord.run_id == run_id,
+                        CycleRecord.unique_code == unique_code,
+                    )
+                    .order_by(CycleRecord.cycle_number.desc())
+                )
+            ).all()
+        )
+        for cycle in cycles:
+            plan_tasks = list((cycle.plan or {}).get("tasks", []))
+            ordinary_plan = [
+                task
+                for task in plan_tasks
+                if value(task, "hypothesis_key") != "challenge-direction"
+            ]
+            if not ordinary_plan:
+                continue
+            if all(value(task, "task_stage") == "discovery" for task in ordinary_plan):
+                if not has_validation:
+                    raise StateConflict(
+                        "validation_wave_required",
+                        "The next non-empty wave must contain a validation or exploitation task and cite the prior wave",
+                        {
+                            "previous_cycle_id": cycle.cycle_id,
+                            "required_task_stages": ["validation", "exploitation"],
+                            "required_tool": "challenge_submit_analysis_plan",
+                        },
+                    )
+                prior_agents = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == unique_code,
+                                AgentRecord.cycle_id == cycle.cycle_id,
+                            )
+                        )
+                    ).all()
+                )
+                prior_agent_ids = {item.agent_id for item in prior_agents}
+                prior_reports = list(
+                    (
+                        await session.scalars(
+                            select(ReportRecord).where(
+                                ReportRecord.run_id == run_id,
+                                ReportRecord.unique_code == unique_code,
+                                ReportRecord.agent_id.in_(prior_agent_ids),
+                            )
+                        )
+                    ).all()
+                ) if prior_agent_ids else []
+                prior_findings = list(
+                    (
+                        await session.scalars(
+                            select(FindingRecord).where(
+                                FindingRecord.run_id == run_id,
+                                FindingRecord.unique_code == unique_code,
+                                FindingRecord.agent_id.in_(prior_agent_ids),
+                            )
+                        )
+                    ).all()
+                ) if prior_agent_ids else []
+                prior_refs = {
+                    *(f"report:{item.report_id}" for item in prior_reports),
+                    *(f"finding:{item.finding_id}" for item in prior_findings),
+                }
+                current_refs = {
+                    reference
+                    for task in task_values
+                    if value(task, "task_stage") in {"validation", "exploitation"}
+                    for reference in (value(task, "context_refs", []) or [])
+                }
+                if not prior_refs.intersection(current_refs):
+                    raise StateConflict(
+                        "validation_wave_required",
+                        "The validation wave must cite a report or Finding produced by the prior discovery wave",
+                        {
+                            "previous_cycle_id": cycle.cycle_id,
+                            "required_task_stages": ["validation", "exploitation"],
+                            "required_context_ref": "report:<id> or finding:<id>",
+                            "required_tool": "challenge_submit_analysis_plan",
+                        },
+                    )
+                return
+            return
+
+    async def _reserve_warning_pivot_for_tasks(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        challenge: ChallengeRecord,
+        tasks: Iterable[Any],
+        agent_id: str | None,
+        cycle_id: str | None,
+    ) -> None:
+        task_values = list(tasks)
+        discovery_tasks = [
+            task
+            for task in task_values
+            if (
+                task.task_stage
+                if hasattr(task, "task_stage")
+                else task["task_stage"]
+            )
+            == "discovery"
+        ]
+        if not discovery_tasks or challenge.work_status != "warning":
+            return
+        if len(discovery_tasks) > 1 or challenge.warning_pivot_used:
+            raise StateConflict(
+                "warning_discovery_limit",
+                "A warning episode permits at most one discovery pivot",
+            )
+        discovery = discovery_tasks[0]
+        context_refs = list(
+            discovery.context_refs
+            if hasattr(discovery, "context_refs")
+            else discovery.get("context_refs", [])
+        )
+        evidence_refs = await self._scoped_evidence_refs(
+            session,
+            run_id=run_id,
+            unique_code=challenge.unique_code,
+            context_refs=context_refs,
+        )
+        gap_refs = {
+            reference
+            for reference in context_refs
+            if reference.startswith("gap:") and reference.removeprefix("gap:").strip()
+        }
+        if not evidence_refs and not gap_refs:
+            raise StateConflict(
+                "warning_discovery_reference_required",
+                "A warning discovery pivot must cite concrete evidence or an information gap",
+            )
+        challenge.warning_pivot_used = True
+        challenge.version += 1
+        await self._event(
+            session,
+            run_id,
+            "warning_pivot_reserved",
+            {"unique_code": challenge.unique_code},
+            agent_id=agent_id,
+            cycle_id=cycle_id,
+        )
 
     async def get_assignment(self, run_id: str, agent_id: str, context: CapabilityContext) -> dict[str, Any]:
-        async with self.db.sessions() as session:
+        async with self.db.sessions.begin() as session:
             agent = await self._authorize(session, context, roles={"chief", "challenge", "execution"}, agent_id=agent_id)
+            if not agent.unique_code:
+                return {"agent": self._agent_dict(agent), "challenge": None}
+            challenge = await self._require_challenge(session, run_id, agent.unique_code)
+            challenge_data = self._challenge_dict(challenge)
+            assignment: dict[str, Any] = {
+                "mission": agent.mission,
+                "task_stage": agent.task_stage,
+                "success_criteria": list(agent.success_criteria or []),
+                "context_refs": list(agent.context_refs or []),
+                "evidence_root": challenge_data["evidence_root"],
+            }
+            # Only material referenced context crosses the Execution boundary.
+            # Full cycles, all Agents, and unrelated history remain Challenge-owned.
+            referenced: list[dict[str, Any]] = []
+            for reference in agent.context_refs or []:
+                if reference.startswith("finding:"):
+                    finding = await session.get(FindingRecord, reference.removeprefix("finding:"))
+                    if finding is not None and finding.run_id == run_id and finding.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "finding", "summary": finding.summary, "confidence": finding.confidence, "verification_status": finding.verification_status, "evidence_paths": list(finding.evidence_paths or [])})
+                elif reference.startswith("observation:"):
+                    observation = await session.get(ObservationRecord, reference.removeprefix("observation:"))
+                    if observation is not None and observation.run_id == run_id and observation.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "observation", "summary": observation.summary, "confidence": observation.confidence})
+                elif reference.startswith("report:"):
+                    report = await session.get(ReportRecord, reference.removeprefix("report:"))
+                    if report is not None and report.run_id == run_id and report.unique_code == agent.unique_code:
+                        referenced.append({"ref": reference, "type": "report", "summary": str((report.payload or {}).get("summary", ""))[:1000], "status": report.status})
+            challenge_data = {
+                "run_id": challenge_data["run_id"],
+                "unique_code": challenge_data["unique_code"],
+                "description": challenge_data["description"],
+                "target": challenge_data["container_addr"],
+                "direction": challenge_data["direction"],
+                "work_status": challenge_data["work_status"],
+                "container_status": challenge_data["container_status"],
+                "container_addr": challenge_data["container_addr"],
+                "evidence_root": challenge_data["evidence_root"],
+                "referenced_context": referenced,
+            }
             return {
                 "agent": self._agent_dict(agent),
-                "challenge": await self.get_challenge_context(run_id, agent.unique_code, context) if agent.unique_code else None,
+                "assignment": assignment,
+                "challenge": challenge_data,
+                "evidence_root": challenge_data["evidence_root"],
             }
 
     async def run_exists(self, run_id: str) -> bool:
@@ -704,6 +1572,13 @@ class StateService:
                 agent = await session.get(AgentRecord, agent_id)
                 if agent is None or agent.run_id != run_id:
                     raise StateNotFound("agent_not_found", "Agent was not found")
+                if agent.role == "execution":
+                    if agent.terminal_report_id is None:
+                        raise StateConflict(
+                            "execution_finalizer_required",
+                            "Execution Agents must be terminated through finalize_execution_agent",
+                        )
+                    return self._agent_dict(agent, include_runtime=True)
                 agent.status = status
                 if final_report is not None:
                     agent.final_report = redact_value(dict(final_report))
@@ -1550,15 +2425,19 @@ class StateService:
             ).all()
             return [self._resource_work_dict(item) for item in rows]
 
-    async def interrupt_execution_agents(self, run_id: str) -> list[str]:
-        """Mark pre-crash Execution Agents non-replayable during recovery."""
+    async def interrupt_execution_agents(
+        self,
+        run_id: str,
+        *,
+        failure_code: str = "runtime_interrupted",
+    ) -> list[str]:
+        """Finalize active Execution Agents without replaying their assignments."""
 
-        interrupted: list[str] = []
-        async with self._lock:
-            async with self.db.sessions.begin() as session:
-                agents = (
+        async with self.db.sessions() as session:
+            agent_ids = list(
+                (
                     await session.scalars(
-                        select(AgentRecord).where(
+                        select(AgentRecord.agent_id).where(
                             AgentRecord.run_id == run_id,
                             AgentRecord.role == "execution",
                             AgentRecord.status.in_(
@@ -1567,51 +2446,29 @@ class StateService:
                         )
                     )
                 ).all()
-                for agent in agents:
-                    agent.status = "interrupted"
-                    agent.ended_at = self.clock()
-                    agent.version += 1
-                    interrupted.append(agent.agent_id)
-                    admission = await session.scalar(
-                        select(AdmissionRecord).where(
-                            AdmissionRecord.run_id == run_id,
-                            AdmissionRecord.agent_id == agent.agent_id,
-                            AdmissionRecord.status.in_(["queued", "starting", "running"]),
-                        )
-                    )
-                    if admission is not None:
-                        admission.status = "interrupted"
-                        admission.updated_at = self.clock()
-                    await self._event(
-                        session,
-                        run_id,
-                        "agent_interrupted_on_recovery",
-                        {"agent_id": agent.agent_id},
-                        agent_id=agent.agent_id,
-                        cycle_id=agent.cycle_id,
-                    )
-        return interrupted
-
-    async def set_agent_final_report(
-        self,
-        run_id: str,
-        agent_id: str,
-        report: Mapping[str, Any],
-    ) -> None:
-        async with self._lock:
-            async with self.db.sessions.begin() as session:
-                agent = await session.get(AgentRecord, agent_id)
-                if agent is None or agent.run_id != run_id:
-                    raise StateNotFound("agent_not_found", "Agent was not found")
-                agent.final_report = redact_value(dict(report))
-                agent.version += 1
-                await self._event(
-                    session,
-                    run_id,
-                    "agent_report_saved",
-                    {"agent_id": agent_id},
+            )
+        for agent_id in agent_ids:
+            runtime = await self.get_agent_runtime(run_id, agent_id)
+            agent = runtime["agent"]
+            await self.finalize_execution_agent(
+                run_id,
+                agent_id,
+                CapabilityContext(
+                    run_id=run_id,
                     agent_id=agent_id,
-                )
+                    role="execution",
+                    unique_code=agent["unique_code"],
+                ),
+                AgentReportInput(
+                    status="cancelled",
+                    summary="Execution Agent was interrupted by the Runtime",
+                    failure_code=failure_code,
+                    hypothesis_outcome="inconclusive",
+                ),
+                terminal_status="interrupted",
+                allow_inactive=True,
+            )
+        return agent_ids
 
     async def finish_run(
         self,
@@ -1644,6 +2501,63 @@ class StateService:
                 )
         await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
         return self._run_dict(run)
+
+    async def pause_run(self, run_id: str, *, reason: str) -> dict[str, Any]:
+        """Persist a resumable Run pause without turning it terminal."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                run = await self._require_run(session, run_id)
+                if run.status in {"completed", "failed", "interrupted"}:
+                    return self._run_dict(run)
+                if run.status == "paused" and run.pause_reason == reason:
+                    return self._run_dict(run)
+                run.status = "paused"
+                run.paused_at = self.clock()
+                run.pause_reason = reason[:128]
+                sequence = await self._event(
+                    session,
+                    run_id,
+                    "run_paused",
+                    {"reason": run.pause_reason},
+                )
+        await self.notifier.notify(self.run_signal_key(run_id), sequence)
+        return self._run_dict(run)
+
+    async def resume_run(self, run_id: str) -> dict[str, Any]:
+        """Mark a resumable Run active before its controllers are relaunched."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                run = await self._require_run(session, run_id)
+                if run.status in {"completed", "failed", "interrupted"}:
+                    raise StateConflict("run_not_resumable", "Run is terminal")
+                if run.status == "active":
+                    return self._run_dict(run)
+                previous_reason = run.pause_reason
+                run.status = "active"
+                run.paused_at = None
+                run.pause_reason = None
+                sequence = await self._event(
+                    session,
+                    run_id,
+                    "run_resumed",
+                    {"previous_pause_reason": previous_reason},
+                )
+        await self.notifier.notify(self.run_signal_key(run_id), sequence)
+        return self._run_dict(run)
+
+    async def append_run_event(
+        self, run_id: str, event_type: str, payload: Mapping[str, Any]
+    ) -> int:
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await self._require_run(session, run_id)
+                sequence = await self._event(
+                    session, run_id, event_type, dict(payload)
+                )
+        await self.notifier.notify(self.run_signal_key(run_id), sequence)
+        return sequence
 
     async def consume_reports(
         self,
@@ -1766,8 +2680,37 @@ class StateService:
                         "challenge_not_active",
                         "Paused, closed, or completed challenges do not accept new cycles",
                     )
+                open_cycle = await session.scalar(
+                    select(CycleRecord)
+                    .where(
+                        CycleRecord.run_id == run_id,
+                        CycleRecord.unique_code == unique_code,
+                        CycleRecord.status.not_in(["completed", "invalid_cycle_output"]),
+                    )
+                    .order_by(CycleRecord.cycle_number.desc())
+                    .limit(1)
+                )
+                if open_cycle is not None:
+                    raise StateConflict(
+                        "cycle_already_in_progress",
+                        "a Cycle is already in progress; read its authoritative state before continuing",
+                        {
+                            **self._cycle_recovery_detail(open_cycle),
+                            "required_tool": "challenge_get_state",
+                            "retry_same_arguments": False,
+                        },
+                    )
                 if challenge.version != payload.expected_challenge_version:
-                    raise StateConflict("state_conflict", "challenge state changed", {"current_version": challenge.version})
+                    raise StateConflict(
+                        "state_conflict",
+                        "challenge state changed",
+                        {
+                            "current_version": challenge.version,
+                            "current_status": challenge.work_status,
+                            "cycle_id": None,
+                            "allowed_tools": ["challenge_get_state"],
+                        },
+                    )
                 existing = await session.scalar(select(func.max(CycleRecord.cycle_number)).where(CycleRecord.run_id == run_id, CycleRecord.unique_code == unique_code))
                 cycle_number = int(existing or 0) + 1
                 cycle = CycleRecord(
@@ -1791,12 +2734,31 @@ class StateService:
             async with self.db.sessions.begin() as session:
                 cycle = await self._require_cycle(session, run_id, cycle_id)
                 await self._authorize(session, context, roles={"challenge"}, unique_code=cycle.unique_code)
-                self._check_version(cycle.version, payload.expected_version)
+                self._check_version(
+                    cycle.version,
+                    payload.expected_version,
+                    detail=self._cycle_recovery_detail(cycle),
+                )
                 if cycle.status not in {"state", "analysis"}:
-                    raise StateConflict("invalid_cycle_phase", "cycle is not accepting analysis and plan")
+                    raise StateConflict(
+                        "invalid_cycle_phase",
+                        "cycle is not accepting analysis and plan",
+                        self._cycle_recovery_detail(cycle),
+                    )
+                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
+                tasks = list(payload.tasks)
+                await self._validate_discovery_wave(
+                    session,
+                    run_id=run_id,
+                    unique_code=cycle.unique_code,
+                    tasks=tasks,
+                )
                 cycle.analysis = {
                     "summary": payload.analysis_summary,
-                    "hypotheses": payload.hypotheses,
+                    "direction": payload.direction,
+                    "hypotheses": [
+                        item.model_dump(mode="json") for item in payload.hypotheses
+                    ],
                     "information_gaps": payload.information_gaps,
                     "avoid_repeating": payload.avoid_repeating,
                 }
@@ -1807,45 +2769,133 @@ class StateService:
                 cycle.execute_at = self.clock()
                 cycle.version += 1
                 admissions: list[dict[str, Any]] = []
-                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
-                tasks = list(payload.tasks)
-                if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
-                    tasks = []
-                elif challenge.stagnation_level >= 1:
-                    tasks = [
-                        item
-                        for item in tasks
-                        if item.kind == "exploration" and item.context_refs
-                    ][:1]
-                    existing_explorer = await session.scalar(
-                        select(AgentRecord).where(
-                            AgentRecord.run_id == run_id,
-                            AgentRecord.unique_code == cycle.unique_code,
-                            AgentRecord.kind == "exploration",
-                            AgentRecord.status.in_(
-                                ["pending", "queued", "starting", "running", "working"]
-                            ),
+                await self._validate_validation_debt_tasks(
+                    session,
+                    run_id=run_id,
+                    unique_code=cycle.unique_code,
+                    tasks=tasks,
+                )
+                await self._reserve_warning_pivot_for_tasks(
+                    session,
+                    run_id=run_id,
+                    challenge=challenge,
+                    tasks=tasks,
+                    agent_id=context.agent_id,
+                    cycle_id=cycle_id,
+                )
+                if payload.direction != "unknown" and challenge.direction != payload.direction:
+                    if challenge.direction != "unknown":
+                        direction_refs = [
+                            reference
+                            for hypothesis in payload.hypotheses
+                            for reference in hypothesis.based_on_observations
+                        ]
+                        direction_refs.extend(
+                            reference
+                            for task in tasks
+                            for reference in task.context_refs
                         )
+                        if not any(
+                            reference.startswith(("report:", "observation:"))
+                            for reference in direction_refs
+                        ):
+                            raise StateConflict(
+                                "direction_change_requires_evidence",
+                                "Changing a classified direction requires a new report or observation reference",
+                            )
+                    previous_direction = challenge.direction
+                    challenge.direction = payload.direction
+                    challenge.version += 1
+                    await self._event(
+                        session,
+                        run_id,
+                        "challenge_direction_changed",
+                        {
+                            "unique_code": cycle.unique_code,
+                            "previous_direction": previous_direction,
+                            "direction": payload.direction,
+                            "source": "analysis_plan",
+                        },
+                        agent_id=context.agent_id,
+                        cycle_id=cycle_id,
                     )
-                    if existing_explorer is not None or challenge.l2_explorer_created:
-                        tasks = []
-                    elif tasks:
-                        challenge.l2_explorer_created = True
-                        challenge.version += 1
-                        await self._event(
-                            session,
-                            run_id,
-                            "stagnation_explorer_reserved",
-                            {"unique_code": cycle.unique_code, "source": "cycle_plan"},
-                            agent_id=context.agent_id,
-                            cycle_id=cycle_id,
+                if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
+                    if tasks:
+                        raise StateConflict(
+                            "challenge_paused",
+                            "Paused or extended challenges do not accept execution tasks",
                         )
+                if len({task.task_key for task in tasks}) != len(tasks):
+                    raise StateConflict(
+                        "duplicate_task_key", "A plan contains duplicate task keys"
+                    )
+                if len({task.hypothesis_key for task in tasks}) != len(tasks):
+                    raise StateConflict(
+                        "duplicate_active_hypothesis",
+                        "A plan may start only one task per hypothesis",
+                    )
+                hypothesis_by_key = {
+                    hypothesis.key: hypothesis
+                    for hypothesis in payload.hypotheses
+                }
                 for task in tasks:
+                    if task.hypothesis_key == "challenge-direction":
+                        existing_probe = await session.scalar(
+                            select(AgentRecord).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == cycle.unique_code,
+                                AgentRecord.hypothesis_key == "challenge-direction",
+                            )
+                        )
+                        if existing_probe is not None:
+                            raise StateConflict(
+                                "direction_probe_exists",
+                                "Only one challenge-direction probe is allowed for this challenge",
+                            )
+                    branch_key = task.branch_key or (
+                        f"{task.hypothesis_key}:{task.kind}"
+                    )
+                    await self._validate_branch_admission(
+                        session,
+                        run_id=run_id,
+                        unique_code=cycle.unique_code,
+                        hypothesis_key=task.hypothesis_key,
+                        branch_key=branch_key,
+                        task_key=task.task_key,
+                        task_stage=task.task_stage,
+                        context_refs=task.context_refs,
+                    )
                     agent_id = f"execution_{uuid4().hex}"
+                    hypothesis = hypothesis_by_key.get(task.hypothesis_key)
+                    await self._upsert_hypothesis(
+                        session,
+                        run_id=run_id,
+                        unique_code=cycle.unique_code,
+                        hypothesis=hypothesis,
+                        created_by=context.agent_id,
+                        status="active",
+                    )
+                    await self._upsert_branch(
+                        session,
+                        run_id=run_id,
+                        unique_code=cycle.unique_code,
+                        branch_key=branch_key,
+                        hypothesis_key=task.hypothesis_key,
+                        kind=task.kind,
+                        task_stage=task.task_stage,
+                        priority=task.priority,
+                        mission=task.objective,
+                        agent_id=agent_id,
+                        status="queued",
+                    )
                     agent = AgentRecord(
                         agent_id=agent_id, run_id=run_id, parent_id=context.agent_id,
                         unique_code=cycle.unique_code, cycle_id=cycle.cycle_id,
-                        role="execution", kind=task.kind, priority=task.priority,
+                        role="execution", kind=task.kind,
+                        task_stage=task.task_stage, priority=task.priority,
+                        hypothesis_key=task.hypothesis_key,
+                        task_key=task.task_key,
+                        branch_key=branch_key,
                         mission=task.objective, success_criteria=task.success_criteria,
                         context_refs=task.context_refs, timeout_seconds=task.timeout_seconds,
                         initial_prompt=task.objective,
@@ -1877,11 +2927,19 @@ class StateService:
             async with self.db.sessions.begin() as session:
                 cycle = await self._require_cycle(session, run_id, cycle_id)
                 await self._authorize(session, context, roles={"challenge"}, unique_code=cycle.unique_code)
-                self._check_version(cycle.version, payload.expected_version)
+                self._check_version(
+                    cycle.version,
+                    payload.expected_version,
+                    detail=self._cycle_recovery_detail(cycle),
+                )
                 if cycle.status not in {"execute", "verify"}:
-                    raise StateConflict("invalid_cycle_phase", "cycle is not ready for verification")
+                    raise StateConflict(
+                        "invalid_cycle_phase",
+                        "cycle is not ready for verification",
+                        self._cycle_recovery_detail(cycle),
+                    )
                 cycle.status = "completed"
-                cycle.verification = {"summary": payload.summary, "outcome": payload.outcome, "rejected_finding_ids": payload.rejected_finding_ids}
+                cycle.verification = {"summary": payload.summary, "outcome": payload.outcome}
                 cycle.state_update = {
                     "next_steps": payload.next_steps,
                     "outcome": payload.outcome,
@@ -1893,74 +2951,36 @@ class StateService:
                 cycle.verify_at = self.clock()
                 cycle.update_at = self.clock()
                 cycle.version += 1
-                valid_progress, added = await self._record_findings(
-                    session,
-                    run_id,
-                    cycle.unique_code,
-                    context.agent_id,
-                    payload.findings,
-                )
-                attack_paths = [
-                    FindingInput(
-                        category="attack_path",
-                        summary=path.summary,
-                        detail={"verification_steps": path.verification_steps},
-                        confidence=path.confidence,
-                        verification_status="candidate",
-                        evidence_paths=path.evidence_paths,
-                    )
-                    for path in payload.new_attack_paths
-                ]
-                attack_path_progress, added_paths = await self._record_findings(
-                    session,
-                    run_id,
-                    cycle.unique_code,
-                    context.agent_id,
-                    attack_paths,
-                    count_candidate_attack_paths=True,
-                )
-                valid_progress = valid_progress or attack_path_progress
-                added.extend(added_paths)
-                for finding_id in payload.rejected_finding_ids:
-                    finding = await session.get(FindingRecord, finding_id)
-                    if finding and finding.run_id == run_id and finding.unique_code == cycle.unique_code:
-                        finding.verification_status = "rejected"
-                        finding.version += 1
+                # Execution reports are the sole source of Finding mutations.
+                # Cycle commit stores only the Challenge's compact summary and
+                # references; copying report findings here used to create a
+                # second semantic event and incorrectly reset stagnation.
+                added: list[dict[str, Any]] = []
+                progress_kinds: set[str] = set()
+                valid_progress = False
                 for credential in payload.credentials:
                     await self._record_credential(session, run_id, cycle.unique_code, None, credential)
-                if any(credential.verified for credential in payload.credentials):
-                    valid_progress = True
-                challenge = await self._require_challenge(session, run_id, cycle.unique_code)
-                if valid_progress:
-                    self._mark_progress(challenge)
-                    progress_kinds = []
-                    if attack_path_progress:
-                        progress_kinds.append("new_attack_path")
-                    if valid_progress and not attack_path_progress:
-                        progress_kinds.append("verified_evidence")
-                    if any(credential.verified for credential in payload.credentials):
-                        progress_kinds.append("verified_credential")
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": cycle.unique_code,
-                            "progress_kinds": progress_kinds,
-                        },
-                        agent_id=context.agent_id,
-                        cycle_id=cycle_id,
-                    )
                 cycle.completed_at = self.clock()
                 await self._event(
                     session,
                     run_id,
                     "cycle_committed",
-                    {"cycle_id": cycle_id, "finding_count": len(added), "valid_progress": valid_progress, "outcome": payload.outcome},
+                    {
+                        "cycle_id": cycle_id,
+                        "finding_count": len(added),
+                        "valid_progress": valid_progress,
+                        "progress_kinds": sorted(progress_kinds),
+                        "outcome": payload.outcome,
+                    },
                     agent_id=context.agent_id,
                     cycle_id=cycle_id,
                 )
-        return {"cycle": self._cycle_dict(cycle), "findings": added, "valid_progress": valid_progress}
+        return {
+            "cycle": self._cycle_dict(cycle),
+            "findings": added,
+            "valid_progress": valid_progress,
+            "progress_kinds": sorted(progress_kinds),
+        }
 
     async def mark_invalid_cycle(self, run_id: str, cycle_id: str, context: CapabilityContext, reason: str = "missing_structured_output") -> dict[str, Any]:
         async with self._lock:
@@ -1985,32 +3005,39 @@ class StateService:
                             "challenge_not_active",
                             "The challenge no longer accepts Execution Agent progress",
                         )
-                agent.status = "running" if payload.status == "working" else payload.status
+                # Progress is never a lifecycle terminal.  Only the atomic
+                # terminal report path may finish an Execution Agent.
+                agent.status = "running"
                 agent.last_heartbeat_at = self.clock()
                 agent.version += 1
+                report_evidence_paths = (
+                    self._validate_evidence_paths(
+                        run_id,
+                        str(agent.unique_code),
+                        payload.evidence_paths,
+                        evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                        if agent.unique_code and self.workspace_root is not None
+                        else None,
+                    )
+                    if agent.unique_code
+                    else list(payload.evidence_paths)
+                )
                 finding_values = [
                     item
-                    if item.evidence_paths or not payload.evidence_paths
-                    else item.model_copy(update={"evidence_paths": payload.evidence_paths})
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
                     for item in payload.findings
                 ]
-                valid, findings = await self._record_findings(
-                    session, run_id, agent.unique_code, agent_id, finding_values
+                progress_kinds, findings = await self._record_findings(
+                    session,
+                    run_id,
+                    agent.unique_code,
+                    agent_id,
+                    finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
                 )
-                if agent.unique_code and valid:
-                    challenge = await self._require_challenge(session, run_id, agent.unique_code)
-                    self._mark_progress(challenge)
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": agent.unique_code,
-                            "progress_kinds": ["verified_evidence"],
-                        },
-                        agent_id=agent_id,
-                        cycle_id=agent.cycle_id,
-                    )
+                valid = False
                 await self._event(
                     session,
                     run_id,
@@ -2022,14 +3049,24 @@ class StateService:
                         "summary": payload.summary,
                         "finding_count": len(findings),
                         "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
                         "expected_result_seconds": payload.expected_result_seconds,
                     },
                     agent_id=agent_id,
                     cycle_id=agent.cycle_id,
                 )
-        return {"agent": self._agent_dict(agent), "findings": findings, "valid_progress": valid}
+        return {
+            "agent": self._agent_dict(agent),
+            "findings": findings,
+            "valid_progress": valid,
+            "progress_kinds": sorted(progress_kinds),
+        }
 
     async def submit_report(self, run_id: str, agent_id: str, context: CapabilityContext, payload: AgentReportInput) -> dict[str, Any]:
+        if context.role == "execution" and payload.status != "working":
+            return await self.finalize_execution_agent(
+                run_id, agent_id, context, payload
+            )
         async with self._lock:
             async with self.db.sessions.begin() as session:
                 agent = await self._authorize(session, context, roles={"execution", "challenge"}, agent_id=agent_id)
@@ -2042,6 +3079,18 @@ class StateService:
                             "challenge_not_active",
                             "The challenge no longer accepts Agent reports",
                         )
+                report_evidence_paths = (
+                    self._validate_evidence_paths(
+                        run_id,
+                        str(agent.unique_code),
+                        payload.evidence_paths,
+                        evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                        if agent.unique_code and self.workspace_root is not None
+                        else None,
+                    )
+                    if agent.unique_code
+                    else list(payload.evidence_paths)
+                )
                 if payload.status == "working":
                     agent.status = "running"
                 else:
@@ -2051,38 +3100,33 @@ class StateService:
                 agent.version += 1
                 finding_values = [
                     item
-                    if item.evidence_paths or not payload.evidence_paths
-                    else item.model_copy(update={"evidence_paths": payload.evidence_paths})
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
                     for item in payload.findings
                 ]
-                valid, findings = await self._record_findings(
-                    session, run_id, agent.unique_code, agent_id, finding_values
+                progress_kinds, findings = await self._record_findings(
+                    session,
+                    run_id,
+                    agent.unique_code,
+                    agent_id,
+                    finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
                 )
-                if agent.unique_code and valid:
-                    self._mark_progress(challenge)
-                    await self._event(
-                        session,
-                        run_id,
-                        "stagnation_progress_recorded",
-                        {
-                            "unique_code": agent.unique_code,
-                            "progress_kinds": ["verified_evidence"],
-                        },
-                        agent_id=agent_id,
-                        cycle_id=agent.cycle_id,
-                    )
+                valid = False
                 safe_payload = {
                     "status": payload.status,
                     "summary": payload.summary,
-                    "findings": [item.model_dump(mode="json") for item in payload.findings],
-                    "evidence_paths": payload.evidence_paths,
+                    "findings": findings,
+                    "evidence_paths": report_evidence_paths,
                     "next_steps": payload.next_steps,
                     "confidence": payload.confidence,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
                 }
                 if payload.failure_code is not None:
                     safe_payload["failure_code"] = payload.failure_code
                 if payload.candidate_flag is not None:
-                    safe_payload["candidate_flag"] = {"sha256": fingerprint_secret(payload.candidate_flag), "length": len(payload.candidate_flag)}
+                    safe_payload["candidate_flag"] = payload.candidate_flag
                 sequence = await self._next_sequence(session, run_id)
                 report = ReportRecord(
                     report_id=f"report_{uuid4().hex}", run_id=run_id, sequence=sequence,
@@ -2097,17 +3141,297 @@ class StateService:
                     run_id,
                     sequence,
                     "agent_report",
-                    {"report_id": report.report_id, "agent_id": agent_id, "status": payload.status, "valid_progress": valid},
+                    {
+                        "report_id": report.report_id,
+                        "agent_id": agent_id,
+                        "status": payload.status,
+                        "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
+                    },
                     agent_id=agent_id,
                     cycle_id=agent.cycle_id,
                 )
-                result = {"report_id": report.report_id, "sequence": sequence, "status": payload.status, "valid_progress": valid, "findings": findings}
+                result = {
+                    "report_id": report.report_id,
+                    "sequence": sequence,
+                    "status": payload.status,
+                    "valid_progress": valid,
+                    "progress_kinds": sorted(progress_kinds),
+                    "findings": findings,
+                }
                 if payload.candidate_flag is not None:
                     self._ephemeral_reports[report.report_id] = payload.candidate_flag
         if agent.parent_id:
             await self.notifier.notify(
                 self.agent_signal_key(run_id, agent.parent_id), sequence
             )
+        return result
+
+    async def finalize_execution_agent(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        payload: AgentReportInput,
+        *,
+        terminal_status: str | None = None,
+        allow_inactive: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically persist exactly one terminal Execution report."""
+
+        if payload.status == "working":
+            raise StateError(
+                "terminal_report_required",
+                "Execution finalization requires a terminal report status",
+                status_code=422,
+            )
+        parent_id: str | None = None
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                agent = await self._authorize(
+                    session,
+                    context,
+                    roles={"execution"},
+                    agent_id=agent_id,
+                )
+                if agent.terminal_report_id is not None:
+                    existing = await session.get(ReportRecord, agent.terminal_report_id)
+                    if existing is None:
+                        raise StateError(
+                            "terminal_report_missing",
+                            "Execution Agent terminal report reference is invalid",
+                        )
+                    return {
+                        "report_id": existing.report_id,
+                        "sequence": existing.sequence,
+                        "status": existing.status,
+                        "hypothesis_outcome": (
+                            existing.payload.get("hypothesis_outcome")
+                            if isinstance(existing.payload, Mapping)
+                            else None
+                        ),
+                        "valid_progress": False,
+                        "progress_kinds": [],
+                        "findings": [],
+                        "idempotent": True,
+                    }
+                challenge: ChallengeRecord | None = None
+                if agent.unique_code:
+                    challenge = await self._require_challenge(
+                        session, run_id, agent.unique_code
+                    )
+                    if (
+                        not allow_inactive
+                        and (
+                            challenge.work_status in {"paused", "closed"}
+                            or challenge.is_completed
+                        )
+                    ):
+                        raise StateConflict(
+                            "challenge_not_active",
+                            "The challenge no longer accepts Agent reports",
+                        )
+                report_evidence_paths = self._validate_evidence_paths(
+                    run_id,
+                    str(agent.unique_code),
+                    payload.evidence_paths,
+                    evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                    if challenge is not None
+                    else None,
+                ) if agent.unique_code else list(payload.evidence_paths)
+                finding_values = [
+                    item
+                    if item.evidence_paths or not report_evidence_paths
+                    else item.model_copy(update={"evidence_paths": report_evidence_paths})
+                    for item in payload.findings
+                ]
+                normalized_resolutions = [
+                    item.model_copy(
+                        update={
+                            "evidence_paths": self._validate_evidence_paths(
+                                run_id,
+                                str(agent.unique_code),
+                                item.evidence_paths,
+                                evidence_root_path=self._ensure_evidence_root_dir(challenge)
+                                if challenge is not None and self.workspace_root is not None
+                                else None,
+                            )
+                        }
+                    )
+                    for item in payload.finding_resolutions
+                ]
+                report_payload = payload.model_copy(
+                    update={"finding_resolutions": normalized_resolutions}
+                )
+                progress_kinds, findings = await self._record_findings(
+                    session,
+                    run_id,
+                    agent.unique_code,
+                    agent_id,
+                    finding_values,
+                    task_stage=agent.task_stage,
+                    count_evidence_backed_candidates=False,
+                )
+                progress_kinds.update(
+                    await self._apply_finding_resolutions(
+                        session, run_id, agent, report_payload
+                    )
+                )
+                valid = bool(progress_kinds)
+                if challenge is not None and valid:
+                    self._mark_progress(challenge)
+                    await self._event(
+                        session,
+                        run_id,
+                        "stagnation_progress_recorded",
+                        {
+                            "unique_code": agent.unique_code,
+                            "progress_kinds": sorted(progress_kinds),
+                        },
+                        agent_id=agent_id,
+                        cycle_id=agent.cycle_id,
+                    )
+                safe_payload: dict[str, Any] = {
+                    "status": payload.status,
+                    "summary": payload.summary,
+                    "findings": findings,
+                    "evidence_paths": report_evidence_paths,
+                    "next_steps": payload.next_steps,
+                    "confidence": payload.confidence,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
+                    "finding_resolutions": [
+                        item.model_dump(mode="json")
+                        for item in normalized_resolutions
+                    ],
+                }
+                if payload.failure_code is not None:
+                    safe_payload["failure_code"] = payload.failure_code
+                if payload.candidate_flag is not None:
+                    safe_payload["candidate_flag"] = payload.candidate_flag
+                sequence = await self._next_sequence(session, run_id)
+                report = ReportRecord(
+                    report_id=f"report_{uuid4().hex}",
+                    run_id=run_id,
+                    sequence=sequence,
+                    agent_id=agent_id,
+                    parent_id=agent.parent_id,
+                    unique_code=agent.unique_code,
+                    report_type="execution",
+                    status=payload.status,
+                    payload=safe_payload,
+                )
+                session.add(report)
+                resolved_status = terminal_status or {
+                    "completed": "completed",
+                    "cancelled": "stopped",
+                    "blocked": "failed",
+                    "failed": "failed",
+                }.get(payload.status, "failed")
+                if resolved_status not in {
+                    "completed",
+                    "failed",
+                    "stopped",
+                    "interrupted",
+                }:
+                    raise StateError(
+                        "invalid_terminal_status",
+                        "Execution terminal status is invalid",
+                        status_code=422,
+                    )
+                durable_report = {
+                    "type": "execution_report",
+                    "agent_id": agent_id,
+                    **safe_payload,
+                    "sequence": sequence,
+                    "report_id": report.report_id,
+                }
+                agent.status = resolved_status
+                agent.final_report = redact_value(durable_report)
+                agent.terminal_report_id = report.report_id
+                agent.last_report_sequence = sequence
+                agent.last_heartbeat_at = self.clock()
+                agent.ended_at = self.clock()
+                agent.version += 1
+                if agent.branch_key and agent.unique_code:
+                    branch = await session.get(
+                        ExecutionBranchRecord,
+                        (run_id, agent.unique_code, agent.branch_key),
+                    )
+                    if branch is not None:
+                        branch.status = {
+                            "completed": "completed",
+                            "cancelled": "cancelled",
+                            "blocked": "failed",
+                            "failed": "failed",
+                            "stopped": "cancelled",
+                            "interrupted": "interrupted",
+                        }.get(resolved_status, "failed")
+                        branch.outcome = {
+                            **branch.outcome,
+                            "agent_id": agent_id,
+                            "report_id": report.report_id,
+                            "status": resolved_status,
+                            "valid_progress": valid,
+                            "progress_kinds": sorted(progress_kinds),
+                            "hypothesis_outcome": payload.hypothesis_outcome,
+                        }
+                        branch.updated_at = self.clock()
+                        branch.version += 1
+                    if agent.hypothesis_key:
+                        hypothesis = await session.get(
+                            HypothesisRecord,
+                            (run_id, agent.unique_code, agent.hypothesis_key),
+                        )
+                        if hypothesis is not None:
+                            hypothesis.status = str(payload.hypothesis_outcome)
+                            hypothesis.updated_at = self.clock()
+                            hypothesis.version += 1
+                admission = await session.scalar(
+                    select(AdmissionRecord).where(
+                        AdmissionRecord.run_id == run_id,
+                        AdmissionRecord.agent_id == agent_id,
+                    )
+                )
+                if admission is not None:
+                    admission.status = resolved_status
+                    admission.updated_at = self.clock()
+                await self._event_with_sequence(
+                    session,
+                    run_id,
+                    sequence,
+                    "agent_report",
+                    {
+                        "report_id": report.report_id,
+                        "agent_id": agent_id,
+                        "status": payload.status,
+                        "agent_status": resolved_status,
+                        "valid_progress": valid,
+                        "progress_kinds": sorted(progress_kinds),
+                        "hypothesis_outcome": payload.hypothesis_outcome,
+                        "terminal": True,
+                    },
+                    agent_id=agent_id,
+                    cycle_id=agent.cycle_id,
+                )
+                parent_id = agent.parent_id
+                result = {
+                    "report_id": report.report_id,
+                    "sequence": sequence,
+                    "status": payload.status,
+                    "agent_status": resolved_status,
+                    "hypothesis_outcome": payload.hypothesis_outcome,
+                    "valid_progress": valid,
+                    "progress_kinds": sorted(progress_kinds),
+                    "findings": findings,
+                    "idempotent": False,
+                }
+                if payload.candidate_flag is not None:
+                    self._ephemeral_reports[report.report_id] = payload.candidate_flag
+        if parent_id:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, parent_id), sequence
+            )
+        await self.notifier.notify(self.run_signal_key(run_id), sequence)
         return result
 
     async def list_reports(
@@ -2251,6 +3575,7 @@ class StateService:
                 challenge.work_status = "paused"
                 challenge.platform_status = "available"
                 challenge.paused_at = self.clock()
+                challenge.pause_reason = "stagnation_threshold"
                 challenge.version += 1
                 event_sequence = await self._event(
                     session,
@@ -2273,6 +3598,7 @@ class StateService:
                 challenge.work_status = "paused"
                 challenge.platform_status = platform_status
                 challenge.paused_at = self.clock()
+                challenge.pause_reason = "stagnation_pending"
                 challenge.version += 1
                 event_sequence = await self._event(
                     session,
@@ -2282,35 +3608,6 @@ class StateService:
                         "unique_code": unique_code,
                         "container_status": challenge.container_status,
                     },
-                )
-        await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
-        return self._challenge_dict(challenge)
-
-    async def reserve_stagnation_explorer(
-        self, run_id: str, unique_code: str
-    ) -> dict[str, Any]:
-        async with self._lock:
-            async with self.db.sessions.begin() as session:
-                challenge = await self._require_challenge(session, run_id, unique_code)
-                if challenge.stagnation_level < 1:
-                    return self._challenge_dict(challenge)
-                if challenge.stagnation_level >= 2 or challenge.work_status in {"paused", "extended"}:
-                    raise StateConflict(
-                        "stagnation_explorer_not_allowed",
-                        "Exploration is not allowed after the first stagnation level",
-                    )
-                if challenge.l2_explorer_created:
-                    raise StateConflict(
-                        "stagnation_explorer_limit",
-                        "This stagnation episode already used its exploration Agent",
-                    )
-                challenge.l2_explorer_created = True
-                challenge.version += 1
-                event_sequence = await self._event(
-                    session,
-                    run_id,
-                    "stagnation_explorer_reserved",
-                    {"unique_code": unique_code},
                 )
         await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
         return self._challenge_dict(challenge)
@@ -2336,7 +3633,7 @@ class StateService:
                         "stagnation_extension_used",
                         "Only one stagnation extension is allowed per episode",
                     )
-                if challenge.container_status not in {"starting", "running"}:
+                if not challenge_work_active(challenge):
                     raise StateConflict(
                         "stagnation_extension_not_allowed",
                         "The challenge container is not active",
@@ -2629,6 +3926,312 @@ class StateService:
             ).all()
             return [self._operation_dict(item) for item in rows]
 
+    async def latest_completed_operation(
+        self,
+        run_id: str,
+        *,
+        operation_type: str,
+        unique_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        async with self.db.sessions() as session:
+            await self._require_run(session, run_id)
+            clauses = [
+                OperationRecord.run_id == run_id,
+                OperationRecord.operation_type == operation_type,
+                OperationRecord.status == "completed",
+            ]
+            if unique_code is not None:
+                clauses.append(OperationRecord.unique_code == unique_code)
+            row = await session.scalar(
+                select(OperationRecord)
+                .where(*clauses)
+                .order_by(OperationRecord.completed_at.desc())
+                .limit(1)
+            )
+            return self._operation_dict(row) if row is not None else None
+
+    async def latest_control_report(
+        self,
+        run_id: str,
+        *,
+        recipient_id: str,
+        report_type: str,
+    ) -> dict[str, Any] | None:
+        """Return the latest persisted control report for one recipient."""
+
+        async with self.db.sessions() as session:
+            await self._require_run(session, run_id)
+            row = await session.scalar(
+                select(ReportRecord)
+                .where(
+                    ReportRecord.run_id == run_id,
+                    ReportRecord.parent_id == recipient_id,
+                    ReportRecord.report_type == report_type,
+                )
+                .order_by(ReportRecord.sequence.desc())
+                .limit(1)
+            )
+            return self._report_dict(row) if row is not None else None
+
+    async def evaluate_hint_admission(
+        self,
+        run_id: str,
+        unique_code: str,
+        context: CapabilityContext,
+        *,
+        basis: str,
+        evidence_refs: list[str],
+    ) -> dict[str, Any]:
+        """Evaluate every Hint prerequisite in one authoritative read transaction.
+
+        This method intentionally has no mutation side effects.  The caller
+        holds the per-challenge Hint lock while it invokes Benchmark, so a
+        rejected evaluation cannot create a Hint marker or an operation.
+        """
+
+        result: dict[str, Any] = {
+            "eligible": False,
+            "basis": basis,
+            "remaining_run_seconds": 0,
+            "remaining_stagnation_seconds": 0,
+            "active_execution_count": 0,
+            "active_resource_work_count": 0,
+            "rejection_code": None,
+        }
+
+        async with self.db.sessions() as session:
+            await self._authorize(session, context, roles={"chief"})
+            run = await self._require_run(session, run_id)
+            challenge = await self._require_challenge(session, run_id, unique_code)
+            now = aware(self.clock())
+            result["remaining_run_seconds"] = max(
+                0, int((aware(run.deadline_at) - now).total_seconds())
+            )
+
+            elapsed = active_seconds(
+                now=now,
+                active_since=challenge.active_since,
+                accumulated_seconds=challenge.exploration_seconds,
+            )
+            result["remaining_stagnation_seconds"] = max(
+                0, HINT_STAGNATION_PAUSE_SECONDS - elapsed
+            )
+
+            # Load all challenge/execution owners once so resource work can be
+            # attributed both to the requested challenge and to the full-run
+            # near-deadline convergence check.
+            agent_rows = list(
+                (
+                    await session.scalars(
+                        select(AgentRecord).where(
+                            AgentRecord.run_id == run_id,
+                            AgentRecord.role.in_(["challenge", "execution"]),
+                        )
+                    )
+                ).all()
+            )
+            agents_by_code: dict[str, list[AgentRecord]] = {}
+            agent_code_by_id: dict[str, str] = {}
+            for agent in agent_rows:
+                if agent.unique_code:
+                    agents_by_code.setdefault(agent.unique_code, []).append(agent)
+                    agent_code_by_id[agent.agent_id] = agent.unique_code
+
+            target_agents = agents_by_code.get(unique_code, [])
+            result["active_execution_count"] = sum(
+                1
+                for agent in target_agents
+                if agent.role == "execution"
+                and agent.status not in HINT_TERMINAL_AGENT_STATES
+            )
+
+            # The four task families have different status columns.  Treat an
+            # in-progress analysis as active HTTP work even when execution has
+            # already completed; a Hint must not race the result pipeline.
+            shell_rows = list(
+                (
+                    await session.scalars(
+                        select(ShellTaskRecord).where(
+                            ShellTaskRecord.run_id == run_id,
+                            ShellTaskRecord.status.in_(HINT_ACTIVE_STATUSES),
+                        )
+                    )
+                ).all()
+            )
+            network_rows = list(
+                (
+                    await session.scalars(
+                        select(NetworkTaskRecord).where(
+                            NetworkTaskRecord.run_id == run_id,
+                        )
+                    )
+                ).all()
+            )
+            http_rows = list(
+                (
+                    await session.scalars(
+                        select(HttpInteractionRecord).where(
+                            HttpInteractionRecord.run_id == run_id,
+                        )
+                    )
+                ).all()
+            )
+            resource_rows = list(
+                (
+                    await session.scalars(
+                        select(ResourceWorkRecord).where(
+                            ResourceWorkRecord.run_id == run_id,
+                            ResourceWorkRecord.status.in_(HINT_ACTIVE_STATUSES),
+                        )
+                    )
+                ).all()
+            )
+
+            active_task_code_counts: dict[str, int] = {}
+
+            def add_active_task(agent_id: str) -> None:
+                code = agent_code_by_id.get(agent_id)
+                if code is None:
+                    return
+                active_task_code_counts[code] = active_task_code_counts.get(code, 0) + 1
+
+            for row in shell_rows:
+                add_active_task(row.agent_id)
+            for row in network_rows:
+                if row.status in HINT_ACTIVE_STATUSES or row.resource_status in HINT_ACTIVE_STATUSES:
+                    add_active_task(row.agent_id)
+            for row in http_rows:
+                if any(
+                    value in HINT_ACTIVE_STATUSES
+                    for value in (
+                        row.status,
+                        row.execution_status,
+                        row.analysis_status,
+                        row.resource_status,
+                    )
+                ):
+                    add_active_task(row.agent_id)
+            for row in resource_rows:
+                add_active_task(row.agent_id)
+
+            # Count separate records, not distinct owners, for the public
+            # diagnostic value.  The per-code map is restricted to known
+            # challenge/execution owners, preserving Run/Challenge isolation.
+            result["active_resource_work_count"] = active_task_code_counts.get(
+                unique_code, 0
+            )
+
+            def reject(code: str) -> dict[str, Any]:
+                result["rejection_code"] = code
+                return result
+
+            if run.status != "active":
+                return reject("run_not_active")
+            if challenge.is_completed or challenge.work_status in {"closed", "paused"}:
+                return reject("challenge_not_active")
+            if not container_slot_occupied(challenge.container_status):
+                return reject("challenge_slot_released")
+            if challenge.work_status != "warning":
+                return reject("challenge_not_warning")
+            if not challenge.hint_eligible:
+                return reject("hint_not_eligible")
+            if challenge.stagnation_level != 1:
+                return reject("stagnation_level_required")
+            if challenge.hint_requested:
+                return reject("hint_already_requested")
+            if result["active_execution_count"]:
+                return reject("execution_active")
+            if result["active_resource_work_count"]:
+                return reject("resource_work_active")
+            if result["remaining_stagnation_seconds"] < HINT_MIN_ACTION_WINDOW_SECONDS:
+                return reject("insufficient_stagnation_window")
+            if not evidence_refs:
+                return reject("evidence_required")
+
+            latest = await session.scalar(
+                select(ReportRecord)
+                .where(
+                    ReportRecord.run_id == run_id,
+                    ReportRecord.parent_id == context.agent_id,
+                    ReportRecord.unique_code == unique_code,
+                    ReportRecord.report_type == "challenge_status",
+                )
+                .order_by(ReportRecord.sequence.desc())
+                .limit(1)
+            )
+            if latest is None or latest.status != "ready_for_hint":
+                return reject("status_report_not_ready")
+            if (
+                challenge.control_since is not None
+                and aware(latest.created_at) < aware(challenge.control_since)
+            ):
+                return reject("status_report_stale")
+            payload = latest.payload if isinstance(latest.payload, Mapping) else {}
+            if not bool(payload.get("hint_recommended")):
+                return reject("hint_not_recommended")
+            if not str(payload.get("blocker") or "").strip():
+                return reject("blocker_required")
+            report_refs = {
+                str(value).strip()
+                for value in (payload.get("evidence_refs") or [])
+                if str(value).strip()
+            }
+            requested_refs = {str(value).strip() for value in evidence_refs if str(value).strip()}
+            if not requested_refs:
+                return reject("evidence_required")
+            if not requested_refs.issubset(report_refs):
+                return reject("evidence_not_in_status_report")
+
+            for reference in requested_refs:
+                kind, separator, identifier = reference.partition(":")
+                if not separator or kind not in {"report", "finding", "observation"} or not identifier:
+                    return reject("invalid_evidence_ref")
+                if kind == "report":
+                    record = await session.get(ReportRecord, identifier)
+                    valid = record is not None and record.run_id == run_id and record.unique_code == unique_code
+                elif kind == "finding":
+                    record = await session.get(FindingRecord, identifier)
+                    valid = record is not None and record.run_id == run_id and record.unique_code == unique_code
+                else:
+                    record = await session.get(ObservationRecord, identifier)
+                    valid = record is not None and record.run_id == run_id and record.unique_code == unique_code
+                if not valid:
+                    return reject("evidence_not_found")
+
+            if basis == "high_probability_path":
+                if run.pass_number != 1:
+                    return reject("high_probability_path_first_pass_only")
+            elif basis == "second_pass_convergence":
+                if run.pass_number != 2:
+                    return reject("second_pass_required")
+            elif basis == "near_deadline":
+                if result["remaining_run_seconds"] > HINT_NEAR_DEADLINE_SECONDS:
+                    return reject("near_deadline_required")
+                all_challenges = list(
+                    (
+                        await session.scalars(
+                            select(ChallengeRecord).where(ChallengeRecord.run_id == run_id)
+                        )
+                    ).all()
+                )
+                for other in all_challenges:
+                    if other.unique_code == unique_code or other.is_completed or other.work_status == "closed":
+                        continue
+                    other_agents = agents_by_code.get(other.unique_code, [])
+                    other_active_execution = any(
+                        agent.role == "execution" and agent.status not in HINT_TERMINAL_AGENT_STATES
+                        for agent in other_agents
+                    )
+                    if other_active_execution or active_task_code_counts.get(other.unique_code, 0):
+                        return reject("global_convergence_required")
+                    if other.work_status not in {"warning", "paused"}:
+                        return reject("global_convergence_required")
+            else:
+                return reject("invalid_basis")
+
+            result["eligible"] = True
+            return result
+
     async def sample_resources(self, run_id: str, cpu_percent: float, memory_percent: float) -> dict[str, Any]:
         async with self._lock:
             async with self.db.sessions.begin() as session:
@@ -2793,6 +4396,97 @@ class StateService:
         """Recovery boundary: unresolved platform operations become indeterminate."""
         return await self.mark_indeterminate_operations(run_id)
 
+    async def _apply_finding_resolutions(
+        self,
+        session: Any,
+        run_id: str,
+        agent: AgentRecord,
+        payload: AgentReportInput,
+    ) -> set[str]:
+        resolutions = list(payload.finding_resolutions or [])
+        if not resolutions:
+            actionable_verified = any(
+                item.category in VALIDATION_DEBT_CATEGORIES
+                and item.verification_status in {"verified", "rejected"}
+                for item in payload.findings
+            )
+            if actionable_verified:
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Actionable Finding verification requires finding_resolutions",
+                    status_code=422,
+                )
+            return set()
+        if agent.task_stage not in {"validation", "exploitation"}:
+            raise StateError(
+                "invalid_finding_resolution",
+                "Only validation and exploitation tasks may resolve Findings",
+                status_code=422,
+            )
+        if payload.hypothesis_outcome not in {"supported", "rejected"}:
+            raise StateError(
+                "invalid_finding_resolution",
+                "Finding resolutions require a supported or rejected hypothesis outcome",
+                status_code=422,
+            )
+        expected_outcome = (
+            "verified" if payload.hypothesis_outcome == "supported" else "rejected"
+        )
+        progress: set[str] = set()
+        seen: set[str] = set()
+        challenge = await self._require_challenge(session, run_id, str(agent.unique_code))
+        evidence_root = self._ensure_evidence_root_dir(challenge)
+        for resolution in resolutions:
+            if not resolution.finding_ref.startswith("finding:"):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "finding_ref must use finding:<id> format",
+                    status_code=422,
+                )
+            if resolution.outcome != expected_outcome:
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding resolution outcome does not match hypothesis_outcome",
+                    status_code=422,
+                )
+            if resolution.finding_ref in seen or resolution.finding_ref not in (agent.context_refs or []):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding resolution must reference a cited same-challenge candidate",
+                    status_code=422,
+                )
+            seen.add(resolution.finding_ref)
+            normalized = self._validate_evidence_paths(
+                run_id,
+                str(agent.unique_code),
+                resolution.evidence_paths,
+                evidence_root_path=evidence_root,
+            )
+            finding = await session.get(
+                FindingRecord, resolution.finding_ref.removeprefix("finding:")
+            )
+            if (
+                finding is None
+                or finding.run_id != run_id
+                or finding.unique_code != agent.unique_code
+                or finding.verification_status != "candidate"
+            ):
+                raise StateError(
+                    "invalid_finding_resolution",
+                    "Finding is missing, out of scope, or no longer candidate",
+                    status_code=422,
+                )
+            finding.verification_status = resolution.outcome
+            finding.evidence_paths = list(dict.fromkeys([*finding.evidence_paths, *normalized]))
+            finding.verified_at = self.clock() if resolution.outcome == "verified" else None
+            finding.version += 1
+            progress.add(
+                "verified_finding"
+                if resolution.outcome == "verified"
+                else "rejected_finding"
+            )
+        return progress
+
     async def _record_findings(
         self,
         session: Any,
@@ -2801,28 +4495,33 @@ class StateService:
         agent_id: str | None,
         values: Iterable[FindingInput],
         *,
+        task_stage: str | None = None,
         count_candidate_attack_paths: bool = False,
-    ) -> tuple[bool, list[dict[str, Any]]]:
+        count_evidence_backed_candidates: bool = False,
+    ) -> tuple[set[str], list[dict[str, Any]]]:
         if not unique_code:
-            return False, []
+            return set(), []
         added: list[dict[str, Any]] = []
-        valid_progress = False
+        progress_kinds: set[str] = set()
+        challenge = await self._require_challenge(session, run_id, unique_code)
         for value in values:
+            if (
+                task_stage == "discovery"
+                and value.category in VALIDATION_DEBT_CATEGORIES
+                and value.verification_status != "candidate"
+            ):
+                value = value.model_copy(update={"verification_status": "candidate"})
+            normalized_paths = self._validate_evidence_paths(
+                run_id,
+                unique_code,
+                value.evidence_paths,
+                evidence_root_path=self._ensure_evidence_root_dir(challenge),
+            )
+            if normalized_paths != value.evidence_paths:
+                value = value.model_copy(update={"evidence_paths": normalized_paths})
             fingerprint = _fingerprint(value.category, value.summary, value.detail)
             summary = value.summary
             detail = value.detail
-            if value.category == "flag":
-                raw_candidate = json.dumps(
-                    {"summary": value.summary, "detail": value.detail},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
-                summary = "Flag candidate"
-                detail = {
-                    "sha256": fingerprint_secret(raw_candidate),
-                    "length": len(raw_candidate),
-                }
             existing = await session.scalar(select(FindingRecord).where(FindingRecord.run_id == run_id, FindingRecord.unique_code == unique_code, FindingRecord.category == value.category, FindingRecord.fingerprint == fingerprint))
             now = self.clock()
             if existing is None:
@@ -2836,27 +4535,73 @@ class StateService:
                 )
                 session.add(record)
                 existing = record
-                if value.verification_status == "verified" and value.evidence_paths:
-                    valid_progress = True
-                elif (
+                await self._record_observation_locked(
+                    session,
+                    run_id,
+                    unique_code,
+                    category=value.category,
+                    fingerprint=fingerprint,
+                    summary=summary,
+                    detail=detail,
+                    source="finding",
+                    source_ref=record.finding_id,
+                    confidence=value.confidence,
+                    challenge=challenge,
+                )
+                if (
                     count_candidate_attack_paths
                     and value.category == "attack_path"
                     and value.evidence_paths
                     and value.detail.get("verification_steps")
                 ):
-                    valid_progress = True
+                    progress_kinds.add("new_attack_path")
+                elif (
+                    task_stage in {"validation", "exploitation"}
+                    and value.category == "attack_path"
+                    and value.evidence_paths
+                    and value.detail.get("verification_steps")
+                ):
+                    progress_kinds.add("new_attack_path")
+                elif (
+                    task_stage != "discovery"
+                    and count_evidence_backed_candidates
+                    and value.verification_status == "candidate"
+                    and value.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and value.evidence_paths
+                ):
+                    progress_kinds.add("evidence_backed_discovery")
             else:
                 existing.last_seen_at = now
+                was_evidence_backed_candidate = (
+                    existing.verification_status == "candidate"
+                    and existing.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and bool(existing.evidence_paths)
+                )
+                previous_confidence = existing.confidence
+                previous_evidence_paths = list(existing.evidence_paths)
                 existing.confidence = max(existing.confidence, value.confidence)
                 existing.evidence_paths = list(dict.fromkeys([*existing.evidence_paths, *value.evidence_paths]))
+                changed = (
+                    existing.confidence != previous_confidence
+                    or existing.evidence_paths != previous_evidence_paths
+                )
                 if existing.verification_status != "verified" and value.verification_status == "verified":
                     existing.verification_status = "verified"
                     existing.verified_at = now
+                    changed = True
+                elif (
+                    task_stage != "discovery"
+                    and count_evidence_backed_candidates
+                    and not was_evidence_backed_candidate
+                    and existing.verification_status == "candidate"
+                    and existing.confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    and existing.evidence_paths
+                ):
+                    progress_kinds.add("evidence_backed_discovery")
+                if changed:
                     existing.version += 1
-                    if existing.evidence_paths:
-                        valid_progress = True
             added.append(self._finding_dict(existing))
-        return valid_progress, added
+        return progress_kinds, added
 
     async def _record_credential(self, session: Any, run_id: str, unique_code: str, finding_id: str | None, value: Any) -> CredentialRecord:
         record = CredentialRecord(credential_id=f"credential_{uuid4().hex}", run_id=run_id, unique_code=unique_code, finding_id=finding_id, kind=value.kind, principal=value.principal, secret_value=value.secret_value, scope=value.scope, verified=value.verified)
@@ -2936,6 +4681,8 @@ class StateService:
         challenge = await session.get(ChallengeRecord, (run_id, unique_code))
         if challenge is None:
             raise StateNotFound("challenge_not_found", "challenge was not found")
+        self._ensure_evidence_root(challenge)
+        self._ensure_evidence_root_dir(challenge)
         return challenge
 
     async def _require_cycle(self, session: Any, run_id: str, cycle_id: str) -> CycleRecord:
@@ -2959,9 +4706,45 @@ class StateService:
         return agent
 
     @staticmethod
-    def _check_version(current: int, expected: int) -> None:
+    def _cycle_recovery_detail(cycle: CycleRecord) -> dict[str, Any]:
+        """Describe the authoritative next actions for a Cycle conflict."""
+
+        if cycle.status in {"state", "analysis"}:
+            allowed_tools = ["challenge_submit_analysis_plan"]
+        elif cycle.status in {"execute", "verify"}:
+            allowed_tools = [
+                "challenge_get_execution_reports",
+                "challenge_commit_cycle",
+            ]
+        elif cycle.status in {"completed", "invalid_cycle_output"}:
+            allowed_tools = ["challenge_begin_cycle"]
+        else:
+            allowed_tools = ["challenge_get_state"]
+        return {
+            "cycle_id": cycle.cycle_id,
+            "current_status": cycle.status,
+            "current_version": cycle.version,
+            "allowed_tools": allowed_tools,
+            "required_tool": "challenge_get_state",
+            "retry_same_arguments": False,
+        }
+
+    @staticmethod
+    def _check_version(
+        current: int,
+        expected: int,
+        *,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
         if current != expected:
-            raise StateConflict("state_conflict", "state version is stale", {"current_version": current})
+            conflict_detail = {"current_version": current}
+            if detail:
+                conflict_detail.update(detail)
+            raise StateConflict(
+                "state_conflict",
+                "state version is stale",
+                conflict_detail,
+            )
 
     def _mark_progress(self, challenge: ChallengeRecord) -> None:
         now = self.clock()
@@ -2970,16 +4753,660 @@ class StateService:
         challenge.stagnation_level = 0
         challenge.hint_eligible = False
         challenge.work_status = "completed" if challenge.is_completed else "active"
-        challenge.l2_explorer_created = False
+        challenge.warning_pivot_used = False
         challenge.extension_cycle_pending = False
+        challenge.control_state = "ok"
+        challenge.control_since = None
+        challenge.pause_reason = None
         challenge.version += 1
-        if challenge.container_status == "running":
+        if container_slot_occupied(challenge.container_status):
             challenge.active_since = now
 
     def _freeze_exploration(self, challenge: ChallengeRecord) -> None:
         now = self.clock()
         challenge.exploration_seconds = active_seconds(now=now, active_since=challenge.active_since, accumulated_seconds=challenge.exploration_seconds)
         challenge.active_since = None
+
+    @staticmethod
+    def _target_fingerprint(challenge: ChallengeRecord) -> str:
+        addrs = sorted(str(item) for item in (challenge.container_addr or []))
+        raw = json.dumps(addrs, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _ensure_evidence_root(self, challenge: ChallengeRecord) -> str:
+        target_fingerprint = self._target_fingerprint(challenge)
+        relative = Path(
+            ".aion",
+            "runs",
+            challenge.run_id,
+            "challenges",
+            challenge.unique_code,
+            "evidence",
+            target_fingerprint,
+        )
+        if self.workspace_root is None and self.run_root is not None:
+            relative = Path(
+                "challenges",
+                challenge.unique_code,
+                "evidence",
+                target_fingerprint,
+            )
+        if not challenge.evidence_root or Path(challenge.evidence_root).name != target_fingerprint:
+            challenge.evidence_root = relative.as_posix()
+        return challenge.evidence_root
+
+    def _ensure_evidence_root_dir(self, challenge: ChallengeRecord) -> Path | None:
+        if self.run_root is None:
+            return None
+        path = (
+            self.run_root
+            / challenge.run_id
+            / "challenges"
+            / challenge.unique_code
+            / "evidence"
+            / self._target_fingerprint(challenge)
+        ).resolve()
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for parent in (
+            path,
+            path.parent,
+            path.parent.parent,
+            path.parent.parent.parent,
+            path.parent.parent.parent.parent,
+        ):
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
+        return path
+
+    async def _record_observation_locked(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+        *,
+        category: str,
+        fingerprint: str,
+        summary: str,
+        detail: Mapping[str, Any] | None,
+        source: str,
+        source_ref: str | None = None,
+        confidence: float = 0.5,
+        challenge: ChallengeRecord | None = None,
+    ) -> tuple[str, bool]:
+        if challenge is None:
+            challenge = await self._require_challenge(session, run_id, unique_code)
+        target = self._target_fingerprint(challenge)
+        self._ensure_evidence_root(challenge)
+        existing = await session.scalar(
+            select(ObservationRecord).where(
+                ObservationRecord.run_id == run_id,
+                ObservationRecord.unique_code == unique_code,
+                ObservationRecord.target_fingerprint == target,
+                ObservationRecord.category == category,
+                ObservationRecord.fingerprint == fingerprint,
+            )
+        )
+        now = self.clock()
+        if existing is not None:
+            existing.last_seen_at = now
+            existing.confidence = max(existing.confidence, confidence)
+            existing.version += 1
+            return existing.observation_id, False
+        observation_id = f"observation_{uuid4().hex}"
+        session.add(
+            ObservationRecord(
+                observation_id=observation_id,
+                run_id=run_id,
+                unique_code=unique_code,
+                target_fingerprint=target,
+                category=category,
+                fingerprint=fingerprint,
+                summary=summary,
+                detail=dict(detail or {}),
+                source=source,
+                source_ref=source_ref,
+                confidence=confidence,
+                captured_at=now,
+                last_seen_at=now,
+            )
+        )
+        return observation_id, True
+
+    async def _upsert_hypothesis(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        hypothesis: Any | None,
+        created_by: str | None = None,
+        status: str = "active",
+    ) -> bool:
+        if hypothesis is None:
+            return False
+        existing = await session.get(
+            HypothesisRecord, (run_id, unique_code, hypothesis.key)
+        )
+        now = self.clock()
+        if existing is not None:
+            existing.statement = hypothesis.statement
+            existing.confidence = hypothesis.confidence
+            existing.based_on_observations = sorted(
+                set(
+                    [
+                        *existing.based_on_observations,
+                        *hypothesis.based_on_observations,
+                    ]
+                )
+            )
+            if status == "active" and existing.status in {"proposed", "active"}:
+                existing.status = status
+            existing.updated_at = now
+            existing.version += 1
+            return False
+        session.add(
+            HypothesisRecord(
+                run_id=run_id,
+                unique_code=unique_code,
+                hypothesis_key=hypothesis.key,
+                statement=hypothesis.statement,
+                confidence=hypothesis.confidence,
+                based_on_observations=sorted(hypothesis.based_on_observations),
+                status=status,
+                created_by=created_by,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return True
+
+    async def _upsert_branch(
+        self,
+        session: Any,
+        *,
+        run_id: str,
+        unique_code: str,
+        branch_key: str,
+        hypothesis_key: str | None,
+        kind: str,
+        task_stage: str,
+        priority: int,
+        mission: str | None,
+        agent_id: str | None = None,
+        status: str = "proposed",
+    ) -> bool:
+        challenge = await self._require_challenge(session, run_id, unique_code)
+        target = self._target_fingerprint(challenge)
+        existing = await session.get(
+            ExecutionBranchRecord, (run_id, unique_code, branch_key)
+        )
+        now = self.clock()
+        if existing is not None:
+            if agent_id and agent_id not in (existing.agent_ids or []):
+                existing.agent_ids = [*existing.agent_ids, agent_id]
+            if status == "queued" and existing.status in {"proposed", "queued"}:
+                existing.status = status
+            if priority > existing.priority:
+                existing.priority = priority
+            if mission:
+                existing.mission = mission
+            existing.task_stage = task_stage
+            existing.updated_at = now
+            existing.version += 1
+            return False
+        session.add(
+            ExecutionBranchRecord(
+                run_id=run_id,
+                unique_code=unique_code,
+                branch_key=branch_key,
+                target_fingerprint=target,
+                hypothesis_key=hypothesis_key,
+                kind=kind,
+                task_stage=task_stage,
+                status=status,
+                priority=priority,
+                mission=mission,
+                agent_ids=[agent_id] if agent_id else [],
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return True
+
+    async def _cancel_live_branches(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+        *,
+        reason: str,
+    ) -> list[str]:
+        rows = list(
+            (
+                await session.scalars(
+                    select(ExecutionBranchRecord).where(
+                        ExecutionBranchRecord.run_id == run_id,
+                        ExecutionBranchRecord.unique_code == unique_code,
+                        ExecutionBranchRecord.status.in_(
+                            ["proposed", "queued", "running"]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        cancelled: list[str] = []
+        now = self.clock()
+        for branch in rows:
+            branch.status = "cancelled"
+            branch.outcome = {
+                **branch.outcome,
+                "cancelled_at": _json_value(now),
+                "reason": reason,
+            }
+            branch.updated_at = now
+            branch.version += 1
+            cancelled.append(branch.branch_key)
+        return cancelled
+
+    def _validate_evidence_paths(
+        self,
+        run_id: str,
+        unique_code: str,
+        paths: Iterable[str],
+        *,
+        evidence_root_path: Path | None = None,
+    ) -> list[str]:
+        """Reject evidence paths that escape the challenge evidence directory."""
+
+        normalized: list[str] = []
+        evidence_root: Path | None = None
+        if self.run_root is not None and self.workspace_root is not None:
+            evidence_root = evidence_root_path or (
+                self.run_root / run_id / "challenges" / unique_code / "evidence"
+            ).resolve()
+        for raw in paths:
+            path = str(raw or "")
+            if not path:
+                continue
+            if "://" in path:
+                if self.workspace_root is not None:
+                    raise StateError(
+                        "invalid_evidence_path",
+                        "evidence path must be a file below the exact challenge evidence directory",
+                        status_code=422,
+                    )
+                normalized.append(path)
+                continue
+            value = Path(path)
+            if evidence_root is None:
+                if value.is_absolute() or ".." in value.parts:
+                    raise StateError(
+                        "invalid_evidence_path",
+                        "evidence path must be inside the challenge evidence directory",
+                        status_code=422,
+                    )
+                normalized.append(path)
+                continue
+            workspace_root = self.workspace_root or self.run_root.parent
+            candidate = value if value.is_absolute() else workspace_root / value
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(evidence_root):
+                raise StateError(
+                    "invalid_evidence_path",
+                    "evidence path must be inside the exact challenge evidence directory",
+                    status_code=422,
+                )
+            if self.workspace_root is not None:
+                normalized.append(resolved.relative_to(self.workspace_root).as_posix())
+            else:
+                normalized.append(resolved.as_posix())
+        return normalized
+
+    async def record_observation(
+        self,
+        run_id: str,
+        unique_code: str,
+        *,
+        category: str,
+        summary: str,
+        detail: Mapping[str, Any] | None = None,
+        source: str,
+        source_ref: str | None = None,
+        confidence: float = 0.5,
+        mark_progress: bool = False,
+    ) -> dict[str, Any]:
+        """Persist one deduplicated Observation and route capability branches."""
+
+        fingerprint = _fingerprint(category, summary, detail or {})
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                observation_id, created = await self._record_observation_locked(
+                    session,
+                    run_id,
+                    unique_code,
+                    category=category,
+                    fingerprint=fingerprint,
+                    summary=summary,
+                    detail=detail,
+                    source=source,
+                    source_ref=source_ref,
+                    confidence=confidence,
+                    challenge=challenge,
+                )
+                event_sequence: int | None = None
+                if created:
+                    if mark_progress and challenge_work_active(challenge):
+                        self._mark_progress(challenge)
+                    event_sequence = await self._event(
+                        session,
+                        run_id,
+                        "observation_recorded",
+                        {
+                            "unique_code": unique_code,
+                            "observation_id": observation_id,
+                            "category": category,
+                            "source": source,
+                        },
+                    )
+                branch_keys: list[str] = []
+                if created:
+                    routes = routes_for_observation(
+                        {
+                            "category": category,
+                            "summary": summary,
+                            "detail": detail or {},
+                        }
+                    )
+                    for route in routes:
+                        added = await self._upsert_branch(
+                            session,
+                            run_id=run_id,
+                            unique_code=unique_code,
+                            branch_key=route.branch_key,
+                            hypothesis_key=None,
+                            kind=route.kind,
+                            task_stage=route.task_stage,
+                            priority=route.priority,
+                            mission=route.mission,
+                            status="proposed",
+                        )
+                        if added:
+                            branch_keys.append(route.branch_key)
+        if created and event_sequence is not None:
+            await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
+        return {
+            "observation_id": observation_id,
+            "created": created,
+            "fingerprint": fingerprint,
+            "branches_created": branch_keys,
+        }
+
+    async def list_observations(
+        self, run_id: str, unique_code: str
+    ) -> list[dict[str, Any]]:
+        async with self.db.sessions() as session:
+            await self._require_challenge(session, run_id, unique_code)
+            rows = (
+                await session.scalars(
+                    select(ObservationRecord)
+                    .where(
+                        ObservationRecord.run_id == run_id,
+                        ObservationRecord.unique_code == unique_code,
+                    )
+                    .order_by(ObservationRecord.captured_at)
+                )
+            ).all()
+            return [
+                {
+                    "observation_id": item.observation_id,
+                    "unique_code": item.unique_code,
+                    "target_fingerprint": item.target_fingerprint,
+                    "category": item.category,
+                    "summary": item.summary,
+                    "detail": item.detail,
+                    "source": item.source,
+                    "source_ref": item.source_ref,
+                    "confidence": item.confidence,
+                    "captured_at": _json_value(item.captured_at),
+                    "version": item.version,
+                }
+                for item in rows
+            ]
+
+    async def list_hypotheses(
+        self, run_id: str, unique_code: str
+    ) -> list[dict[str, Any]]:
+        async with self.db.sessions() as session:
+            await self._require_challenge(session, run_id, unique_code)
+            rows = (
+                await session.scalars(
+                    select(HypothesisRecord)
+                    .where(
+                        HypothesisRecord.run_id == run_id,
+                        HypothesisRecord.unique_code == unique_code,
+                    )
+                    .order_by(HypothesisRecord.created_at)
+                )
+            ).all()
+            return [
+                {
+                    "hypothesis_key": item.hypothesis_key,
+                    "statement": item.statement,
+                    "confidence": item.confidence,
+                    "based_on_observations": item.based_on_observations,
+                    "status": item.status,
+                    "created_by": item.created_by,
+                    "updated_at": _json_value(item.updated_at),
+                    "version": item.version,
+                }
+                for item in rows
+            ]
+
+    async def list_branches(
+        self, run_id: str, unique_code: str
+    ) -> list[dict[str, Any]]:
+        async with self.db.sessions() as session:
+            await self._require_challenge(session, run_id, unique_code)
+            rows = (
+                await session.scalars(
+                    select(ExecutionBranchRecord)
+                    .where(
+                        ExecutionBranchRecord.run_id == run_id,
+                        ExecutionBranchRecord.unique_code == unique_code,
+                    )
+                    .order_by(ExecutionBranchRecord.priority.desc())
+                )
+            ).all()
+            return [
+                {
+                    "branch_key": item.branch_key,
+                    "target_fingerprint": item.target_fingerprint,
+                    "hypothesis_key": item.hypothesis_key,
+                    "kind": item.kind,
+                    "task_stage": item.task_stage,
+                    "status": item.status,
+                    "priority": item.priority,
+                    "mission": item.mission,
+                    "agent_ids": item.agent_ids,
+                    "outcome": item.outcome,
+                    "updated_at": _json_value(item.updated_at),
+                    "version": item.version,
+                }
+                for item in rows
+            ]
+
+    async def cancel_challenge_branches(
+        self,
+        run_id: str,
+        unique_code: str,
+        *,
+        reason: str = "challenge_completed",
+    ) -> list[str]:
+        """Cancel every live branch after an explicit Challenge termination."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await self._require_challenge(session, run_id, unique_code)
+                return await self._cancel_live_branches(
+                    session,
+                    run_id,
+                    unique_code,
+                    reason=reason,
+                )
+
+    async def set_challenge_control_state(
+        self,
+        run_id: str,
+        unique_code: str,
+        control_state: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if control_state not in CHALLENGE_CONTROL_STATE_VALUES:
+            raise StateError(
+                "invalid_control_state",
+                "unknown challenge control state",
+                status_code=422,
+            )
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                if (
+                    challenge.is_completed
+                    or challenge.work_status in {"paused", "closed", "completed"}
+                ):
+                    raise StateConflict(
+                        "challenge_not_active",
+                        "The challenge no longer accepts control state changes",
+                    )
+                now = self.clock()
+                changed = challenge.control_state != control_state
+                if changed:
+                    challenge.control_state = control_state
+                    if control_state == "ok":
+                        challenge.control_since = None
+                        challenge.active_since = now
+                    else:
+                        challenge.control_since = now
+                        if control_state == "waiting_external_change":
+                            self._freeze_exploration(challenge)
+                    challenge.version += 1
+                event_sequence = await self._event(
+                    session,
+                    run_id,
+                    "challenge_control_state_changed",
+                    {
+                        "unique_code": unique_code,
+                        "control_state": control_state,
+                        "reason": reason,
+                    },
+                )
+        await self.signal_challenge_changes(run_id, [unique_code], event_sequence)
+        return self._challenge_dict(challenge)
+
+    async def second_pass_ready(
+        self,
+        run_id: str,
+        *,
+        min_remaining_seconds: int = 30 * 60,
+    ) -> dict[str, Any]:
+        async with self.db.sessions() as session:
+            run = await self._require_run(session, run_id)
+            if run.status != "active" or run.pass_number >= 2:
+                return {"ready": False, "reason": "pass_limit"}
+            remaining = int(
+                (
+                    aware(run.deadline_at) - aware(self.clock())
+                ).total_seconds()
+            )
+            challenges = list(
+                (
+                    await session.scalars(
+                        select(ChallengeRecord).where(
+                            ChallengeRecord.run_id == run_id
+                        )
+                    )
+                ).all()
+            )
+            paused = [
+                item.unique_code
+                for item in challenges
+                if item.work_status == "paused" and not item.is_completed
+            ]
+            if not paused:
+                return {"ready": False, "reason": "no_paused_challenges"}
+            if remaining < min_remaining_seconds:
+                return {
+                    "ready": False,
+                    "reason": "insufficient_remaining_time",
+                    "remaining_seconds": remaining,
+                }
+            return {
+                "ready": True,
+                "reason": "first_pass_complete",
+                "unique_codes": sorted(paused),
+                "remaining_seconds": remaining,
+            }
+
+    async def begin_second_pass(self, run_id: str) -> dict[str, Any]:
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                run = await self._require_run(session, run_id)
+                if run.status != "active":
+                    raise StateConflict(
+                        "run_not_active", "Second pass requires an active Run"
+                    )
+                if run.pass_number >= 2:
+                    return {"started": False, "unique_codes": []}
+                challenges = list(
+                    (
+                        await session.scalars(
+                            select(ChallengeRecord).where(
+                                ChallengeRecord.run_id == run_id
+                            )
+                        )
+                    ).all()
+                )
+                paused = [
+                    item
+                    for item in challenges
+                    if item.work_status == "paused" and not item.is_completed
+                ]
+                codes = sorted(item.unique_code for item in paused)
+                now = self.clock()
+                for challenge in paused:
+                    challenge.pass_number = 2
+                    challenge.resume_count += 1
+                    challenge.stagnation_level = 0
+                    challenge.extension_cycle_pending = False
+                    challenge.warning_pivot_used = False
+                    challenge.control_state = "ok"
+                    challenge.control_since = None
+                    challenge.pause_reason = None
+                    challenge.work_status = "unassigned"
+                    challenge.platform_status = "pending"
+                    challenge.updated_at = now
+                    challenge.version += 1
+                run.pass_number = 2
+                event_sequence = await self._event(
+                    session,
+                    run_id,
+                    "second_pass_began",
+                    {
+                        "unique_codes": codes,
+                        "resume_count": sum(item.resume_count for item in paused),
+                    },
+                )
+        if event_sequence is not None:
+            await self.signal_challenge_changes(run_id, codes, event_sequence)
+        return {
+            "started": bool(codes),
+            "unique_codes": codes,
+            "run": self._run_dict(run),
+        }
 
     @staticmethod
     def _challenge_from_import(run_id: str, value: ChallengeImport, *, now: datetime | None = None) -> ChallengeRecord:
@@ -3002,6 +5429,9 @@ class StateService:
             record.container_status = value.container_status
             record.platform_status = "completed"
             record.work_status = "completed"
+            record.control_state = "ok"
+            record.control_since = None
+            record.pause_reason = None
         elif value.container_status in {"starting", "running", "active"}:
             record.container_status = "running" if value.container_status == "active" else value.container_status
             record.platform_status = "started"
@@ -3038,15 +5468,15 @@ class StateService:
 
     @staticmethod
     def _run_dict(item: RunRecord) -> dict[str, Any]:
-        return {"run_id": item.run_id, "status": item.status, "phase": item.phase, "model": item.model, "prompt": item.prompt, "context_window_tokens": item.context_window_tokens, "duration_minutes": item.duration_minutes, "started_at": _json_value(item.started_at), "deadline_at": _json_value(item.deadline_at), "current_challenge_code": item.current_challenge_code, "score_snapshot": item.score_snapshot, "last_sequence": item.last_sequence, "last_projected_sequence": item.last_projected_sequence, "stagnation_epoch": item.stagnation_epoch}
+        return {"run_id": item.run_id, "status": item.status, "phase": item.phase, "pass_number": item.pass_number, "model": item.model, "prompt": item.prompt, "context_window_tokens": item.context_window_tokens, "duration_minutes": item.duration_minutes, "started_at": _json_value(item.started_at), "deadline_at": _json_value(item.deadline_at), "current_challenge_code": item.current_challenge_code, "score_snapshot": item.score_snapshot, "last_sequence": item.last_sequence, "last_projected_sequence": item.last_projected_sequence, "stagnation_epoch": item.stagnation_epoch, "paused_at": _json_value(item.paused_at), "pause_reason": item.pause_reason}
 
     @staticmethod
     def _challenge_dict(item: ChallengeRecord) -> dict[str, Any]:
-        return {"run_id": item.run_id, "unique_code": item.unique_code, "description": item.description, "difficulty": item.difficulty, "level": item.level, "total_score": item.total_score, "flag_count": item.flag_count, "correct_flag_count": item.correct_flag_count, "is_completed": item.is_completed, "platform_status": item.platform_status, "container_status": item.container_status, "slot_occupied": container_slot_occupied(item.container_status), "container_addr": item.container_addr, "work_status": item.work_status, "stagnation_level": item.stagnation_level, "hint_eligible": item.hint_eligible, "hint_requested": item.hint_requested, "l2_explorer_created": item.l2_explorer_created, "extension_active": item.extension_cycle_pending, "exploration_seconds": item.exploration_seconds, "last_progress_at": _json_value(item.last_progress_at), "version": item.version}
+        return {"run_id": item.run_id, "unique_code": item.unique_code, "description": item.description, "difficulty": item.difficulty, "level": item.level, "total_score": item.total_score, "flag_count": item.flag_count, "correct_flag_count": item.correct_flag_count, "is_completed": item.is_completed, "platform_status": item.platform_status, "container_status": item.container_status, "slot_occupied": container_slot_occupied(item.container_status), "container_addr": item.container_addr, "direction": item.direction, "work_status": item.work_status, "control_state": item.control_state, "control_since": _json_value(item.control_since), "pause_reason": item.pause_reason, "pass_number": item.pass_number, "resume_count": item.resume_count, "evidence_root": item.evidence_root, "stagnation_level": item.stagnation_level, "hint_eligible": item.hint_eligible, "hint_requested": item.hint_requested, "warning_pivot_used": item.warning_pivot_used, "extension_active": item.extension_cycle_pending, "exploration_seconds": item.exploration_seconds, "active_since": _json_value(item.active_since), "last_progress_at": _json_value(item.last_progress_at), "version": item.version}
 
     @staticmethod
     def _agent_dict(item: AgentRecord, *, include_runtime: bool = False) -> dict[str, Any]:
-        data = {"agent_id": item.agent_id, "run_id": item.run_id, "parent_id": item.parent_id, "unique_code": item.unique_code, "cycle_id": item.cycle_id, "role": item.role, "kind": item.kind, "priority": item.priority, "mission": item.mission, "success_criteria": item.success_criteria, "context_refs": item.context_refs, "status": item.status, "timeout_seconds": item.timeout_seconds, "last_heartbeat_at": _json_value(item.last_heartbeat_at), "last_report_sequence": item.last_report_sequence, "report_cursor": item.report_cursor, "report_cursors": item.report_cursors, "controller_cursor": item.controller_cursor, "last_summarized_sequence": item.last_summarized_sequence, "started_at": _json_value(item.started_at), "ended_at": _json_value(item.ended_at), "stop_requested_at": _json_value(item.stop_requested_at), "updated_at": _json_value(item.updated_at), "version": item.version}
+        data = {"agent_id": item.agent_id, "run_id": item.run_id, "parent_id": item.parent_id, "unique_code": item.unique_code, "cycle_id": item.cycle_id, "role": item.role, "kind": item.kind, "task_stage": item.task_stage, "priority": item.priority, "mission": item.mission, "success_criteria": item.success_criteria, "context_refs": item.context_refs, "hypothesis_key": item.hypothesis_key, "task_key": item.task_key, "branch_key": item.branch_key, "terminal_report_id": item.terminal_report_id, "status": item.status, "timeout_seconds": item.timeout_seconds, "last_heartbeat_at": _json_value(item.last_heartbeat_at), "last_report_sequence": item.last_report_sequence, "report_cursor": item.report_cursor, "report_cursors": item.report_cursors, "controller_cursor": item.controller_cursor, "last_summarized_sequence": item.last_summarized_sequence, "started_at": _json_value(item.started_at), "ended_at": _json_value(item.ended_at), "stop_requested_at": _json_value(item.stop_requested_at), "updated_at": _json_value(item.updated_at), "version": item.version}
         if include_runtime:
             data.update({"initial_prompt": item.initial_prompt, "session_memory": item.session_memory, "final_report": item.final_report})
         return data
@@ -3247,8 +5677,8 @@ class StateService:
             challenge.active_since = None
             challenge.paused_at = self.clock()
         elif (
-            challenge.container_status in {"starting", "running"}
-            and previous_container_status not in {"starting", "running"}
+            container_slot_occupied(challenge.container_status)
+            and not container_slot_occupied(previous_container_status)
         ):
             now = self.clock()
             challenge.started_at = challenge.started_at or now

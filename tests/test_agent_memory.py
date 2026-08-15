@@ -23,7 +23,7 @@ from agent.memory.context import (
 from agent.memory.models import Checkpoint, OperationState, TargetState
 from agent.memory.redaction import redact_tool_payload, redact_value
 from agent.memory.summarizer import SessionMemorySummarizer
-from agent.runner import AgentRunner, ToolRegistry
+from agent.runner import AgentRunner, ToolDispatchOutcome, ToolRegistry
 from agent.state import AgentStateStore, StateService
 from agent.state.models import DEFAULT_SESSION_MEMORY
 
@@ -54,23 +54,23 @@ def test_context_window_override_is_optional_and_validated(monkeypatch: pytest.M
         _settings()
 
 
-def test_sensitive_payloads_are_redacted_without_losing_safe_metadata() -> None:
+def test_payloads_remain_plaintext_for_local_analysis() -> None:
     payload = {
         "flag": "flag{secret-value}",
         "BENCHMARK_TOKEN": "benchmark-secret",
         "nested": {"authorization": "Bearer api-secret"},
     }
-    redacted = redact_tool_payload(
+    plaintext = redact_tool_payload(
         "benchmark_submit_flag",
         payload,
         secrets=("api-secret",),
     )
-    encoded = json.dumps(redacted)
-    assert "flag{secret-value}" not in encoded
-    assert "benchmark-secret" not in encoded
-    assert "api-secret" not in encoded
-    assert redacted["flag"]["redacted"] is True
-    assert redact_value("api-secret", secrets=("api-secret",)) == "[REDACTED]"
+    encoded = json.dumps(plaintext)
+    assert "flag{secret-value}" in encoded
+    assert "benchmark-secret" in encoded
+    assert "api-secret" in encoded
+    assert plaintext["flag"] == "flag{secret-value}"
+    assert redact_value("api-secret", secrets=("api-secret",)) == "api-secret"
 
 
 def test_context_estimation_and_tool_result_limits() -> None:
@@ -248,6 +248,41 @@ class _FakeTools:
         return None
 
 
+class _ControllerWaitTools:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @classmethod
+    def tool_definitions(cls) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "test",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            for name in ("challenge_wait_for_state", "challenge_get_state")
+        ]
+
+    async def dispatch(
+        self, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | ToolDispatchOutcome:
+        self.calls.append(name)
+        result = {"ok": True, "data": {"name": name}}
+        if name == "challenge_wait_for_state":
+            return ToolDispatchOutcome(result=result, yield_session=True)
+        return result
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Path) -> None:
     fake_tools = _FakeTools({"system_read_file": {"ok": True, "data": {"content": "ok"}}})
@@ -328,3 +363,85 @@ async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Pa
     await runner.close()
     await service.close()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Path) -> None:
+    tools = _ControllerWaitTools()
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "wait-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "challenge_wait_for_state",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "controller-wait" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("controller-wait", model="test-model", prompt="wait")
+    agent = await service.register_agent(
+        "controller-wait", role="chief", initial_prompt="wait"
+    )
+    store = await AgentStateStore.open(
+        service,
+        run_id="controller-wait",
+        agent_id=agent["agent_id"],
+        run_dir=run_root / "controller-wait",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    runner = AgentRunner(
+        _settings(),
+        ToolRegistry([tools]),
+        http_client=client,
+        run_root=run_root,
+        state_service=service,
+        agent_id=agent["agent_id"],
+        role="chief",
+    )
+
+    result = await runner.run_session("wait", store=store)
+    assert result.yield_reason == "controller_wait"
+    assert requests == 1
+    assert tools.calls == ["challenge_wait_for_state"]
+
+    rejected, _, requested_yield = await runner._execute_tool_call(
+        store,
+        {
+            "id": "wait-parallel",
+            "type": "function",
+            "function": {
+                "name": "challenge_wait_for_state",
+                "arguments": "{}",
+            },
+        },
+        allow_yield=False,
+    )
+    assert requested_yield is False
+    assert rejected["error"]["code"] == "controller_wait_must_be_solo"
+
+    await runner.close()
+    await client.aclose()
+    await service.close()

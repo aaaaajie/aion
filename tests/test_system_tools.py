@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -39,11 +40,15 @@ class _ToolHarness:
         sandbox_executable: str | None = None,
         clock: Callable[[], datetime] = utc_now,
         reap_interval_seconds: float = 60.0,
+        read_only_paths: Sequence[Path] = (),
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.root = root
         self.sandbox_executable = sandbox_executable
         self.clock = clock
         self.reap_interval_seconds = reap_interval_seconds
+        self.read_only_paths = tuple(read_only_paths)
+        self.environment = dict(environment or {})
         self.run_id = f"tools-{uuid4().hex}"
         self.agent_id: str | None = None
         self.service: StateService | None = None
@@ -68,9 +73,14 @@ class _ToolHarness:
             policy,
             self.service,
             self.run_id,
-            sandbox=SandboxBackend(policy.root, self.sandbox_executable),
+            sandbox=SandboxBackend(
+                policy.root,
+                self.sandbox_executable,
+                read_only_paths=self.read_only_paths,
+            ),
             clock=self.clock,
             reap_interval_seconds=self.reap_interval_seconds,
+            environment=self.environment,
         )
         await self.manager.initialize()
         return SystemTools(
@@ -208,6 +218,55 @@ async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools)
         assert failed["data"]["status"] == "failed"
         assert failed["data"]["exit_code"] == 7
         assert failed["data"]["output"] == "command-failed"
+
+
+@pytest.mark.asyncio
+async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, tmp_path: Path) -> None:
+    skill_root = tmp_path / "skills"
+    scripts = skill_root / "execution" / "fixture" / "scripts"
+    scripts.mkdir(parents=True)
+    python_script = scripts / "check.py"
+    shell_script = scripts / "check.sh"
+    background_script = scripts / "background.sh"
+    python_script.write_text("print('python-skill')\n", encoding="utf-8")
+    shell_script.write_text("printf shell-skill\n", encoding="utf-8")
+    background_script.write_text(
+        "printf start; sleep 0.05; printf end\n", encoding="utf-8"
+    )
+    runtime_prefix = Path(sys.prefix).resolve()
+    runtime_python = runtime_prefix / "bin" / Path(sys.executable).name
+    if not runtime_python.is_file():
+        runtime_python = Path(sys.executable).resolve()
+
+    async with make_tools(
+        read_only_paths=(skill_root, runtime_prefix),
+        environment={
+            "AION_SKILLS_ROOT": str(skill_root),
+            "AION_PYTHON": str(runtime_python),
+        },
+    ) as tools:
+        executed = await tools.shell(
+            '"$AION_PYTHON" "$AION_SKILLS_ROOT/execution/fixture/scripts/check.py"; '
+            'bash "$AION_SKILLS_ROOT/execution/fixture/scripts/check.sh"'
+        )
+        assert executed["data"]["status"] == "completed"
+        assert executed["data"]["output"] == "python-skill\nshell-skill"
+
+        write = await tools.shell(
+            'printf changed > "$AION_SKILLS_ROOT/execution/fixture/scripts/check.py"'
+        )
+        assert write["data"]["status"] == "failed"
+        assert python_script.read_text(encoding="utf-8") == "print('python-skill')\n"
+
+        background = await tools.shell(
+            'bash "$AION_SKILLS_ROOT/execution/fixture/scripts/background.sh"',
+            run_in_background=True,
+        )
+        output = await tools.task_output(
+            background["data"]["task_id"], wait_seconds=1.0
+        )
+        assert output["data"]["status"] == "completed"
+        assert output["data"]["output"] == "startend"
 
 
 @pytest.mark.asyncio
@@ -441,20 +500,39 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | 0o111)
 
+    read_only = tmp_path / "skills"
+    read_only.mkdir()
     backend = SandboxBackend(
         tmp_path,
         executable=str(executable),
         platform_name="Linux",
+        read_only_paths=(read_only,),
     )
 
     assert backend.available is True
-    command = backend.command("printf linux-ok", tmp_path)
+    persistent_tmp = tmp_path / "agent-private-tmp"
+    persistent_tmp.mkdir()
+    command = backend.command("printf linux-ok", tmp_path, persistent_tmp)
     assert command[:2] == [str(executable), "--die-with-parent"]
     assert "--ro-bind" in command
     assert "--bind" in command
+    assert ["--tmpfs", "/tmp"] not in [command[index : index + 2] for index in range(len(command) - 1)]
+    tmp_bind = command.index(str(persistent_tmp))
+    assert command[tmp_bind - 1 : tmp_bind + 2] == [
+        "--bind",
+        str(persistent_tmp),
+        "/tmp",
+    ]
     chdir_index = command.index("--chdir")
     assert command[chdir_index : chdir_index + 2] == ["--chdir", str(tmp_path)]
     assert command[-4:] == ["--noprofile", "--norc", "-lc", "printf linux-ok"]
+    root_bind = command.index(str(tmp_path), command.index("--bind"))
+    skill_bind = command.index(str(read_only), root_bind + 1)
+    assert command[skill_bind - 1 : skill_bind + 2] == [
+        "--ro-bind",
+        str(read_only),
+        str(read_only),
+    ]
 
 
 def test_windows_backend_is_reserved_without_an_unsafe_fallback(tmp_path: Path) -> None:

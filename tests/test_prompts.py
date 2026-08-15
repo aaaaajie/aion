@@ -33,14 +33,42 @@ def test_default_chief_prompt_is_centrally_managed() -> None:
     assert "multiple Flags" in prompt
 
 
+@pytest.mark.parametrize("role", ["chief", "challenge", "execution"])
+def test_role_system_prompts_include_shared_base_prompt(role: str) -> None:
+    base = load_prompt("base_system.txt")
+    role_prompt = system_prompt(role)
+
+    assert role_prompt.endswith("\n\n" + base)
+    assert role_prompt.startswith(load_prompt(f"{role}_system.txt"))
+
+
 def test_challenge_prompt_requires_a_persistent_report_loop() -> None:
     prompt = render_prompt(
         "challenge_agent.txt",
         challenge_data=json.dumps({"unique_code": "web-1"}),
     )
     assert "one-shot task" in prompt
-    assert "A consumed report" in prompt
+    assert "consume every" in prompt.lower()
+    assert "challenge_wait_for_state" in prompt
     assert "challenge_data" in prompt
+    system = system_prompt("challenge")
+    assert "recognize-challenge-direction" in system
+    assert "skill_list" in system
+    assert "common/" in system
+    assert "Never preload" in system
+
+
+def test_challenge_prompt_prefers_breadth_first_parallel_decomposition() -> None:
+    prompt = load_prompt("challenge_agent.txt")
+    system = system_prompt("challenge")
+
+    assert "breadth-first" in prompt
+    assert "In every planning cycle" in prompt
+    assert "Do not impose an arbitrary minimum or" in prompt
+    assert "resulting task set" in prompt
+    assert "Resources are intentionally abundant" in system
+    assert "limits only one discovery pivot" in system
+    assert "validation/exploitation concurrency" in system
 
 
 def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
@@ -51,6 +79,14 @@ def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
     assert "Never call" in prompt
     assert "Session" in prompt
     assert "system_http_cleanup" in prompt
+    assert "run_in_background=true" in prompt
+    assert "system_task_output(wait_seconds=...)" in prompt
+    assert "nohup" in prompt
+    assert "for + curl" in prompt
+    assert "skill_list" in prompt
+    assert "skill_read" in prompt
+    assert "$AION_SKILLS_ROOT" in prompt
+    assert "$AION_PYTHON" in prompt
 
 
 def test_prompt_loader_rejects_missing_templates() -> None:

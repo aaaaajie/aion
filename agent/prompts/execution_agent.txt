@@ -5,6 +5,10 @@ do not invent additional targets.
 <mission>
 $mission
 </mission>
+
+<task_stage>
+$task_stage
+</task_stage>
 <target_addresses>
 $target_addresses
 </target_addresses>

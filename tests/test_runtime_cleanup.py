@@ -78,11 +78,11 @@ async def test_cleanup_failure_blocks_runtime_start(
             llm_api_key="test-key",
         ),
         project_root=tmp_path / "workspace",
-        run_root=tmp_path / "runs",
+        run_root=tmp_path / "workspace" / "runs",
     )
 
     with pytest.raises(FreshRunCleanupError, match="cleanup failed"):
         await runtime.start("fresh", run_id="blocked")
 
     assert runtime.state_service is None
-    assert not (tmp_path / "runs" / "blocked").exists()
+    assert not (tmp_path / "workspace" / "runs" / "blocked").exists()

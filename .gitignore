@@ -3,6 +3,11 @@
 config/vpn/*.ovpn
 __pycache__/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+.coverage
 *.egg-info/
 .system-tools/
 .aion/

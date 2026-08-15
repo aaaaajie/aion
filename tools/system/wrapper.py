@@ -154,7 +154,7 @@ class SystemTools:
         ),
         _definition(
             "system_shell",
-            "Run a bash command in the shared workspace sandbox with an Agent-persistent HOME and temp directory. Supports bounded foreground or background execution.",
+            "Run bash in the shared workspace with Agent-persistent HOME and temp storage. On Linux both /tmp and $TMPDIR persist for this Agent; on macOS use $TMPDIR. For work longer than the foreground wait, set run_in_background=true and follow the returned task_id with system_task_output. Do not use nohup, '&', or sleep polling to emulate task management. Prefer HTTP tools over representable curl loops.",
             {
                 "command": {"type": "string"},
                 "cwd": {"type": "string", "default": "."},
@@ -166,7 +166,7 @@ class SystemTools:
         ),
         _definition(
             "system_task_output",
-            "Read retained output and status for an owned Shell task without consuming it.",
+            "Read retained output and status for an owned Shell task without consuming it. Use wait_seconds instead of shell sleep loops; repeated reads are idempotent.",
             {
                 "task_id": {"type": "string"},
                 "wait_seconds": {"type": "number", "minimum": 0, "maximum": 30, "default": 0},

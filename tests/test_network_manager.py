@@ -41,6 +41,10 @@ if mode == "exit-after-ready":
     time.sleep(0.2)
     print("OpenVPN fixture disconnected", flush=True)
     raise SystemExit(7)
+if mode == "remote-halt":
+    time.sleep(0.2)
+    print("Halt command was pushed by server ('')", flush=True)
+    raise SystemExit(0)
 while True:
     time.sleep(1)
 """,
@@ -282,6 +286,24 @@ async def test_vpn_wait_failure_detects_disconnect(
     await manager.start()
     with pytest.raises(VPNManagerError, match="status 7"):
         await asyncio.wait_for(manager.wait_failure(), timeout=2)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_vpn_remote_halt_is_typed_and_not_a_process_failure(
+    tmp_path: Path,
+    fake_openvpn: Path,
+) -> None:
+    manager = VPNManager(
+        _config(tmp_path, "remote-halt"),
+        openvpn_binary=fake_openvpn,
+        use_sudo=False,
+    )
+    await manager.start()
+    with pytest.raises(VPNManagerError) as caught:
+        await asyncio.wait_for(manager.wait_failure(), timeout=2)
+    assert caught.value.code == "vpn_remote_halt"
+    assert manager.status.returncode == 0
     await manager.close()
 
 

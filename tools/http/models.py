@@ -60,6 +60,17 @@ class HttpRequestSpec(HttpModel):
         default=None,
         description="Agent-private Cookie Jar identifier. Reuse it across separate tool calls when a protocol session must continue.",
     )
+    connection_context_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Optional stable identifier for one ordered interaction chain. Requests in the same context execute serially by sequence_id and survive waiting/resume.",
+    )
+    sequence_id: int | None = Field(
+        default=None,
+        ge=0,
+        description="Optional per-Agent monotonic position inside connection_context_id. Omitted values are assigned from the context history.",
+    )
     update_session: bool = Field(
         default=False,
         description="Persist response cookies into session_id after this request. Set true for login or other session-establishing requests.",
@@ -155,7 +166,7 @@ class HttpRequestArguments(HttpModel):
 class HttpProbeArguments(HttpModel):
     cases: list[HttpProbeCase] = Field(
         min_length=1,
-        description="Use one case for a variable matrix. Do not put response-dependent chained steps in one batch; make separate calls with a Session.",
+        description="Use one case for a finite variable matrix. Place variables with exactly {{name}} in method, URL, query, headers, cookies, or body; single-brace {name} is invalid. Do not put response-dependent chained steps in one batch; make separate calls with a Session.",
     )
     concurrency: int = Field(default=8, gt=0)
     rate_limit_per_second: float | None = Field(default=None, gt=0)
@@ -170,7 +181,7 @@ class HttpProbeArguments(HttpModel):
         ge=0,
         description="20 seconds by default; 0 returns immediately; null waits for request execution to finish.",
     )
-    result_limit: int = Field(default=100, gt=0)
+    result_limit: int = Field(default=10, gt=0)
 
 
 class HttpOutputFilters(HttpModel):
@@ -178,6 +189,9 @@ class HttpOutputFilters(HttpModel):
     status_codes: list[int] = Field(default_factory=list)
     outcomes: list[str] = Field(default_factory=list)
     request_group_id: str | None = None
+    connection_context_id: str | None = None
+    sequence_id_min: int | None = Field(default=None, ge=0)
+    sequence_id_max: int | None = Field(default=None, ge=0)
     min_body_bytes: int | None = Field(default=None, ge=0)
     max_body_bytes: int | None = Field(default=None, ge=0)
     header_contains: dict[str, str] = Field(default_factory=dict)
@@ -358,6 +372,10 @@ class FingerprintArguments(HttpModel):
     active: bool = Field(
         default=True,
         description="Probe TscanPlus FingerDir paths and match their rules.",
+    )
+    minimum_confidence: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Minimum deterministic fingerprint confidence returned. Low-confidence generic keyword matches are hidden by default.",
     )
     include_favicon: bool = Field(
         default=True,

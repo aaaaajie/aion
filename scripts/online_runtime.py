@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent.config import AgentSettings
 from agent.prompts import load_prompt
-from agent.runtime import AgentRuntime
+from agent.runtime import AgentRuntime, RuntimePausedError
 from challenges_sdk import ChallengesClient, ChallengesSettings
 from scripts.network_manager import VPNManager, discover_vpn_config
 from scripts.runtime_web import RuntimeMonitor
@@ -236,6 +236,10 @@ async def run_online(
             interrupted = True
             result_code, result_message = _signal_result(signal_state["signal"])
         print(f"[online] result: {result_message}", flush=True)
+    except RuntimePausedError as exc:
+        result_code = 0
+        result_message = f"online Runtime paused: {exc.reason}"
+        print(f"[online] paused: {exc.reason}", flush=True)
     except Exception as exc:
         result_message = f"online Runtime failed: {type(exc).__name__}: {exc}"
         print(f"[online] failed: {type(exc).__name__}: {exc}", flush=True)

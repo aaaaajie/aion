@@ -353,6 +353,7 @@ class NetworkDiscoveryManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "recommended_wait_seconds": 20 if row["status"] not in TERMINAL else 0,
         }
 
     async def stop(self, agent_id: str, task_id: str) -> dict[str, Any]:
@@ -730,7 +731,37 @@ class NetworkDiscoveryManager:
             counters["by_service"][service] = counters["by_service"].get(service, 0) + 1
             if details.get("is_web") or service.lower() in {"http", "https"}:
                 counters["web_ports"] += 1
+            await self._record_service_observation(live, record)
         await self._persist_progress(live)
+
+    async def _record_service_observation(
+        self, live: LiveNetworkTask, record: dict[str, Any]
+    ) -> None:
+        try:
+            runtime = await self.service.get_agent_runtime(
+                self.run_id, live.agent_id
+            )
+        except Exception:
+            return
+        unique_code = runtime["agent"].get("unique_code")
+        if not unique_code:
+            return
+        try:
+            await self.service.record_observation(
+                self.run_id,
+                unique_code,
+                category="service",
+                summary=(
+                    f"{record.get('host')}:{record.get('port')} "
+                    f"{record.get('service') or 'unknown'}"
+                ),
+                detail=dict(record),
+                source="network_discovery",
+                source_ref=live.task_id,
+                confidence=0.7,
+            )
+        except Exception:
+            pass
 
     async def _consume_stderr(self, live: LiveNetworkTask) -> None:
         assert live.process.stderr is not None

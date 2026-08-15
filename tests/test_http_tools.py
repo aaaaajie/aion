@@ -39,6 +39,61 @@ async def _manager(
 
 
 @pytest.mark.asyncio
+async def test_real_http_loopback_smoke(
+    tmp_path: Path, unused_tcp_port: int
+) -> None:
+    body = b"loopback-http-ok"
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", unused_tcp_port)
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "loopback" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("loopback")
+    agent = await service.register_agent(
+        "loopback", role="chief", initial_prompt="http loopback"
+    )
+    policy = WorkspacePolicy(tmp_path)
+    manager = HttpProbeManager(policy, service, "loopback")
+    await manager.initialize()
+    try:
+        result = await manager.start_request(
+            agent["agent_id"],
+            request=HttpRequestSpec(
+                request_intent="loopback_smoke",
+                url=f"http://127.0.0.1:{unused_tcp_port}/health",
+            ),
+            wait_seconds=None,
+        )
+        response = next(
+            item for item in result["results"] if item["type"] == "response"
+        )
+        assert response["status_code"] == 200
+        assert response["body_bytes"] == len(body)
+        assert response["outcome"] == "response"
+    finally:
+        await manager.finish_run()
+        await service.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_request_persists_full_body_and_runs_async_analysis(tmp_path: Path) -> None:
     payload = b"<html><title>Probe</title><form action='/x'><input name='id'></form></html>"
 
@@ -179,6 +234,7 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
         wait_seconds=0,
     )
     assert result["status"] == "running"
+    assert result["recommended_wait_seconds"] == 20
     assert result["request_id"].startswith("request-")
     release.set()
     live = manager._live[result["interaction_id"]]
@@ -186,6 +242,10 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
     first = await manager.output(agent_id, interaction_id=result["interaction_id"])
     second = await manager.output(agent_id, interaction_id=result["interaction_id"])
     assert first["results"] == second["results"]
+    assert first["recommended_wait_seconds"] == 20
+    await live.analysis_done.wait()
+    finished = await manager.output(agent_id, interaction_id=result["interaction_id"])
+    assert finished["recommended_wait_seconds"] == 0
     assert calls == 1
     await manager.finish_run()
     await service.close()
@@ -260,7 +320,7 @@ async def test_ownership_and_resource_disk_admission(tmp_path: Path) -> None:
     await service.close()
 
 
-def test_http_tool_contract_and_audit_redaction() -> None:
+def test_http_tool_contract_and_plaintext_audit() -> None:
     definitions = HttpTools.tool_definitions()
     names = [item["function"]["name"] for item in definitions]
     assert names == [
@@ -291,7 +351,7 @@ def test_http_tool_contract_and_audit_redaction() -> None:
     request_properties = request_schema["$defs"]["HttpRequestSpec"]["properties"]
     assert "http://" in request_properties["url"]["description"]
     assert "request_intent" in request_properties
-    redacted = redact_tool_payload(
+    plaintext = redact_tool_payload(
         "system_http_request",
         {
             "request": {
@@ -301,12 +361,12 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             }
         },
     )
-    encoded = json.dumps(redacted)
-    assert "Bearer secret" not in encoded
-    assert "sid=secret" not in encoded
-    assert '"value": "secret"' not in encoded
+    encoded = json.dumps(plaintext)
+    assert "Bearer secret" in encoded
+    assert "sid=secret" in encoded
+    assert '"value": "secret"' in encoded
 
-    path_redacted = redact_tool_payload(
+    path_plaintext = redact_tool_payload(
         "system_web_path_probe",
         {
             "url": "https://x.test/",
@@ -316,9 +376,9 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(path_redacted)
+    assert "secret" in json.dumps(path_plaintext)
 
-    fingerprint_redacted = redact_tool_payload(
+    fingerprint_plaintext = redact_tool_payload(
         "system_web_fingerprint",
         {
             "url": "https://x.test/",
@@ -326,7 +386,7 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(fingerprint_redacted)
+    assert "secret" in json.dumps(fingerprint_plaintext)
 
 
 def test_zip_expansion_and_unresolved_variables_are_validated(tmp_path: Path) -> None:

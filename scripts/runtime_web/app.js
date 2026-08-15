@@ -3,6 +3,7 @@
 
   const TERMINAL = new Set(["completed", "failed", "stopped", "cancelled", "interrupted"]);
   const ACTIVE = new Set(["pending", "queued", "starting", "running", "waiting", "working", "blocked", "stopping"]);
+  const ACTIVE_CHALLENGE_WORK = new Set(["active", "warning", "extended"]);
   const CONVERSATION_EVENTS = new Set(["assistant_response", "tool_call", "tool_result", "agent_report"]);
   const ROLE_NAMES = { chief: "首席 Agent", challenge: "挑战 Agent", execution: "执行 Agent" };
   const STATUS_NAMES = {
@@ -303,8 +304,33 @@
     return (state.snapshot?.challenges || []).find((challenge) => challenge.unique_code === agent.unique_code) || null;
   }
 
+  function challengeMachineActive(agent) {
+    const challenge = challengeForAgent(agent);
+    return Boolean(
+      agent?.role === "challenge"
+      && challenge?.slot_occupied === true
+      && !challenge.is_completed
+      && ACTIVE_CHALLENGE_WORK.has(String(challenge.work_status || "").toLowerCase()),
+    );
+  }
+
+  function challengeMachineLabel(challenge) {
+    if (!challenge) return "机器状态未知";
+    const workStatus = String(challenge.work_status || "").toLowerCase();
+    if (challenge.slot_occupied === true && ACTIVE_CHALLENGE_WORK.has(workStatus)) return "机器执行中";
+    if (challenge.slot_occupied === true && workStatus === "paused") return "机器已占用 · 已暂停";
+    if (challenge.slot_occupied === true) return "机器已占用";
+    return "机器已释放";
+  }
+
   function agentIconStatus(agent) {
     const status = iconStatus(agent?.status);
+    if (challengeMachineActive(agent) && !TERMINAL.has(String(agent?.status || "").toLowerCase())) {
+      // A Challenge Agent can be waiting while its child Execution Agents work.
+      // The icon represents the challenge machine, so use the persisted machine
+      // state instead of turning the occupied machine gray.
+      return "active";
+    }
     if (agent?.role !== "execution" || status !== "error") return status;
     const containerStatus = String(challengeForAgent(agent)?.container_status || "").toLowerCase();
     return ["stopped", "closed", "terminated", "exited"].includes(containerStatus) ? "muted" : status;
@@ -391,6 +417,19 @@
     return compareAgentStart(left, right);
   }
 
+  function challengeStatusRank(agent) {
+    const status = String(agent?.status || "").toLowerCase();
+    if (["running", "working", "active", "waiting"].includes(status)) return 0;
+    if (["queued", "pending", "starting"].includes(status)) return 1;
+    return 2;
+  }
+
+  function compareChallengeAgents(left, right) {
+    const statusDiff = challengeStatusRank(left) - challengeStatusRank(right);
+    if (statusDiff) return statusDiff;
+    return compareAgentStart(left, right);
+  }
+
   function agentStartLabel(agent) {
     return agent?.started_at ? `启用 ${clock(agent.started_at)}` : "待启用";
   }
@@ -419,13 +458,7 @@
   function challengeAgents() {
     return allAgents()
       .filter((agent) => agent.role === "challenge")
-      .sort((left, right) => {
-        const activeDiff = Number(isActive(right)) - Number(isActive(left));
-        if (activeDiff) return activeDiff;
-        const activityDiff = latestAgentActivity(right) - latestAgentActivity(left);
-        if (activityDiff) return activityDiff;
-        return String(left.unique_code || left.agent_id).localeCompare(String(right.unique_code || right.agent_id), "zh-CN");
-      });
+      .sort(compareChallengeAgents);
   }
 
   function chiefAgent() {
@@ -714,14 +747,21 @@
     const row = make("button", `challenge-agent-row ${selected ? "selected" : ""} ${agent.status === "completed" ? "completed" : ""}`);
     row.type = "button";
     row.setAttribute("aria-expanded", String(searching || expanded));
-    row.setAttribute("aria-label", `${agent.unique_code || "挑战 Agent"}，${statusLabel(agent.status)}，${children.length} 个执行 Agent`);
+    const challenge = challengeForAgent(agent);
+    row.setAttribute(
+      "aria-label",
+      `${agent.unique_code || "挑战 Agent"}，${challengeMachineLabel(challenge)}，Agent ${statusLabel(agent.status)}，${children.length} 个执行 Agent`,
+    );
     const caret = make("span", `tree-caret ${searching || expanded ? "open" : ""}`, "›");
     const robot = make("span", "robot-slot");
     robot.append(makeAgentIcon("challenge", agentIconStatus(agent)));
     const copy = make("span", "agent-row-copy");
     const name = make("strong", "", agent.unique_code || "挑战 Agent");
     name.dataset.tooltip = agent.agent_id;
-    copy.append(name, make("small", "", `创建 ${clock(agent.created_at)}`));
+    copy.append(
+      name,
+      make("small", "", `${challengeMachineLabel(challenge)} · Agent ${statusLabel(agent.status)} · 创建 ${clock(agent.created_at)}`),
+    );
     const count = make("span", "agent-child-count", children.length);
     row.append(caret, robot, copy, count);
     row.addEventListener("click", () => {
@@ -1319,6 +1359,12 @@
     ]));
     if (agent.mission) target.append(detailBlock("任务", agent.mission));
     if (challenge) {
+      target.append(detailGrid([
+        ["机器状态", challengeMachineLabel(challenge)],
+        ["远端状态", challenge.container_status || "未知"],
+        ["工作状态", statusLabel(challenge.work_status)],
+        ["槽位", challenge.slot_occupied === true ? "已占用" : "已释放"],
+      ]));
       const addressBlock = make("section", "detail-block");
       addressBlock.append(make("p", "detail-label", "目标地址"));
       const list = make("div", "address-list");
