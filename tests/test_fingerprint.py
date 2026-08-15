@@ -17,6 +17,7 @@ from tools.http.fingerprint import (
     ActiveProbe,
     EHoleRule,
     FingerprintEngine,
+    FingerprintMatch,
     FingerprintOptions,
     FingerprintScanner,
     PassiveProbe,
@@ -29,6 +30,7 @@ from tools.http.fingerprint import (
     murmur3_32,
 )
 from tools.system.policy import SystemToolError, WorkspacePolicy
+from tests.resource_runtime import install_resource_runtime
 
 
 async def _manager(
@@ -47,6 +49,7 @@ async def _manager(
         path_transport=httpx.MockTransport(handler),
     )
     await manager.initialize()
+    install_resource_runtime(manager, service, "run-1", root=root)
     return service, manager, agent["agent_id"]
 
 
@@ -57,6 +60,39 @@ def test_murmur3_vectors() -> None:
     signed = mmh3_hash(b"foo")
     assert signed == -156908512
     assert favicon_hash(b"test") == mmh3_hash(base64.b64encode(b"test"))
+
+
+def test_fingerprint_confidence_scoring_distinguishes_regex_and_generic_words() -> None:
+    regex = FingerprintMatch(
+        rule_id="regex",
+        rule_sources=["EHole"],
+        name="Structured product",
+        category=None,
+        version=None,
+        source="passive",
+        matched_path=None,
+        evidence=[
+            {
+                "field": "body",
+                "pattern": "product-[0-9]+",
+                "value": "product-42",
+                "match_type": "regex",
+            }
+        ],
+    ).score()
+    generic = FingerprintMatch(
+        rule_id="generic",
+        rule_sources=["Yakit"],
+        name="False positive",
+        category=None,
+        version=None,
+        source="passive",
+        matched_path=None,
+        evidence=[{"field": "body", "pattern": "login", "value": "login"}],
+    ).score()
+    assert (regex.confidence_score, regex.confidence_level) == (50, "medium")
+    assert (generic.confidence_score, generic.confidence_level) == (20, "low")
+    assert "generic_term_capped" in generic.confidence_reasons
 
 
 def test_rule_data_loading() -> None:
@@ -119,6 +155,57 @@ def test_passive_yakit_keyword_body_and_header() -> None:
         )
     )
     assert any(item.name == "Shiro" for item in shiro)
+
+
+@pytest.mark.asyncio
+async def test_generic_login_words_are_low_confidence_and_suppressed_by_default() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "<html><title>Login</title><form>"
+                "<input name='username'><input name='password'>"
+                "<button>submit</button></form>redirect admin logout</html>"
+            ),
+        )
+
+    default_matches: list[FingerprintMatch] = []
+    default_result = await FingerprintScanner(
+        FingerprintOptions(
+            url="https://target.test/",
+            active=False,
+            include_favicon=False,
+        ),
+        transport=httpx.MockTransport(handler),
+    ).scan(
+        session_cookies=[],
+        on_match=lambda match: _append_match(default_matches, match),
+    )
+    assert default_matches == []
+    assert default_result.suppressed_match_count > 0
+
+    diagnostic_matches: list[FingerprintMatch] = []
+    await FingerprintScanner(
+        FingerprintOptions(
+            url="https://target.test/",
+            active=False,
+            include_favicon=False,
+            minimum_confidence="low",
+        ),
+        transport=httpx.MockTransport(handler),
+    ).scan(
+        session_cookies=[],
+        on_match=lambda match: _append_match(diagnostic_matches, match),
+    )
+    names = {item.name for item in diagnostic_matches}
+    assert {"Citrix Access Gateway", "Grafana", "Hue 大数据框架", "nps"} <= names
+    assert all(item.confidence_level == "low" for item in diagnostic_matches)
+
+
+async def _append_match(
+    values: list[FingerprintMatch], match: FingerprintMatch
+) -> None:
+    values.append(match)
 
 
 def test_passive_yakit_faviconhash(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,5 @@
 """Single-run memory and durable execution state."""
 
-from .models import Checkpoint, RunEvent, TargetState
+from .models import Checkpoint, RunEvent, RunStatus, TargetState
 
-__all__ = ["Checkpoint", "RunEvent", "TargetState"]
+__all__ = ["Checkpoint", "RunEvent", "RunStatus", "TargetState"]

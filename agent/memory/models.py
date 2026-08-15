@@ -25,6 +25,7 @@ TargetStatus = Literal[
 ]
 
 AgentRole = Literal["chief", "challenge", "execution"]
+RunStatus = Literal["active", "paused", "completed", "failed", "interrupted"]
 AgentLifecycleStatus = Literal[
     "pending",
     "running",
@@ -35,6 +36,7 @@ AgentLifecycleStatus = Literal[
     "interrupted",
     "indeterminate",
 ]
+SkillActivationMode = Literal["auto", "model"]
 
 
 class _Model(BaseModel):
@@ -50,7 +52,7 @@ class RunManifest(_Model):
     role: AgentRole | None = None
     parent_id: str | None = None
     unique_code: str | None = None
-    status: Literal["active", "completed", "failed", "interrupted"] = "active"
+    status: RunStatus = "active"
     started_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -97,10 +99,17 @@ class AgentNode(_Model):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class ActiveSkillState(_Model):
+    skill_id: str = Field(min_length=1, max_length=160)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    activation_mode: SkillActivationMode
+    activated_at: datetime = Field(default_factory=utc_now)
+
+
 class Checkpoint(_Model):
-    schema_version: int = 1
+    schema_version: int = 2
     run_id: str = Field(min_length=1)
-    status: Literal["active", "completed", "failed", "interrupted"] = "active"
+    status: RunStatus = "active"
     phase: str = "initializing"
     targets: list[TargetState] = Field(default_factory=list)
     container_capacity: dict[str, Any] = Field(default_factory=dict)
@@ -112,6 +121,8 @@ class Checkpoint(_Model):
     last_completed_operation: OperationState | None = None
     indeterminate_operations: list[OperationState] = Field(default_factory=list)
     agents: list[AgentNode] = Field(default_factory=list)
+    active_skills: list[ActiveSkillState] = Field(default_factory=list)
+    authoritative_view: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=utc_now)
 
 

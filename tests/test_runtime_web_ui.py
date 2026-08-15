@@ -64,9 +64,12 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
         "agentIconStatus",
         "chiefOverviewStats",
         "operationResultData",
+        "runtimeDuration",
         "compareAgentStart",
         "executionStatusRank",
         "compareExecutionAgents",
+        "challengeStatusRank",
+        "compareChallengeAgents",
         "agentStartLabel",
         "executionAgentName",
         "started_at",
@@ -90,6 +93,10 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert '.sort(compareExecutionAgents)' in app
     assert 'if (["running", "working", "active"].includes(status)) return 0;' in app
     assert 'if (["queued", "pending", "starting"].includes(status)) return 1;' in app
+    assert '.sort(compareChallengeAgents)' in app
+    assert 'if (["running", "working", "active", "waiting"].includes(status)) return 0;' in app
+    assert 'return compareAgentStart(left, right);' in app
+    assert 'latestAgentActivity(right) - latestAgentActivity(left)' not in app
     assert "grid-template-columns: var(--left-width) minmax(var(--min-center-width), 1fr) var(--right-width)" in css
     assert "height: 100vh" in css
     assert ".conversation-stream" in css
@@ -113,15 +120,41 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert 'agent?.role !== "execution" || status !== "error"' in app
     assert '["stopped", "closed", "terminated", "exited"].includes(containerStatus)' in app
     assert 'return "muted"' in app
+    assert '["pending", "queued", "starting", "waiting", "blocked", "stopping"]' in app
+    assert 'if (agent?.role === "challenge" && status === "muted")' in app
+    assert 'controller_cursor' not in (WEB_ROOT / "server.py").read_text(encoding="utf-8")
     assert 'operation.operation_type === "benchmark_submit_flag"' in app
     assert 'cumulative_score' in app
     assert '"提交 Flag"' in app
     assert '"获得分数"' in app
+    assert '"已运行时长"' in app
+    assert 'if (agent.role === "chief" || agent.role === "challenge")' in app
+    assert 'return `${minutes} 分钟`;' in app
+    assert "function timestampDate(value)" in app
+    assert '`${text.replace(" ", "T")}Z`' in app
+    assert 'stat.dataset.runtimeDuration = "true"' in app
+    assert "refreshRuntimeDuration()" in app
+    for tool_name in (
+        "challenge_get_state",
+        "challenge_wait_for_state",
+        "chief_get_core_state",
+        "execution_get_assignment",
+        "skill_read",
+        "system_http_request",
+        "system_web_fingerprint",
+        "tool_result_read",
+    ):
+        assert f"{tool_name}:" in app
+    assert 'target ? `${toolDisplayName(name)}：${target}` : toolDisplayName(name)' in app
+    assert 'make("small", "", name)' in app
     assert "/assets/Challenge.svg" in css
     assert "/assets/Execution.svg" in css
     assert "/assets/Chief.svg" in css
     assert ".copy-button" in css
     assert "Exec Agent." in app
+    assert 'if (agent?.kind === "bootstrap") return "Bootstrap";' in app
+    assert 'if (agent?.kind === "exploration") return "探索";' in app
+    assert 'function agentRoleLabel(agent)' in app
     assert "创建 ${clock(agent.created_at)}" in app
     assert "execution-start-time" not in app
     assert "execution-start-time" not in css
@@ -179,6 +212,39 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert "follow-button" not in app
     assert "jump-button" not in app
     assert "state.paused" not in app
+    assert "toolViewModes" in app
+    assert "toolBatchSelections" in app
+    assert "renderToolViews" in app
+    assert "renderToolSummaryView" in app
+    assert "resultContentItems" in app
+    assert "renderSummaryContent" in app
+    assert "renderToolJsonView" in app
+    assert "renderHttpView" in app
+    assert "renderHttpTargetCard" in app
+    assert "httpTargetItems" in app
+    assert "httpRequestText" in app
+    assert "httpResponseText" in app
+    assert "httpResultEntries" in app
+    assert "requestHeaderLines" in app
+    assert "requestBodyText" in app
+    assert "httpPreviewValue" in app
+    assert "http-selection-list" in app
+    assert "toolBatchSelections.set(callId, entry.id)" in app
+    for http_field in ("request.headers", "request.cookies", "request.auth", "request.body", "request.query", "args.wait_seconds", "args.session_id"):
+        assert http_field in app
+    assert '[["packet", "报文"], ["json", "JSON"]]' in app
+    assert '[["summary", "摘要"], ["json", "JSON"]]' in app
+    assert 'setAttribute("aria-label", "HTTP 请求或响应列表")' in app
+    assert ".tool-view-tabs" in css
+    assert ".tool-summary-grid" in css
+    assert ".tool-summary-content-pre" in css
+    assert ".http-target-card" in css
+    assert ".http-target-url" in css
+    assert ".http-packet-pre" in css
+    assert ".http-selection-list" in css
+    assert "max-height: 380px" in css
+    assert "truncated === true" in app
+    assert "eof === false" in app
 
 
 def test_workbench_uses_safe_dom_rendering_and_removes_obsolete_event_ui() -> None:

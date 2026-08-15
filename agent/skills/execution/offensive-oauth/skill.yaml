@@ -1,0 +1,57 @@
+id: web.offensive_oauth
+name: Offensive Oauth
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: 'OAuth 2.0 attack checklist: authorization code interception, redirect_uri bypass, CSRF on OAuth flow, state parameter abuse, open redirector chaining, token leakage via Referer, PKCE bypass, and scope escalation. Use when testing OAuth implementations in web apps or bug bounty.'
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - oauth
+  - '2.0'
+  - attack
+  - checklist
+  - authorization
+  - code
+  - interception
+  - redirect
+  - uri
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_OAUTH
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: true
+tags:
+- web
+- oauth
+- '2.0'
+- attack
+- checklist
+- authorization
+- code
+- interception

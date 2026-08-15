@@ -1,0 +1,58 @@
+id: web.business_logic_vulnerabilities
+name: Business Logic Vulnerabilities
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: Business logic vulnerability playbook. Use when reasoning about workflows, race conditions, price manipulation, coupon abuse, state machines, and multi-step authorization gaps.
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - business
+  - logic
+  - vulnerabilities
+  - vulnerability
+  - playbook.
+  - use
+  - when
+  - reasoning
+  - about
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - sliver
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - BUSINESS_LOGIC_VULNERABILITIES
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- business
+- logic
+- vulnerabilities
+- vulnerability
+- playbook.
+- use
+- when

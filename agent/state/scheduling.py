@@ -21,6 +21,7 @@ from .models import (
     FindingRecord,
     ResourceWorkRecord,
 )
+from .resources import challenge_work_active
 from .service import StateService, derive_phase
 
 
@@ -37,7 +38,6 @@ class ResourceController:
         *,
         cpu_limit_percent: float = 70.0,
         memory_limit_percent: float = 70.0,
-        start_interval_seconds: float = 5.0,
         storage_root: Path | None = None,
         disk_reserve_bytes: int = 1_073_741_824,
         disk_reserve_percent: float = 5.0,
@@ -48,7 +48,6 @@ class ResourceController:
         self.run_id = run_id
         self.cpu_limit_percent = cpu_limit_percent
         self.memory_limit_percent = memory_limit_percent
-        self.start_interval_seconds = start_interval_seconds
         self.storage_root = (storage_root or service.db.path.parent).resolve()
         self.disk_reserve_bytes = max(0, disk_reserve_bytes)
         self.disk_reserve_percent = max(0.0, disk_reserve_percent)
@@ -113,36 +112,52 @@ class ResourceController:
                     admission = AdmissionRecord(admission_id=f"admission_{uuid4().hex}", run_id=self.run_id, agent_id=agent_id, unique_code=agent.unique_code, role=agent.role, priority=agent.priority)
                     session.add(admission)
                 if admission.status in {"starting", "running"}:
-                    return {"ok": True, "status": admission.status, "admission_id": admission.admission_id}
+                    return {
+                        "ok": True,
+                        "claimed": False,
+                        "status": admission.status,
+                        "admission_id": admission.admission_id,
+                    }
+                # A queued Bootstrap can outlive a failed/closed Challenge
+                # during startup.  Re-check ownership at the point of
+                # reservation so the scheduler never launches an orphan.
+                if agent.status not in {"queued", "pending"}:
+                    if admission.status == "queued":
+                        admission.status = "cancelled"
+                        admission.reason = "agent_not_queued"
+                    return {
+                        "ok": False,
+                        "code": "agent_not_queued",
+                        "status": admission.status,
+                        "admission_id": admission.admission_id,
+                    }
+                if agent.parent_id:
+                    parent = await session.get(AgentRecord, agent.parent_id)
+                    if (
+                        parent is None
+                        or parent.run_id != self.run_id
+                        or parent.role != "challenge"
+                        or parent.status in {"failed", "stopped", "completed", "cancelled", "interrupted"}
+                    ):
+                        if admission.status == "queued":
+                            admission.status = "cancelled"
+                            admission.reason = "parent_challenge_inactive"
+                        return {
+                            "ok": False,
+                            "code": "parent_challenge_inactive",
+                            "status": admission.status,
+                            "admission_id": admission.admission_id,
+                        }
                 reason: str | None = None
                 retry_at: datetime | None = None
                 if cpu >= self.cpu_limit_percent:
                     reason = "cpu_limit"
                 elif memory >= self.memory_limit_percent:
                     reason = "memory_limit"
-                else:
-                    latest_agent = await session.scalar(select(AdmissionRecord.started_at).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.status.in_(["starting", "running"]), AdmissionRecord.started_at.is_not(None)).order_by(AdmissionRecord.started_at.desc()).limit(1))
-                    latest_work = await session.scalar(
-                        select(ResourceWorkRecord.started_at)
-                        .where(
-                            ResourceWorkRecord.run_id == self.run_id,
-                            ResourceWorkRecord.started_at.is_not(None),
-                        )
-                        .order_by(ResourceWorkRecord.started_at.desc())
-                        .limit(1)
-                    )
-                    latest_values = [
-                        aware(value)
-                        for value in (latest_agent, latest_work)
-                        if value is not None
-                    ]
-                    latest = max(latest_values, default=None)
-                    if latest is not None and (now - latest).total_seconds() < self.start_interval_seconds:
-                        reason = "start_interval"
                 if reason is not None:
                     admission.status = "queued"
                     admission.reason = reason
-                    admission.retry_at = now + timedelta(seconds=max(1.0, self.start_interval_seconds))
+                    admission.retry_at = now + timedelta(seconds=0.5)
                     admission.updated_at = now
                     await self.service._event(session, self.run_id, "agent_admission_queued", {"agent_id": agent_id, "reason": reason, "cpu_percent": cpu, "memory_percent": memory})
                     return {"ok": False, "status": "queued", "admission_id": admission.admission_id, "retry_at": admission.retry_at.isoformat(), "reason": reason, "cpu_percent": cpu, "memory_percent": memory}
@@ -151,11 +166,35 @@ class ResourceController:
                 admission.retry_at = None
                 admission.reserved_at = now
                 admission.updated_at = now
-                await self.service._event(session, self.run_id, "agent_admission_reserved", {"agent_id": agent_id, "admission_id": admission.admission_id, "cpu_percent": cpu, "memory_percent": memory})
-                return {"ok": True, "status": "starting", "admission_id": admission.admission_id, "cpu_percent": cpu, "memory_percent": memory}
+                queue_latency_ms = int(
+                    max(0.0, (now - aware(admission.created_at or now)).total_seconds())
+                    * 1_000
+                )
+                await self.service._event(
+                    session,
+                    self.run_id,
+                    "agent_admission_reserved",
+                    {
+                        "agent_id": agent_id,
+                        "admission_id": admission.admission_id,
+                        "cpu_percent": cpu,
+                        "memory_percent": memory,
+                        "queue_latency_ms": queue_latency_ms,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "claimed": True,
+                    "status": "starting",
+                    "admission_id": admission.admission_id,
+                    "cpu_percent": cpu,
+                    "memory_percent": memory,
+                    "queue_latency_ms": queue_latency_ms,
+                }
 
     async def mark_started(self, agent_id: str) -> dict[str, Any]:
         async with self._lock:
+            event_sequence: int | None = None
             async with self.service.db.sessions.begin() as session:
                 admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
                 if admission is None:
@@ -163,8 +202,11 @@ class ResourceController:
                 admission.status = "running"
                 admission.started_at = self.clock()
                 admission.updated_at = self.clock()
-                await self.service._event(session, self.run_id, "agent_started", {"agent_id": agent_id, "admission_id": admission.admission_id})
-                return {"ok": True, "status": "running", "admission_id": admission.admission_id}
+                event_sequence = await self.service._event(session, self.run_id, "agent_started", {"agent_id": agent_id, "admission_id": admission.admission_id})
+                result = {"ok": True, "status": "running", "admission_id": admission.admission_id}
+            if event_sequence is not None:
+                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
+            return result
 
     async def next_queued_agent_id(self) -> str | None:
         async with self.service.db.sessions() as session:
@@ -202,14 +244,41 @@ class ResourceController:
             )
             if agent is None and work is None:
                 return None
-            if work is None or (
-                agent is not None
-                and (agent.priority, -agent.created_at.timestamp())
-                >= (work.priority, -work.created_at.timestamp())
-            ):
+            if work is None:
                 assert agent is not None
                 return {"kind": "agent", "id": agent.agent_id}
-            assert work is not None
+            if agent is None:
+                return {
+                    "kind": "resource",
+                    "id": work.work_id,
+                    "owner_type": work.owner_type,
+                    "owner_id": work.owner_id,
+                    "phase": work.phase,
+                }
+            # Resource work is deliberately ahead of Agent admission. It
+            # commonly releases a gate needed by an already planned Agent.
+            if work is not None:
+                return {
+                    "kind": "resource",
+                    "id": work.work_id,
+                    "owner_type": work.owner_type,
+                    "owner_id": work.owner_id,
+                    "phase": work.phase,
+                }
+
+    async def next_queued_resource_work_item(self) -> dict[str, Any] | None:
+        async with self.service.db.sessions() as session:
+            work = await session.scalar(
+                select(ResourceWorkRecord)
+                .where(
+                    ResourceWorkRecord.run_id == self.run_id,
+                    ResourceWorkRecord.status == "queued",
+                )
+                .order_by(ResourceWorkRecord.priority.desc(), ResourceWorkRecord.created_at)
+                .limit(1)
+            )
+            if work is None:
+                return None
             return {
                 "kind": "resource",
                 "id": work.work_id,
@@ -228,7 +297,7 @@ class ResourceController:
 
         async with self._lock:
             work = await self.service.get_resource_work(self.run_id, work_id)
-            if work["status"] in {"reserved", "running"}:
+            if work["status"] in {"reserved", "starting", "running"}:
                 return {"ok": True, **work}
             cpu = float(
                 sample["cpu_percent"]
@@ -246,7 +315,7 @@ class ResourceController:
                 int(disk.total * self.disk_reserve_percent / 100.0),
             )
             active = await self.service.list_resource_work(
-                self.run_id, statuses={"reserved", "running"}
+                self.run_id, statuses={"reserved", "starting", "running"}
             )
             reserved_disk = sum(
                 int(item["estimated_disk_bytes"])
@@ -273,42 +342,8 @@ class ResourceController:
                 reason = "memory_reservation"
             elif int(work["estimated_disk_bytes"]) > available_disk:
                 reason = "disk_reservation"
-            if reason is None and self.start_interval_seconds > 0:
-                async with self.service.db.sessions() as session:
-                    latest_agent = await session.scalar(
-                        select(AdmissionRecord.started_at)
-                        .where(
-                            AdmissionRecord.run_id == self.run_id,
-                            AdmissionRecord.started_at.is_not(None),
-                        )
-                        .order_by(AdmissionRecord.started_at.desc())
-                        .limit(1)
-                    )
-                    latest_work = await session.scalar(
-                        select(ResourceWorkRecord.started_at)
-                        .where(
-                            ResourceWorkRecord.run_id == self.run_id,
-                            ResourceWorkRecord.started_at.is_not(None),
-                        )
-                        .order_by(ResourceWorkRecord.started_at.desc())
-                        .limit(1)
-                    )
-                latest_values = [
-                    aware(value)
-                    for value in (latest_agent, latest_work)
-                    if value is not None
-                ]
-                latest = max(latest_values, default=None)
-                if (
-                    latest is not None
-                    and (aware(self.clock()) - latest).total_seconds()
-                    < self.start_interval_seconds
-                ):
-                    reason = "start_interval"
             if reason is not None:
-                retry_at = aware(self.clock()) + timedelta(
-                    seconds=max(1.0, self.start_interval_seconds)
-                )
+                retry_at = aware(self.clock()) + timedelta(seconds=0.5)
                 queued = await self.service.update_resource_work(
                     self.run_id,
                     work_id,
@@ -337,15 +372,16 @@ class ResourceController:
             }
 
     async def mark_resource_started(self, work_id: str) -> dict[str, Any]:
-        return await self.service.update_resource_work(
-            self.run_id, work_id, status="running"
-        )
+        return await self.service.mark_resource_work_started(self.run_id, work_id)
+
+    async def claim_resource_work(self, work_id: str) -> dict[str, Any]:
+        return await self.service.claim_resource_work(self.run_id, work_id)
 
     async def check_resource_work(self, work_id: str) -> dict[str, Any]:
         """Decide whether an admitted task may dispatch another unit of work."""
 
         work = await self.service.get_resource_work(self.run_id, work_id)
-        if work["status"] not in {"reserved", "running"}:
+        if work["status"] not in {"reserved", "starting", "running"}:
             return {"ok": False, **work, "reason": work.get("reason") or "not_running"}
         cpu = float(self.psutil.cpu_percent(interval=None))
         memory = float(self.psutil.virtual_memory().percent)
@@ -368,7 +404,7 @@ class ResourceController:
             "cpu_percent": cpu,
             "memory_percent": memory,
             "disk_free_bytes": disk.free,
-            "retry_after_seconds": max(1.0, self.start_interval_seconds),
+            "retry_after_seconds": 0.5,
         }
 
     async def finish_resource_work(
@@ -384,6 +420,7 @@ class ResourceController:
 
     async def mark_failed(self, agent_id: str, *, reason: str) -> dict[str, Any]:
         async with self._lock:
+            event_sequence: int | None = None
             async with self.service.db.sessions.begin() as session:
                 admission = await session.scalar(
                     select(AdmissionRecord).where(
@@ -396,126 +433,180 @@ class ResourceController:
                 admission.status = "failed"
                 admission.reason = reason[:128]
                 admission.updated_at = self.clock()
-                await self.service._event(
+                event_sequence = await self.service._event(
                     session,
                     self.run_id,
                     "agent_start_failed",
                     {"agent_id": agent_id, "reason": admission.reason},
                     agent_id=agent_id,
                 )
-                return {"ok": True, "status": "failed", "admission_id": admission.admission_id}
+                result = {"ok": True, "status": "failed", "admission_id": admission.admission_id}
+            if event_sequence is not None:
+                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
+            return result
 
     async def finish(self, agent_id: str, *, status: str = "completed") -> dict[str, Any]:
         async with self._lock:
+            event_sequence: int | None = None
             async with self.service.db.sessions.begin() as session:
                 admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
                 if admission is None:
                     return {"ok": False, "code": "admission_not_found"}
                 admission.status = status
                 admission.updated_at = self.clock()
-                await self.service._event(session, self.run_id, "agent_admission_finished", {"agent_id": agent_id, "status": status})
-                return {"ok": True, "status": status, "admission_id": admission.admission_id}
+                event_sequence = await self.service._event(session, self.run_id, "agent_admission_finished", {"agent_id": agent_id, "status": status})
+                result = {"ok": True, "status": status, "admission_id": admission.admission_id}
+            if event_sequence is not None:
+                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
+            return result
 
 class StagnationManager:
-    """Apply the deterministic 8/15/20 minute challenge state machine."""
+    """Turn prolonged lack of progress into a soft signal, then a hard pause."""
 
-    WARNING_SECONDS = 8 * 60
+    LOW_YIELD_SECONDS = 8 * 60
     PAUSE_SECONDS = 15 * 60
-    HARD_STOP_SECONDS = 20 * 60
+    STAGNATION_PAUSE_REASON = "stagnation_timeout"
 
-    def __init__(self, service: StateService, *, clock: Callable[[], datetime] = utc_now) -> None:
+    def __init__(
+        self,
+        service: StateService,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
         self.service = service
         self.clock = clock
         self._lock = asyncio.Lock()
 
     async def evaluate(self, run_id: str, unique_code: str) -> dict[str, Any]:
         async with self._lock:
+            result: dict[str, Any]
             async with self.service.db.sessions.begin() as session:
-                challenge = await self.service._require_challenge(session, run_id, unique_code)
-                now = aware(self.clock())
-                if (
-                    challenge.container_status not in {"running", "starting"}
-                    or challenge.last_progress_at is None
-                    or challenge.is_completed
-                    or challenge.work_status in {"closed", "paused"}
-                ):
-                    return {"unique_code": unique_code, "level": challenge.stagnation_level, "status": challenge.work_status, "elapsed_seconds": 0, "action": "none"}
-                elapsed = active_seconds(
-                    now=now,
-                    active_since=challenge.active_since,
-                    accumulated_seconds=challenge.exploration_seconds,
+                challenge = await self.service._require_challenge(
+                    session, run_id, unique_code
                 )
-                target_level = 1 if elapsed >= self.WARNING_SECONDS else 0
-                hard_stop = elapsed >= self.HARD_STOP_SECONDS
-                pause_due = elapsed >= self.PAUSE_SECONDS and not challenge.extension_cycle_pending
-                if hard_stop or pause_due:
-                    challenge.stagnation_level = 2
-                    challenge.work_status = "paused"
-                    challenge.hint_eligible = False
-                    challenge.version += 1
-                    event_sequence = await self.service._event(
-                        session,
-                        run_id,
-                        "stagnation_level_changed",
-                        {
-                            "unique_code": unique_code,
-                            "level": challenge.stagnation_level,
-                            "elapsed_seconds": elapsed,
-                            "action": "pause",
-                            "extension_active": bool(challenge.extension_cycle_pending),
-                        },
-                    )
-                    return {
+                if (
+                    not challenge_work_active(challenge)
+                    or challenge.is_completed
+                    or challenge.work_status == "closed"
+                ):
+                    result = {
                         "unique_code": unique_code,
-                        "level": challenge.stagnation_level,
                         "status": challenge.work_status,
-                        "elapsed_seconds": elapsed,
-                        "action": "pause",
-                        "event_sequence": event_sequence,
+                        "elapsed_seconds": 0,
+                        "action": "none",
                     }
-                if elapsed >= self.PAUSE_SECONDS and challenge.extension_cycle_pending:
-                    event_sequence: int | None = None
-                    if challenge.stagnation_level < 2 or challenge.work_status != "extended":
+                else:
+                    now = aware(self.clock())
+                    baseline = challenge.last_progress_at or challenge.active_since
+                    elapsed = (
+                        max(0, int((now - aware(baseline)).total_seconds()))
+                        if baseline is not None
+                        else 0
+                    )
+                    if elapsed < self.LOW_YIELD_SECONDS:
+                        result = {
+                            "unique_code": unique_code,
+                            "status": challenge.work_status,
+                            "elapsed_seconds": elapsed,
+                            "action": "none",
+                        }
+                    elif elapsed >= self.PAUSE_SECONDS and challenge.stagnation_level < 2:
+                        self.service._freeze_exploration(challenge)
                         challenge.stagnation_level = 2
-                        challenge.work_status = "extended"
+                        challenge.work_status = "paused"
+                        challenge.paused_at = now
+                        challenge.pause_reason = self.STAGNATION_PAUSE_REASON
                         challenge.version += 1
                         event_sequence = await self.service._event(
                             session,
                             run_id,
-                            "stagnation_level_changed",
+                            "challenge_stagnation_paused",
                             {
                                 "unique_code": unique_code,
-                                "level": challenge.stagnation_level,
                                 "elapsed_seconds": elapsed,
-                                "action": "extension_active",
+                                "pause_reason": self.STAGNATION_PAUSE_REASON,
                             },
                         )
-                    return {
-                        "unique_code": unique_code,
-                        "level": challenge.stagnation_level,
-                        "status": challenge.work_status,
-                        "elapsed_seconds": elapsed,
-                        "action": "extension_active",
-                        "event_sequence": event_sequence,
-                    }
-                if target_level <= challenge.stagnation_level:
-                    return {"unique_code": unique_code, "level": challenge.stagnation_level, "status": challenge.work_status, "elapsed_seconds": elapsed, "action": "none"}
-                challenge.stagnation_level = target_level
-                challenge.version += 1
-                challenge.work_status = "warning"
-                challenge.hint_eligible = True
-                event_sequence = await self.service._event(
-                    session,
+                        result = {
+                            "unique_code": unique_code,
+                            "status": challenge.work_status,
+                            "elapsed_seconds": elapsed,
+                            "action": "pause_stagnation",
+                            "pause_reason": self.STAGNATION_PAUSE_REASON,
+                            "event_sequence": event_sequence,
+                        }
+                    elif challenge.stagnation_level < 1:
+                        challenge.stagnation_level = 1
+                        challenge.version += 1
+                        event_sequence = await self.service._event(
+                            session,
+                            run_id,
+                            "challenge_low_yield",
+                            {
+                                "unique_code": unique_code,
+                                "elapsed_seconds": elapsed,
+                            },
+                        )
+                        result = {
+                            "unique_code": unique_code,
+                            "status": challenge.work_status,
+                            "elapsed_seconds": elapsed,
+                            "action": "low_yield",
+                            "event_sequence": event_sequence,
+                        }
+                    else:
+                        result = {
+                            "unique_code": unique_code,
+                            "status": challenge.work_status,
+                            "elapsed_seconds": elapsed,
+                            "action": "none",
+                        }
+            if result["action"] not in {"low_yield", "pause_stagnation"}:
+                return result
+            overview = await self.service.get_overview(run_id)
+            chief = next(
+                (item for item in overview["agents"] if item["role"] == "chief"),
+                None,
+            )
+            controller = next(
+                (
+                    item
+                    for item in overview["agents"]
+                    if item["role"] == "challenge"
+                    and item["unique_code"] == unique_code
+                ),
+                None,
+            )
+            if chief is not None and controller is not None:
+                report = await self.service.publish_control_report(
                     run_id,
-                    "stagnation_level_changed",
-                    {
+                    sender_id=controller["agent_id"],
+                    recipient_id=chief["agent_id"],
+                    unique_code=unique_code,
+                    report_type="challenge_status",
+                    status=(
+                        "stagnation_paused"
+                        if result["action"] == "pause_stagnation"
+                        else "low_yield"
+                    ),
+                    payload={
+                        "type": (
+                            "challenge_stagnation_paused"
+                            if result["action"] == "pause_stagnation"
+                            else "challenge_low_yield"
+                        ),
                         "unique_code": unique_code,
-                        "level": target_level,
-                        "elapsed_seconds": elapsed,
-                        "action": "warning_review",
+                        "elapsed_seconds": result["elapsed_seconds"],
+                        **(
+                            {"pause_reason": result["pause_reason"]}
+                            if result["action"] == "pause_stagnation"
+                            else {}
+                        ),
                     },
                 )
-                return {"unique_code": unique_code, "level": target_level, "status": challenge.work_status, "elapsed_seconds": elapsed, "action": "warning_review", "event_sequence": event_sequence}
+                result["chief_report_ref"] = report["report_ref"]
+            return result
+
 
 class ChallengeScheduler:
     """Stable phase-aware challenge selection."""
@@ -527,12 +618,15 @@ class ChallengeScheduler:
     async def select(self, run_id: str, *, limit: int = 3) -> list[dict[str, Any]]:
         async with self.service.db.sessions() as session:
             run = await self.service._require_run(session, run_id)
-            challenges = list((await session.scalars(select(ChallengeRecord).where(ChallengeRecord.run_id == run_id, ChallengeRecord.is_completed.is_(False)))).all())
-            challenges = [
+            unfinished = list((await session.scalars(select(ChallengeRecord).where(ChallengeRecord.run_id == run_id, ChallengeRecord.is_completed.is_(False)))).all())
+            runnable = [
                 item
-                for item in challenges
+                for item in unfinished
                 if item.work_status not in {"paused", "completed", "closed"}
             ]
+            paused = [item for item in unfinished if item.work_status == "paused"]
+            restart_required = not runnable and bool(paused)
+            challenges = paused if restart_required else runnable
             phase = derive_phase(run.started_at, run.deadline_at, self.clock())
             if phase == "early":
                 selected = self._early(challenges, limit)
@@ -541,7 +635,11 @@ class ChallengeScheduler:
             else:
                 candidate_codes = set((await session.scalars(select(FindingRecord.unique_code).where(FindingRecord.run_id == run_id, FindingRecord.category == "flag", FindingRecord.verification_status.in_(["candidate", "verified"])))).all())
                 selected = sorted(challenges, key=lambda item: self._late_key(item, candidate_codes), reverse=True)[:limit]
-            return [self.service._challenge_dict(item) for item in selected]
+            result = [self.service._challenge_dict(item) for item in selected]
+            if restart_required:
+                for item in result:
+                    item["restart_required"] = True
+            return result
 
     async def choose_one(self, run_id: str) -> dict[str, Any] | None:
         values = await self.select(run_id, limit=1)
@@ -571,49 +669,3 @@ class ChallengeScheduler:
     def _late_key(item: ChallengeRecord, candidate_codes: set[str] | None = None) -> tuple[Any, ...]:
         completion = item.correct_flag_count / item.flag_count if item.flag_count else 0
         return (item.unique_code in (candidate_codes or set()), item.hint_eligible, item.correct_flag_count > 0, completion, item.total_score, -DIFFICULTY_RANK.get(item.difficulty, 99), item.unique_code)
-
-class ChallengeLoopController:
-    """Drive the two model calls and the six persisted cycle stages."""
-
-    def __init__(self, service: StateService) -> None:
-        self.service = service
-
-    async def run_cycle(
-        self,
-        run_id: str,
-        unique_code: str,
-        context: Any,
-        *,
-        analyze_and_plan: Callable[[dict[str, Any]], Any],
-        verify_and_update: Callable[[dict[str, Any], list[dict[str, Any]]], Any],
-        execute: Callable[[dict[str, Any]], Any] | None = None,
-    ) -> dict[str, Any]:
-        challenge = await self.service.get_challenge_context(run_id, unique_code, context)
-        from .schemas import CreateCycleInput
-
-        cycle = await self.service.begin_cycle(run_id, unique_code, context, CreateCycleInput(expected_challenge_version=challenge["challenge"]["version"]))
-        plan = analyze_and_plan(cycle)
-        if hasattr(plan, "__await__"):
-            plan = await plan
-        if not isinstance(plan, dict):
-            await self.service.mark_invalid_cycle(run_id, cycle["cycle_id"], context)
-            return {"status": "invalid_cycle_output", "cycle_id": cycle["cycle_id"]}
-        plan["expected_version"] = cycle["version"]
-        from .schemas import AnalysisPlanInput
-
-        plan_payload = AnalysisPlanInput.model_validate(plan)
-        cycle = await self.service.submit_analysis_plan(run_id, cycle["cycle_id"], context, plan_payload)
-        if execute is not None:
-            executed = execute(cycle)
-            if hasattr(executed, "__await__"):
-                await executed
-        reports = await self.service.list_reports(run_id, context, after_sequence=0, wait_seconds=0, max_reports=100)
-        update = verify_and_update(cycle, reports["reports"])
-        if hasattr(update, "__await__"):
-            update = await update
-        if not isinstance(update, dict):
-            await self.service.mark_invalid_cycle(run_id, cycle["cycle_id"], context)
-            return {"status": "invalid_cycle_output", "cycle_id": cycle["cycle_id"]}
-        update["expected_version"] = cycle["version"]
-        result = await self.service.commit_cycle(run_id, cycle["cycle_id"], context, VerificationUpdateInput.model_validate(update))
-        return result

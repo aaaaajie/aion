@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from challenges_sdk import ChallengesClient
+from agent.tooling import ToolExecutor, ToolRegistry
 from tools.benchmark import BenchmarkTools
 
 TOKEN = "test-token"
@@ -36,6 +37,15 @@ def make_tools(handler: Any) -> BenchmarkTools:
         transport=httpx.MockTransport(handler),
     )
     return BenchmarkTools(client)
+
+
+async def call_tool(tools: BenchmarkTools, name: str, arguments: Any) -> dict[str, Any]:
+    raw = json.dumps(arguments)
+    results = await ToolExecutor(ToolRegistry([tools])).execute(
+        [{"id": f"test-{name}", "function": {"name": name, "arguments": raw}}]
+    )
+    assert results[0].result is not None
+    return results[0].result
 
 
 @pytest.mark.asyncio
@@ -113,8 +123,10 @@ async def test_named_methods_return_json_envelopes_and_call_sdk(
         return httpx.Response(200, json=response)
 
     tools = make_tools(handler)
-    async with tools:
-        result = await getattr(tools, method_name)(**arguments)
+    try:
+        result = await call_tool(tools, f"benchmark_{method_name}", arguments)
+    finally:
+        await tools.close()
 
     assert len(requests) == 1
     request = requests[0]
@@ -131,7 +143,7 @@ async def test_named_methods_return_json_envelopes_and_call_sdk(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routes_tool_name_and_accepts_env_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_executor_routes_tool_name_and_accepts_env_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -141,16 +153,21 @@ async def test_dispatch_routes_tool_name_and_accepts_env_settings(monkeypatch: p
     monkeypatch.setenv("BENCHMARK_BASE_URL", BASE_URL)
     monkeypatch.setenv("BENCHMARK_TOKEN", TOKEN)
     tools = BenchmarkTools.from_env(transport=httpx.MockTransport(handler))
-    async with tools:
-        result = await tools.dispatch("benchmark_list_challenges", {})
+    try:
+        result = await call_tool(tools, "benchmark_list_challenges", {})
+    finally:
+        await tools.close()
 
     assert result["ok"] is True
     assert result["data"][0]["unique_code"] == CHALLENGE_CODE
     assert len(requests) == 1
 
 
-def test_tool_definitions_are_openai_compatible_and_copy_safe() -> None:
-    definitions = BenchmarkTools.tool_definitions()
+def test_tool_definitions_are_generated_from_specs() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    definitions = ToolRegistry([make_tools(handler)]).definitions()
     names = [definition["function"]["name"] for definition in definitions]
 
     assert names == [
@@ -171,14 +188,13 @@ def test_tool_definitions_are_openai_compatible_and_copy_safe() -> None:
         item for item in definitions if item["function"]["name"] == "benchmark_submit_flag"
     )
     assert submit["function"]["parameters"]["required"] == ["unique_code", "flag"]
-    assert "duplicate" in submit["function"]["description"]
+    assert "never automatically retried" in submit["function"]["description"]
 
-    definitions[0]["function"]["name"] = "mutated"
-    assert BenchmarkTools.tool_definitions()[0]["function"]["name"] == "benchmark_list_challenges"
+    assert not hasattr(BenchmarkTools, "tool_definitions")
 
 
 @pytest.mark.asyncio
-async def test_dispatch_rejects_unknown_and_invalid_arguments_without_http_call() -> None:
+async def test_executor_rejects_unknown_and_invalid_arguments_without_http_call() -> None:
     request_count = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -187,30 +203,32 @@ async def test_dispatch_rejects_unknown_and_invalid_arguments_without_http_call(
         return httpx.Response(500)
 
     tools = make_tools(handler)
-    async with tools:
-        unknown = await tools.dispatch("benchmark_unknown", {})
-        invalid_name = await tools.dispatch(123, {})  # type: ignore[arg-type]
-        missing = await tools.dispatch("benchmark_start_challenge", {})
-        extra = await tools.dispatch(
+    try:
+        unknown = await call_tool(tools, "benchmark_unknown", {})
+        missing = await call_tool(tools, "benchmark_start_challenge", {})
+        extra = await call_tool(
+            tools,
             "benchmark_start_challenge",
             {"unique_code": CHALLENGE_CODE, "unexpected": True},
         )
-        non_object = await tools.dispatch("benchmark_list_challenges", [])
-        invalid_flag = await tools.dispatch(
+        non_object = await call_tool(tools, "benchmark_list_challenges", [])
+        invalid_flag = await call_tool(
+            tools,
             "benchmark_submit_flag",
             {"unique_code": CHALLENGE_CODE, "flag": "x" * 4097},
         )
+    finally:
+        await tools.close()
 
-    for result in (unknown, invalid_name, missing, extra, non_object, invalid_flag):
+    for result in (unknown, missing, extra, non_object, invalid_flag):
         assert result["ok"] is False
-        assert result["error"]["type"] == "validation"
+        assert result["error"]["stage"] in {"schema", "semantic"}
     assert unknown["error"]["code"] == "unknown_tool"
-    assert invalid_name["error"]["code"] == "invalid_tool_name"
     assert request_count == 0
 
 
 @pytest.mark.asyncio
-async def test_api_error_is_normalized_and_token_is_redacted() -> None:
+async def test_api_error_is_normalized_with_full_local_detail() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             404,
@@ -222,13 +240,15 @@ async def test_api_error_is_normalized_and_token_is_redacted() -> None:
         )
 
     tools = make_tools(handler)
-    async with tools:
-        result = await tools.dispatch("benchmark_list_challenges", {})
+    try:
+        result = await call_tool(tools, "benchmark_list_challenges", {})
+    finally:
+        await tools.close()
 
     assert result["ok"] is False
-    assert result["error"]["type"] == "api"
+    assert result["error"]["stage"] == "execution"
     assert result["error"]["code"] == "task_not_found"
-    assert result["error"]["status_code"] == 404
+    assert result["error"]["details"]["status_code"] == 404
     assert TOKEN not in json.dumps(result)
 
 
@@ -242,19 +262,15 @@ async def test_transport_error_is_normalized_without_retry() -> None:
         raise httpx.ConnectError(f"failed with {TOKEN}", request=request)
 
     tools = make_tools(handler)
-    async with tools:
-        result = await tools.dispatch("benchmark_list_challenges", {})
+    try:
+        result = await call_tool(tools, "benchmark_list_challenges", {})
+    finally:
+        await tools.close()
 
-    assert result == {
-        "ok": False,
-        "error": {
-            "type": "transport",
-            "code": "transport_error",
-            "message": "Unable to reach the benchmark service",
-            "status_code": None,
-            "detail": {},
-        },
-    }
+    assert result["ok"] is False
+    assert result["error"]["stage"] == "execution"
+    assert result["error"]["code"] == "transport_error"
+    assert result["error"]["message"] == "Unable to reach the benchmark service"
     assert TOKEN not in json.dumps(result)
     assert request_count == 1
 
@@ -265,11 +281,13 @@ async def test_invalid_response_is_normalized() -> None:
         return httpx.Response(200, json={"not": "a list"})
 
     tools = make_tools(handler)
-    async with tools:
-        result = await tools.list_challenges()
+    try:
+        result = await call_tool(tools, "benchmark_list_challenges", {})
+    finally:
+        await tools.close()
 
     assert result["ok"] is False
-    assert result["error"]["type"] == "internal"
+    assert result["error"]["stage"] == "execution"
     assert result["error"]["code"] == "invalid_response"
 
 
@@ -284,7 +302,7 @@ async def test_wrapper_context_closes_owned_sdk_client() -> None:
         transport=httpx.MockTransport(handler),
     )
     tools = BenchmarkTools(client)
-    async with tools:
-        await tools.list_challenges()
+    await call_tool(tools, "benchmark_list_challenges", {})
+    await tools.close()
 
     assert client._client.is_closed is True

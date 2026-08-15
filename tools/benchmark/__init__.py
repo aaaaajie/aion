@@ -1,5 +1,5 @@
 """Agent-facing tools for the TSec Benchmark Challenges API."""
 
-from .wrapper import BenchmarkTools, ToolResult
+from .wrapper import BenchmarkTools
 
-__all__ = ["BenchmarkTools", "ToolResult"]
+__all__ = ["BenchmarkTools"]

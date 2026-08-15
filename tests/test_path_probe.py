@@ -22,10 +22,11 @@ from tools.http import HttpInteractionEngine, HttpProbeManager, HttpTools
 from tools.http.models import HttpOutputFilters, HttpRequestSpec
 from tools.http.path_probe import PathProbeEngine, PathProbeOptions
 from tools.system.policy import SystemToolError, WorkspacePolicy
+from tests.resource_runtime import install_resource_runtime
 
 
 async def _manager(
-    root: Path, handler, *, admission=None
+    root: Path, handler, *, start_runtime: bool = True
 ) -> tuple[StateService, HttpProbeManager, str]:
     run_root = root / "runs"
     service = StateService(run_root / "run-1" / "state.sqlite3", run_root=run_root)
@@ -41,9 +42,10 @@ async def _manager(
         "run-1",
         engine=engine,
         path_transport=httpx.MockTransport(handler),
-        admission_callback=admission,
     )
     await manager.initialize()
+    if start_runtime:
+        install_resource_runtime(manager, service, "run-1", root=root)
     return service, manager, agent["agent_id"]
 
 
@@ -106,11 +108,8 @@ async def test_large_wordlist_streams_plan_without_fixed_limit(tmp_path: Path) -
     async def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("queued path probe must not send requests")
 
-    async def queued(_work_id: str) -> dict:
-        return {"ok": False, "status": "queued", "reason": "disk_reservation"}
-
     service, manager, agent_id = await _manager(
-        tmp_path, handler, admission=queued
+        tmp_path, handler, start_runtime=False
     )
     result = await manager.start_path_probe(
         agent_id,
@@ -127,6 +126,47 @@ async def test_large_wordlist_streams_plan_without_fixed_limit(tmp_path: Path) -
     assert sum(1 for _ in (interaction_dir / "requests.ndjson").open()) == count
     await manager.stop(agent_id, interaction_id=result["interaction_id"])
     await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_and_agent_cleanup_tolerate_missing_plan(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "small.txt").write_text("admin\n", encoding="utf-8")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("queued path probe must not send requests")
+
+    service, manager, agent_id = await _manager(
+        tmp_path, handler, start_runtime=False
+    )
+    result = await manager.start_path_probe(
+        agent_id,
+        url="https://target.test/",
+        profile="quick",
+        wordlist_paths=["small.txt"],
+        wait_seconds=0,
+    )
+    interaction_dir = manager._interaction_dir(
+        agent_id, result["interaction_id"]
+    )
+    (interaction_dir / "plan.json").unlink()
+    # Exercise both shutdown owners against the same Interaction lock.  The
+    # first caller removes the private files; the other 999 calls must observe
+    # the terminal SQLite state and remain idempotent.
+    await asyncio.gather(
+        *(
+            manager.finish_agent(agent_id)
+            if index % 2
+            else manager.finish_run()
+            for index in range(1_000)
+        )
+    )
+    row = await service.get_http_interaction(
+        "run-1", agent_id, result["interaction_id"]
+    )
+    assert row["output_cleaned_at"] is not None
     await service.close()
 
 
@@ -484,8 +524,12 @@ async def test_session_cookies_are_reused(tmp_path: Path) -> None:
     await service.close()
 
 
-def test_tool_definition_policy_and_prompt() -> None:
-    definitions = HttpTools.tool_definitions()
+def test_tool_definition_policy_and_prompt(tmp_path: Path) -> None:
+    service = StateService(tmp_path / "state.sqlite3")
+    manager = HttpProbeManager(WorkspacePolicy(tmp_path), service, "run-1")
+    from agent.tooling import ToolRegistry
+
+    definitions = ToolRegistry([HttpTools(manager.bind("execution-test"))]).definitions()
     names = {item["function"]["name"] for item in definitions}
     assert "system_web_path_probe" in names
     description = next(
@@ -493,8 +537,8 @@ def test_tool_definition_policy_and_prompt() -> None:
         for item in definitions
         if item["function"]["name"] == "system_web_path_probe"
     )
-    assert "after system_web_fingerprint" in description
-    assert "does not issue implicit" in description
+    assert "bounded web path discovery" in description
+    assert "Preserve interaction_id" in description
     schema = next(
         item["function"]["parameters"]
         for item in definitions
@@ -502,6 +546,7 @@ def test_tool_definition_policy_and_prompt() -> None:
     )
     assert "max_total_requests" not in schema["properties"]
     assert "wordlist_max_size" not in schema["properties"]
+    assert schema["properties"]["profile"]["default"] == "quick"
     assert AgentPolicy("execution").allows("system_web_path_probe")
     prompt = (
         Path(__file__).resolve().parents[1]

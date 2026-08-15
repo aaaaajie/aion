@@ -40,6 +40,10 @@ YAKIT_DATA = ROOT / "third_party" / "yakit"
 EHOLE_DATA = ROOT / "third_party" / "ehole"
 
 _VERSION_SUFFIX_RE = re.compile(r"version:\\(\d+)")
+_GENERIC_FINGERPRINT_TERMS = frozenset(
+    {"login", "password", "username", "redirect", "admin", "submit", "logout"}
+)
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 _TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _FAVICON_LINK_RE = re.compile(
     rb"""<link\b[^>]*\brel=["']?(?:shortcut\s+)?icon["']?[^>]*>""",
@@ -211,6 +215,9 @@ class FingerprintMatch:
     source: str
     matched_path: str | None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    confidence_score: int = 0
+    confidence_level: str = "low"
+    confidence_reasons: list[str] = field(default_factory=list)
 
     def as_record(self, **extra: Any) -> dict[str, Any]:
         return {
@@ -223,8 +230,61 @@ class FingerprintMatch:
             "version": self.version,
             "matched_path": self.matched_path,
             "evidence": self.evidence,
+            "confidence_score": self.confidence_score,
+            "confidence_level": self.confidence_level,
+            "confidence_reasons": self.confidence_reasons,
             **extra,
         }
+
+    def score(self) -> "FingerprintMatch":
+        fields = {
+            str(item.get("field") or "") for item in self.evidence if item.get("field")
+        }
+        body_evidence = [item for item in self.evidence if item.get("field") == "body"]
+        reasons: list[str] = []
+        if "favicon_hash" in fields:
+            score = 100
+            reasons.append("favicon_hash")
+        elif self.source == "active":
+            score = 80
+            reasons.append("active_path_match")
+        elif "title" in fields:
+            score = 70
+            reasons.append("title_signature")
+        elif "header" in fields:
+            score = 60
+            reasons.append("header_signature")
+        elif len(body_evidence) >= 2 or any(
+            item.get("match_type") == "regex" for item in body_evidence
+        ):
+            score = 50
+            reasons.append("multi_condition_body")
+        else:
+            score = 20
+            reasons.append("single_keyword")
+        additional_sources = max(0, len(set(self.rule_sources)) - 1)
+        additional_fields = max(0, len(fields) - 1)
+        if additional_sources:
+            score += additional_sources * 20
+            reasons.append("multiple_rule_sources")
+        if additional_fields:
+            score += additional_fields * 15
+            reasons.append("multiple_response_fields")
+        patterns = {
+            str(item.get("pattern") or "").strip().casefold().strip("/ ")
+            for item in self.evidence
+            if isinstance(item.get("pattern"), str)
+        }
+        generic_only = bool(patterns) and patterns.issubset(_GENERIC_FINGERPRINT_TERMS)
+        if generic_only and additional_sources == 0 and additional_fields == 0:
+            score = min(score, 20)
+            reasons.append("generic_term_capped")
+        self.confidence_score = min(100, score)
+        self.confidence_level = (
+            "high" if self.confidence_score >= 80 else "medium" if self.confidence_score >= 50 else "low"
+        )
+        self.confidence_reasons = reasons
+        return self
 
 
 @lru_cache(maxsize=1)
@@ -374,7 +434,7 @@ class FingerprintEngine:
                 existing.version = match.version
             if existing.category is None:
                 existing.category = match.category
-        return list(matches.values())
+        return [match.score() for match in matches.values()]
 
     def _match_wappalyzer(
         self,
@@ -424,6 +484,7 @@ class FingerprintEngine:
                         "field": "body",
                         "pattern": str(pattern),
                         "value": matched.group(0),
+                        "match_type": "regex",
                     }
                 )
         for value in tech.get("headerstr") or []:
@@ -538,6 +599,7 @@ class FingerprintEngine:
                     "pattern": pattern,
                     "value": match.group(0),
                     "rule_id": rule.rule_id,
+                    "match_type": "regex",
                 }
                 for pattern, match in zip(rule.patterns, found)
                 if match is not None
@@ -607,7 +669,7 @@ class ActiveFingerprintEngine:
                     source="active",
                     matched_path=path,
                     evidence=self._evidence(path, probe, matchers),
-                )
+                ).score()
             )
         return matches
 
@@ -680,6 +742,7 @@ class FingerprintOptions:
     request_intent: str = "technology_fingerprint"
     parent_request_id: str | None = None
     request_group_id: str | None = None
+    minimum_confidence: str = "medium"
 
     def to_plan(self) -> dict[str, Any]:
         return {
@@ -698,6 +761,7 @@ class FingerprintOptions:
             "request_intent": self.request_intent,
             "parent_request_id": self.parent_request_id,
             "request_group_id": self.request_group_id,
+            "minimum_confidence": self.minimum_confidence,
         }
 
     @classmethod
@@ -719,6 +783,7 @@ class FingerprintOptions:
             request_intent=str(data.get("request_intent") or "technology_fingerprint"),
             parent_request_id=data.get("parent_request_id"),
             request_group_id=data.get("request_group_id"),
+            minimum_confidence=str(data.get("minimum_confidence") or "medium"),
         )
 
 
@@ -731,6 +796,7 @@ class FingerprintScanResult:
     errors: dict[str, int] = field(default_factory=dict)
     by_category: dict[str, int] = field(default_factory=dict)
     rule_diagnostics: dict[str, int] = field(default_factory=dict)
+    suppressed_match_count: int = 0
     stopped: bool = False
     started_at: str | None = None
     finished_at: str | None = None
@@ -854,6 +920,11 @@ class FingerprintScanner:
             favicon_bytes=favicon_bytes,
         )
         for match in self._passive.match(probe):
+            if _CONFIDENCE_RANK[match.confidence_level] < _CONFIDENCE_RANK[
+                self.options.minimum_confidence
+            ]:
+                result.suppressed_match_count += 1
+                continue
             result.passive_matched += 1
             if match.category:
                 result.by_category[match.category] = (
@@ -897,6 +968,11 @@ class FingerprintScanner:
                     content_type=response.headers.get("content-type", ""),
                 )
                 for match in self._active.matching_rules_for(path, probe):
+                    if _CONFIDENCE_RANK[match.confidence_level] < _CONFIDENCE_RANK[
+                        self.options.minimum_confidence
+                    ]:
+                        result.suppressed_match_count += 1
+                        continue
                     result.active_matched += 1
                     await on_match(match)
 

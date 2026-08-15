@@ -12,14 +12,193 @@ import pytest
 
 from agent.memory.redaction import redact_tool_payload
 from agent.state import ResourceController, StateService
+from agent.tooling import ToolExecutor, ToolRegistry
 from tools.http import HttpInteractionEngine, HttpProbeManager, HttpTools
 from tools.http.models import (
+    HttpOutputArguments,
     HttpOutputFilters,
+    HttpProbeArguments,
+    HttpProbeInputCase,
     HttpProbeCase,
+    HttpRequestArguments,
     HttpRequestSpec,
     HttpVariableSource,
 )
 from tools.system.policy import SystemToolError, WorkspacePolicy
+from tests.resource_runtime import install_resource_runtime
+
+
+def _tool_call(name: str, arguments: dict[str, object], call_id: str) -> dict[str, object]:
+    return {
+        "id": call_id,
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def test_probe_normalizes_only_unambiguous_shapes() -> None:
+    wrapped = HttpProbeArguments.model_validate(
+        {
+            "arguments": {
+                "cases": {
+                    "url": "https://target.test/{{path}}",
+                    "variables": {"path": {"values": ["/", "/admin"]}},
+                },
+                "concurrency": 2,
+            }
+        }
+    )
+    assert len(wrapped.cases) == 1
+    assert wrapped.concurrency == 2
+
+    moved = HttpProbeArguments.model_validate(
+        {
+            "cases": [
+                {
+                    "url": "https://target.test/{{path}}",
+                    "variables": {"path": {"values": ["/"]}},
+                    "wait_seconds": 4,
+                }
+            ]
+        }
+    )
+    assert moved.wait_seconds == 4
+    assert "wait_seconds" not in moved.cases[0].model_fields_set
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        HttpProbeArguments.model_validate(
+            {
+                "cases": [
+                    {"url": "https://target.test/a", "concurrency": 2},
+                    {"url": "https://target.test/b"},
+                ]
+            }
+        )
+    with pytest.raises(ValueError, match="cannot appear"):
+        HttpProbeArguments.model_validate(
+            {
+                "cases": [
+                    {"url": "https://target.test/a", "wait_seconds": 4}
+                ],
+                "wait_seconds": 5,
+            }
+        )
+    with pytest.raises(ValueError):
+        HttpProbeArguments.model_validate(
+            {
+                "cases": [{"url": "https://target.test/a"}],
+                "session_id": "ordered",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_probe_argument_errors_include_one_canonical_rewrite() -> None:
+    class RecordingClient:
+        def __getattr__(self, name: str):
+            async def operation(_arguments):
+                raise AssertionError(f"unexpected HTTP operation: {name}")
+
+            return operation
+
+        async def probe(self, _arguments):
+            raise AssertionError("invalid Probe arguments reached the handler")
+
+        async def close(self) -> None:
+            return None
+
+    executor = ToolExecutor(ToolRegistry([HttpTools(RecordingClient())]))
+    results = await executor.execute(
+        [
+            {
+                "id": "invalid-json",
+                "function": {
+                    "name": "system_http_probe",
+                    "arguments": '{"cases": [',
+                },
+            },
+            _tool_call(
+                "system_http_probe",
+                {
+                    "cases": [{"url": "https://target.test/a"}],
+                    "session_id": "ordered",
+                },
+                "invalid-schema",
+            ),
+        ]
+    )
+    assert all(item.result and item.result["ok"] is False for item in results)
+    for item in results:
+        assert "canonical_shape" in item.result["error"]["details"]
+        assert "system_http_request" in item.result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_http_tool_executor_preserves_validated_nested_models() -> None:
+    received: list[tuple[str, object]] = []
+
+    class RecordingClient:
+        def __getattr__(self, name: str):
+            async def operation(arguments):
+                received.append((name, arguments))
+                return {"interaction_id": "interaction-test", "results": []}
+
+            return operation
+
+        async def close(self) -> None:
+            return None
+
+    executor = ToolExecutor(ToolRegistry([HttpTools(RecordingClient())]))
+    results = await executor.execute(
+        [
+            _tool_call(
+                "system_http_request",
+                {"url": "https://target.test/", "body": {"type": "json", "value": {"a": 1}}},
+                "request",
+            ),
+            _tool_call(
+                "system_http_probe",
+                {"cases": [{"url": "https://target.test/{{id}}", "variables": {"id": {"values": [1, 2]}}}]},
+                "probe",
+            ),
+            _tool_call(
+                "system_http_output",
+                {"interaction_id": "interaction-test", "filters": {}},
+                "empty-filter",
+            ),
+            _tool_call(
+                "system_http_output",
+                {"interaction_id": "interaction-test", "filters": {"body_contains": "needle"}},
+                "body-filter",
+            ),
+            _tool_call(
+                "system_http_output",
+                {"interaction_id": "interaction-test", "filters": {"body_regex": "n.*e"}},
+                "regex-filter",
+            ),
+        ]
+    )
+    assert all(item.result and item.result["ok"] for item in results)
+    by_name = [(name, type(arguments)) for name, arguments in received]
+    assert ("request", HttpRequestArguments) in by_name
+    assert ("probe", HttpProbeArguments) in by_name
+    assert sum(name == "output" for name, _arguments in received) == 3
+    probe = next(arguments for name, arguments in received if name == "probe")
+    assert isinstance(probe.cases[0], HttpProbeInputCase)
+    outputs = [arguments for name, arguments in received if name == "output"]
+    assert all(isinstance(item, HttpOutputArguments) for item in outputs)
+    assert all(isinstance(item.filters, HttpOutputFilters) for item in outputs)
+
+    rejected = await executor.execute(
+        [
+            _tool_call(
+                "system_http_request",
+                {"request": {"url": "https://target.test/"}},
+                "old-nested-request",
+            )
+        ]
+    )
+    assert rejected[0].result["error"]["stage"] == "schema"
+    assert len(received) == 5
 
 
 async def _manager(
@@ -35,11 +214,80 @@ async def _manager(
     engine = HttpInteractionEngine(policy, transport=httpx.MockTransport(handler))
     manager = HttpProbeManager(policy, service, "run-1", engine=engine)
     await manager.initialize()
+    install_resource_runtime(manager, service, "run-1", root=root)
     return service, manager, agent["agent_id"]
 
 
+async def _wait_for_http_start(
+    manager: HttpProbeManager, agent_id: str, interaction_id: str
+) -> None:
+    while True:
+        result = await manager.output(
+            agent_id, interaction_id=interaction_id, wait_seconds=0
+        )
+        if result["execution_status"] == "running":
+            return
+        await asyncio.sleep(0.001)
+
+
 @pytest.mark.asyncio
-async def test_request_persists_full_body_and_runs_async_analysis(tmp_path: Path) -> None:
+async def test_real_http_loopback_smoke(
+    tmp_path: Path, unused_tcp_port: int
+) -> None:
+    body = b"loopback-http-ok"
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", unused_tcp_port)
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "loopback" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("loopback")
+    agent = await service.register_agent(
+        "loopback", role="chief", initial_prompt="http loopback"
+    )
+    policy = WorkspacePolicy(tmp_path)
+    manager = HttpProbeManager(policy, service, "loopback")
+    await manager.initialize()
+    install_resource_runtime(manager, service, "loopback", root=tmp_path)
+    try:
+        result = await manager.start_request(
+            agent["agent_id"],
+            request=HttpRequestSpec(
+                request_intent="loopback_smoke",
+                url=f"http://127.0.0.1:{unused_tcp_port}/health",
+            ),
+            wait_seconds=None,
+        )
+        response = next(
+            item for item in result["results"] if item["type"] == "response"
+        )
+        assert response["status_code"] == 200
+        assert response["body_bytes"] == len(body)
+        assert response["outcome"] == "response"
+    finally:
+        await manager.finish_run()
+        await service.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_persists_full_body_and_runs_analysis_on_demand(tmp_path: Path) -> None:
     payload = b"<html><title>Probe</title><form action='/x'><input name='id'></form></html>"
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -58,8 +306,8 @@ async def test_request_persists_full_body_and_runs_async_analysis(tmp_path: Path
     assert result["completed_requests"] == 1
     request_id = result["results"][0]["request_id"]
 
-    live = manager._live[result["interaction_id"]]
-    await live.analysis_done.wait()
+    assert result["analysis_status"] == "not_requested"
+    assert result["recommended_action"] == "analyze_or_cleanup"
     analyzed = await manager.analyze(
         agent_id,
         interaction_id=result["interaction_id"],
@@ -121,6 +369,211 @@ async def test_template_matrix_file_range_and_typed_json(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_probe_size_limit_rejects_before_files_or_state(tmp_path: Path) -> None:
+    service, manager, agent_id = await _manager(
+        tmp_path, lambda _request: httpx.Response(200)
+    )
+    oversized = HttpProbeCase(
+        request=HttpRequestSpec(
+            request_intent="oversized",
+            url="https://target.test/{{left}}/{{right}}",
+        ),
+        variables={
+            "left": HttpVariableSource(range={"start": 0, "stop": 100}),
+            "right": HttpVariableSource(range={"start": 0, "stop": 51}),
+        },
+    )
+    with pytest.raises(SystemToolError) as caught:
+        await manager.start_probe(agent_id, cases=[oversized], wait_seconds=0)
+    assert caught.value.code == "http_probe_too_large"
+    assert await service.list_http_interactions("run-1", agent_id=agent_id) == []
+    interactions_root = manager._agent_root(agent_id) / "http-interactions"
+    assert not interactions_root.exists() or list(interactions_root.iterdir()) == []
+    await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_http_creation_transaction_rolls_back_and_cleans_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, manager, agent_id = await _manager(
+        tmp_path, lambda _request: httpx.Response(200)
+    )
+    original_event = service._event
+
+    async def fail_second_event(session, run_id, event_type, payload, **kwargs):
+        if event_type == "resource_work_queued":
+            raise RuntimeError("injected enqueue failure")
+        return await original_event(session, run_id, event_type, payload, **kwargs)
+
+    monkeypatch.setattr(service, "_event", fail_second_event)
+    with pytest.raises(RuntimeError, match="injected enqueue failure"):
+        await manager.start_request(
+            agent_id,
+            request=HttpRequestSpec(
+                request_intent="rollback", url="https://target.test/"
+            ),
+            wait_seconds=0,
+        )
+    assert await service.list_http_interactions("run-1", agent_id=agent_id) == []
+    assert await service.list_resource_work("run-1") == []
+    interactions_root = manager._agent_root(agent_id) / "http-interactions"
+    assert not interactions_root.exists() or list(interactions_root.iterdir()) == []
+    await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_reuses_pool_and_does_not_queue_automatic_analysis(
+    tmp_path: Path,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="ok")
+
+    service, manager, agent_id = await _manager(tmp_path, handler)
+    result = await manager.start_probe(
+        agent_id,
+        cases=[
+            HttpProbeCase(
+                request=HttpRequestSpec(
+                    request_intent="pool",
+                    url="https://target.test/{{id}}",
+                ),
+                variables={"id": HttpVariableSource(range={"start": 0, "stop": 50})},
+            )
+        ],
+        concurrency=8,
+        wait_seconds=None,
+    )
+    work = await service.list_resource_work(
+        "run-1", owner_id=result["interaction_id"]
+    )
+    assert [item["phase"] for item in work] == ["execution"]
+    assert result["analysis_status"] == "not_requested"
+    assert result["connection_pool"]["pool_count"] == 1
+    assert result["connection_pool"]["network_requests"] == 50
+    await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_redirect_cookies_are_local_and_independent_requests_do_not_inherit(
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed[request.url.path] = request.headers.get("cookie", "")
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302,
+                headers={"location": "/final", "set-cookie": "sid=redirect; Path=/"},
+            )
+        return httpx.Response(200, text="ok")
+
+    service, manager, agent_id = await _manager(tmp_path, handler)
+    await manager.start_probe(
+        agent_id,
+        cases=[
+            HttpProbeCase(
+                request=HttpRequestSpec(
+                    request_intent="redirect",
+                    url="https://target.test/redirect",
+                    follow_redirects=True,
+                )
+            ),
+            HttpProbeCase(
+                request=HttpRequestSpec(
+                    request_intent="independent",
+                    url="https://target.test/independent",
+                )
+            ),
+        ],
+        concurrency=2,
+        wait_seconds=None,
+    )
+    assert observed["/redirect"] == ""
+    assert observed["/final"] == "sid=redirect"
+    assert observed["/independent"] == ""
+    await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_probe_uses_no_more_connections_than_concurrency(
+    tmp_path: Path, unused_tcp_port: int
+) -> None:
+    accepted_connections = 0
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal accepted_connections
+        accepted_connections += 1
+        try:
+            while True:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    b"Connection: keep-alive\r\n\r\nok"
+                )
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", unused_tcp_port)
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "keepalive" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("keepalive")
+    agent = await service.register_agent(
+        "keepalive", role="chief", initial_prompt="keepalive"
+    )
+    policy = WorkspacePolicy(tmp_path)
+    manager = HttpProbeManager(
+        policy,
+        service,
+        "keepalive",
+        engine=HttpInteractionEngine(
+            policy, transport=httpx.AsyncHTTPTransport()
+        ),
+    )
+    await manager.initialize()
+    install_resource_runtime(manager, service, "keepalive", root=tmp_path)
+    try:
+        result = await manager.start_probe(
+            agent["agent_id"],
+            cases=[
+                HttpProbeCase(
+                    request=HttpRequestSpec(
+                        request_intent="keepalive",
+                        url=f"http://127.0.0.1:{unused_tcp_port}/{{{{id}}}}",
+                    ),
+                    variables={
+                        "id": HttpVariableSource(range={"start": 0, "stop": 50})
+                    },
+                )
+            ],
+            concurrency=8,
+            wait_seconds=None,
+        )
+        assert result["completed_requests"] == 50
+        assert accepted_connections <= 8
+        assert result["connection_pool"]["observed_connections"] <= 8
+        assert result["connection_pool"]["connection_reuses"] >= 42
+    finally:
+        await manager.finish_run()
+        await service.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_session_is_private_and_tracks_cookie_updates(tmp_path: Path) -> None:
     observed_cookie: list[str] = []
 
@@ -178,7 +631,12 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
         request=HttpRequestSpec(request_intent="status", url="https://target.test/"),
         wait_seconds=0,
     )
-    assert result["status"] == "running"
+    assert result["status"] == "queued"
+    await asyncio.wait_for(
+        asyncio.create_task(_wait_for_http_start(manager, agent_id, result["interaction_id"])),
+        timeout=1,
+    )
+    assert result["recommended_wait_seconds"] == 20
     assert result["request_id"].startswith("request-")
     release.set()
     live = manager._live[result["interaction_id"]]
@@ -186,6 +644,10 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
     first = await manager.output(agent_id, interaction_id=result["interaction_id"])
     second = await manager.output(agent_id, interaction_id=result["interaction_id"])
     assert first["results"] == second["results"]
+    assert first["analysis_status"] == "not_requested"
+    assert first["recommended_action"] == "analyze_or_cleanup"
+    finished = await manager.output(agent_id, interaction_id=result["interaction_id"])
+    assert finished["recommended_wait_seconds"] == 0
     assert calls == 1
     await manager.finish_run()
     await service.close()
@@ -260,8 +722,18 @@ async def test_ownership_and_resource_disk_admission(tmp_path: Path) -> None:
     await service.close()
 
 
-def test_http_tool_contract_and_audit_redaction() -> None:
-    definitions = HttpTools.tool_definitions()
+def test_http_tool_contract_and_plaintext_audit(tmp_path: Path) -> None:
+    service = StateService(tmp_path / "state.sqlite3")
+    policy = WorkspacePolicy(tmp_path)
+    manager = HttpProbeManager(policy, service, "run-1")
+    from agent.tooling import ToolRegistry
+
+    definitions = ToolRegistry([HttpTools(manager.bind("execution-test"))]).definitions()
+    schema_chars = sum(
+        len(json.dumps(item["function"]["parameters"], separators=(",", ":")))
+        for item in definitions
+    )
+    assert schema_chars <= 17_500
     names = [item["function"]["name"] for item in definitions]
     assert names == [
         "system_http_request",
@@ -272,41 +744,49 @@ def test_http_tool_contract_and_audit_redaction() -> None:
         "system_http_output",
         "system_http_response",
         "system_http_stop",
-        "system_http_cleanup",
     ]
     descriptions = {
         item["function"]["name"]: item["function"]["description"]
         for item in definitions
     }
-    assert "one new HTTP request" in descriptions["system_http_request"]
-    assert "response-dependent request chains" in descriptions["system_http_probe"]
-    assert "high-throughput web path discovery" in descriptions["system_web_path_probe"]
+    assert "one fresh HTTP request" in descriptions["system_http_request"]
+    assert "finite matrix" in descriptions["system_http_probe"]
+    assert "bounded web path discovery" in descriptions["system_web_path_probe"]
     assert "web technology stack" in descriptions["system_web_fingerprint"]
-    assert "never sends network traffic" in descriptions["system_http_output"]
+    assert "never resends traffic" in descriptions["system_http_output"]
     request_schema = next(
         item["function"]["parameters"]
         for item in definitions
         if item["function"]["name"] == "system_http_request"
     )
-    request_properties = request_schema["$defs"]["HttpRequestSpec"]["properties"]
+    request_properties = request_schema["properties"]
     assert "http://" in request_properties["url"]["description"]
-    assert "request_intent" in request_properties
-    redacted = redact_tool_payload(
+    assert "request" not in request_properties
+    assert "request_intent" not in request_properties
+    assert "connection_context_id" not in request_properties
+    probe_definition = next(
+        item["function"]
+        for item in definitions
+        if item["function"]["name"] == "system_http_probe"
+    )
+    assert "variables/combine" in probe_definition["description"]
+    assert "ordered multi-step protocols" in probe_definition["description"]
+    assert "variables" not in probe_definition["parameters"]["properties"]
+    assert "session_id" not in probe_definition["parameters"]["properties"]
+    plaintext = redact_tool_payload(
         "system_http_request",
         {
-            "request": {
-                "url": "https://x.test/?token=secret",
-                "headers": {"Authorization": "Bearer secret", "Cookie": "sid=secret"},
-                "body": {"type": "raw", "value": "secret"},
-            }
+            "url": "https://x.test/?token=secret",
+            "headers": {"Authorization": "Bearer secret", "Cookie": "sid=secret"},
+            "body": {"type": "raw", "value": "secret"},
         },
     )
-    encoded = json.dumps(redacted)
-    assert "Bearer secret" not in encoded
-    assert "sid=secret" not in encoded
-    assert '"value": "secret"' not in encoded
+    encoded = json.dumps(plaintext)
+    assert "Bearer secret" in encoded
+    assert "sid=secret" in encoded
+    assert '"value": "secret"' in encoded
 
-    path_redacted = redact_tool_payload(
+    path_plaintext = redact_tool_payload(
         "system_web_path_probe",
         {
             "url": "https://x.test/",
@@ -316,9 +796,9 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(path_redacted)
+    assert "secret" in json.dumps(path_plaintext)
 
-    fingerprint_redacted = redact_tool_payload(
+    fingerprint_plaintext = redact_tool_payload(
         "system_web_fingerprint",
         {
             "url": "https://x.test/",
@@ -326,7 +806,7 @@ def test_http_tool_contract_and_audit_redaction() -> None:
             "cookies": {"sid": "secret"},
         },
     )
-    assert "secret" not in json.dumps(fingerprint_redacted)
+    assert "secret" in json.dumps(fingerprint_plaintext)
 
 
 def test_zip_expansion_and_unresolved_variables_are_validated(tmp_path: Path) -> None:
@@ -389,8 +869,6 @@ async def test_similarity_groups_force_revision_and_analysis_field_selection(
         ],
         wait_seconds=None,
     )
-    live = manager._live[result["interaction_id"]]
-    await live.analysis_done.wait()
     analyzed = await manager.analyze(
         agent_id, interaction_id=result["interaction_id"], wait_seconds=None
     )
@@ -484,7 +962,6 @@ async def test_request_group_isolation_and_terminal_cleanup_metadata(
         )
     assert caught.value.code == "request_group_not_found"
 
-    await manager._live[first["interaction_id"]].analysis_done.wait()
     cleaned = await manager.cleanup(agent_id, interaction_id=first["interaction_id"])
     repeated = await manager.cleanup(agent_id, interaction_id=first["interaction_id"])
     stopped = await manager.stop(agent_id, interaction_id=first["interaction_id"])
@@ -574,7 +1051,6 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
         service,
         "run-1",
         storage_root=tmp_path,
-        start_interval_seconds=0,
         psutil_module=FakePsutil,
     )
     manager = HttpProbeManager(
@@ -582,7 +1058,6 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
         service,
         "run-1",
         engine=HttpInteractionEngine(policy, transport=httpx.MockTransport(handler)),
-        admission_callback=controller.admit_resource_work,
         resource_guard=controller.check_resource_work,
     )
     result = await manager.start_request(
@@ -593,15 +1068,19 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
         wait_seconds=0,
     )
     assert result["status"] == "queued"
-    assert result["resource_admission"]["reason"] == "cpu_limit"
+    work = (await service.list_resource_work("run-1", owner_id=result["interaction_id"]))[0]
+    denied = await controller.admit_resource_work(work["work_id"])
+    assert denied["reason"] == "cpu_limit"
 
     FakePsutil.cpu = 0.0
-    work = (await service.list_resource_work("run-1", owner_id=result["interaction_id"]))[0]
     decision = await controller.admit_resource_work(work["work_id"])
     assert decision["ok"] is True
+    claim = await controller.claim_resource_work(work["work_id"])
+    assert claim["claimed"] is True
     await manager.launch_work(
         result["interaction_id"], work["phase"], work_id=work["work_id"]
     )
+    await controller.mark_resource_started(work["work_id"])
     await manager._live[result["interaction_id"]].execution_done.wait()
     completed = await manager.output(
         agent["agent_id"], interaction_id=result["interaction_id"]
@@ -612,7 +1091,7 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
 
 
 @pytest.mark.asyncio
-async def test_resume_reanalyzes_landed_response_without_replaying_request(
+async def test_resume_keeps_landed_response_and_analysis_remains_on_demand(
     tmp_path: Path,
 ) -> None:
     calls = 0
@@ -629,41 +1108,42 @@ async def test_resume_reanalyzes_landed_response_without_replaying_request(
     policy = WorkspacePolicy(tmp_path)
     engine = HttpInteractionEngine(policy, transport=httpx.MockTransport(handler))
 
-    async def queue_analysis(work_id: str) -> dict:
-        if "-analysis-" in work_id:
-            queued = await service.update_resource_work(
-                "run-1", work_id, status="queued", reason="test_pause"
-            )
-            return {"ok": False, **queued}
-        reserved = await service.update_resource_work(
-            "run-1", work_id, status="reserved"
-        )
-        return {"ok": True, **reserved}
-
     manager = HttpProbeManager(
         policy,
         service,
         "run-1",
         engine=engine,
-        admission_callback=queue_analysis,
     )
     result = await manager.start_request(
         agent["agent_id"],
         request=HttpRequestSpec(
             request_intent="resume analysis", url="https://target.test/"
         ),
-        wait_seconds=None,
+        wait_seconds=0,
     )
+    controller = ResourceController(service, "run-1", storage_root=tmp_path)
+    execution_work = (await service.list_resource_work(
+        "run-1", owner_id=result["interaction_id"], statuses={"queued"}
+    ))[0]
+    await controller.admit_resource_work(
+        execution_work["work_id"], sample={"cpu_percent": 0.0, "memory_percent": 0.0}
+    )
+    assert (await controller.claim_resource_work(execution_work["work_id"]))["claimed"]
+    await manager.launch_work(
+        result["interaction_id"], execution_work["phase"], work_id=execution_work["work_id"]
+    )
+    await controller.mark_resource_started(execution_work["work_id"])
+    await manager._live[result["interaction_id"]].execution_done.wait()
+    result = await manager.output(agent["agent_id"], interaction_id=result["interaction_id"])
     assert result["execution_status"] == "completed"
-    assert result["analysis_status"] == "queued"
+    assert result["analysis_status"] == "not_requested"
     await manager.pause_run()
 
     resumed = HttpProbeManager(policy, service, "run-1", engine=engine)
     await resumed.initialize(resume=True)
-    live = resumed._live[result["interaction_id"]]
-    await live.analysis_done.wait()
-    output = await resumed.output(
-        agent["agent_id"], interaction_id=result["interaction_id"]
+    install_resource_runtime(resumed, service, "run-1", root=tmp_path)
+    output = await resumed.analyze(
+        agent["agent_id"], interaction_id=result["interaction_id"], wait_seconds=None
     )
     assert output["status"] == "completed"
     assert output["analysis_status"] == "completed"

@@ -27,6 +27,11 @@ Pass ``--vpn`` to start and own the single OpenVPN profile under
 """
 
 from __future__ import annotations
+from scripts.runtime_web import RuntimeMonitor
+from scripts.network_manager import VPNManager, discover_vpn_config
+from agent.runner import AgentRunner, ToolRegistry
+from agent.runtime import AgentRuntime
+from agent.config import AgentSettings
 
 import argparse
 import asyncio
@@ -35,16 +40,12 @@ import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from pydantic import BaseModel, ConfigDict, Field
+from agent.tooling import AccessClaim, ToolExecutor, ToolSpec
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from agent.config import AgentSettings
-from agent.runtime import AgentRuntime
-from agent.runner import AgentRunner, ToolRegistry
-from scripts.network_manager import VPNManager, discover_vpn_config
-from scripts.runtime_web import RuntimeMonitor
 
 
 # Local-only challenge slots. The name becomes the internal SQLite challenge
@@ -52,12 +53,70 @@ from scripts.runtime_web import RuntimeMonitor
 # context. Add more dictionaries to test multiple challenge branches.
 CHALLENGES: list[dict[str, Any]] = [
     {
-        "name": "web",
-        "description": "ctf-web",
+        "name": "test",
+        "description": "test1",
         "address": "http://www.dlhayashi.com/",
         "mission": (
             "Test the configured CTF address with the available tools. Do not "
             "request hints, submit flags, or close the challenge."
+        ),
+    },
+    {
+        "name": "test2",
+        "description": "test2",
+        "address": "43.139.231.237:8014",
+        "mission": (
+            "Test the configured CTF address with the available tools. Do not "
+            "request hints, submit flags, or close the challenge."
+        ),
+    },
+    {
+        "name": "test3",
+        "description": "test3",
+        "address": "43.139.231.237:8006",
+        "mission": (
+            "Test the configured CTF address with the available tools. Do not "
+            "request hints, submit flags, or close the challenge."
+        ),
+    },
+    {
+        "name": "web-sqli",
+        "description": "Web SQL injection in the login parameter",
+        "address": "http://127.0.0.1:8001/",
+        "mission": (
+            "Web direction fixture: identify the SQL injection in the login "
+            "flow, verify it with one bounded probe, and report evidence. Do "
+            "not request hints or submit flags."
+        ),
+    },
+    {
+        "name": "binary-reverse",
+        "description": "Binary reverse engineering of an ELF key check",
+        "address": "artifact",
+        "mission": (
+            "Binary direction fixture: identify the attached ELF, extract "
+            "symbols and strings, recover the key check, and report evidence. "
+            "Do not request hints or submit flags."
+        ),
+    },
+    {
+        "name": "exploit-pwn",
+        "description": "Stack overflow exploitation against a pwn service",
+        "address": "127.0.0.1:1337",
+        "mission": (
+            "Exploit direction fixture: identify the binary, inspect "
+            "protections with bin_checksec, plan a bounded ROP chain, and "
+            "report evidence. Do not request hints or submit flags."
+        ),
+    },
+    {
+        "name": "pentest-weak-credential",
+        "description": "Multi-stage penetration test with a weak credential",
+        "address": "127.0.0.1:8022",
+        "mission": (
+            "Pentest direction fixture: probe the service, look up common "
+            "credentials, and follow one bounded privilege path. Do not "
+            "request hints or submit flags."
         ),
     },
 ]
@@ -146,6 +205,22 @@ TERMINAL_AGENT_STATUSES = frozenset(
 DEFAULT_WAIT_SECONDS = 0.0
 
 
+class _LocalArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _LocalEmpty(_LocalArguments):
+    pass
+
+
+class _LocalUniqueCode(_LocalArguments):
+    unique_code: str = Field(min_length=1)
+
+
+class _LocalSubmitFlag(_LocalUniqueCode):
+    flag: str = Field(min_length=1, max_length=4096)
+
+
 class LocalChallengeBenchmark:
     """Offline Benchmark-shaped adapter backed by the configured CTF slots."""
 
@@ -155,7 +230,7 @@ class LocalChallengeBenchmark:
         }
         self._started: set[str] = set()
 
-    async def dispatch(
+    async def _execute(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         arguments = arguments or {}
@@ -218,6 +293,33 @@ class LocalChallengeBenchmark:
             },
         }
 
+    def tool_specs(self) -> list[ToolSpec]:
+        specs: list[ToolSpec] = []
+        for name, model, mode in (
+            ("benchmark_list_challenges", _LocalEmpty, "read"),
+            ("benchmark_start_challenge", _LocalUniqueCode, "write"),
+            ("benchmark_get_hint", _LocalUniqueCode, "write"),
+            ("benchmark_submit_flag", _LocalSubmitFlag, "write"),
+            ("benchmark_close_challenge", _LocalUniqueCode, "write"),
+        ):
+            async def handler(
+                arguments: BaseModel, tool_name: str = name
+            ) -> dict[str, Any]:
+                return await self._execute(tool_name, arguments.model_dump())
+
+            specs.append(
+                ToolSpec(
+                    name,
+                    f"Local smoke-test implementation for {name}.",
+                    model,
+                    handler,
+                    access_claims=lambda _arguments, claim_mode=mode: (
+                        AccessClaim(claim_mode, "benchmark"),
+                    ),
+                )
+            )
+        return specs
+
     def _state(self, challenge: dict[str, Any]) -> dict[str, Any]:
         unique_code = challenge["unique_code"]
         return {
@@ -248,7 +350,7 @@ def guarded_runner_factory(
     disabled = ROLE_DISABLED_TOOLS.get(role, frozenset())
     if disabled:
         allowed = (registry.allowed_tools or set()) - set(disabled)
-        registry = ToolRegistry(registry.wrappers, allowed_tools=allowed)
+        registry = ToolRegistry(registry.providers, allowed_tools=allowed)
     return GuardedAgentRunner(settings, registry, **kwargs)
 
 
@@ -276,7 +378,8 @@ def _selected_challenges(override: str | None) -> list[dict[str, Any]]:
         if isinstance(raw_address, str):
             addresses = [raw_address.strip()] if raw_address.strip() else []
         elif isinstance(raw_address, list):
-            addresses = [str(value).strip() for value in raw_address if str(value).strip()]
+            addresses = [str(value).strip()
+                         for value in raw_address if str(value).strip()]
         else:
             addresses = []
         if not addresses:
@@ -544,7 +647,8 @@ async def run_test(
                     )
                     result_message = f"challenge agent failed: {unique_code}"
                     break
-                started_agents.append((unique_code, result["data"]["agent_id"]))
+                started_agents.append(
+                    (unique_code, result["data"]["agent_id"]))
                 print(f"[quick-test] challenge agent started: {unique_code}")
             else:
                 result_code = 0
@@ -568,11 +672,13 @@ async def run_test(
                 if expected_codes.issubset(actual_codes):
                     for item in overview["agents"]:
                         if item["role"] == "challenge" and item["unique_code"] in expected_codes:
-                            started_agents.append((item["unique_code"], item["agent_id"]))
+                            started_agents.append(
+                                (item["unique_code"], item["agent_id"]))
                     break
                 await asyncio.sleep(1)
             if len(started_agents) != len(expected_codes):
-                print("[quick-test] Chief did not create all configured Challenge Agents")
+                print(
+                    "[quick-test] Chief did not create all configured Challenge Agents")
                 result_message = "Chief did not create all configured Challenge Agents"
             else:
                 print("[quick-test] Chief created the configured Challenge Agents")
@@ -650,9 +756,11 @@ async def run_test(
                     if challenge and challenge["container_status"] in {"starting", "running"}:
                         close_result = await runtime.supervisor.close_challenge(challenge_agent_id)
                         if close_result.get("ok"):
-                            print(f"[quick-test] local challenge slot closed: {unique_code}")
+                            print(
+                                f"[quick-test] local challenge slot closed: {unique_code}")
                         else:
-                            print(f"[quick-test] local challenge slot close failed: {unique_code}")
+                            print(
+                                f"[quick-test] local challenge slot close failed: {unique_code}")
         finally:
             await runtime.close()
             if network_manager is not None:
@@ -662,10 +770,12 @@ async def run_test(
                     monitor.freeze(result_code, message=result_message)
                     print(f"[quick-test] monitor frozen: {monitor.url}")
                     if not monitor_exit_on_complete and not interrupted:
-                        print("[quick-test] press Ctrl-C to close the frozen monitor")
+                        print(
+                            "[quick-test] press Ctrl-C to close the frozen monitor")
                         await _wait_for_monitor_exit()
                 except Exception as exc:
-                    print(f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}")
+                    print(
+                        f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}")
                 finally:
                     monitor.close()
 

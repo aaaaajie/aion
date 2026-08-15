@@ -1,165 +1,122 @@
-"""Agent-facing wrapper for generic HTTP interaction capabilities."""
+"""Agent-facing Tool Specs for generic HTTP interactions."""
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-from tools.system.policy import SystemToolError
+from agent.tooling import AccessClaim, ToolSpec
 
 from .manager import AgentHttpClient
 from .models import (
+    FingerprintArguments,
     HttpAnalyzeArguments,
     HttpCleanupArguments,
     HttpOutputArguments,
-    FingerprintArguments,
-    PathProbeArguments,
     HttpProbeArguments,
     HttpRequestArguments,
     HttpResponseArguments,
     HttpStopArguments,
+    PathProbeArguments,
 )
 
 
-def _definition(name: str, description: str, model: type[BaseModel]) -> dict[str, Any]:
-    schema = model.model_json_schema()
-    schema.setdefault("additionalProperties", False)
-    return {
-        "type": "function",
-        "function": {"name": name, "description": description, "parameters": schema},
-    }
-
-
 class HttpTools:
-    """Expose one Agent-bound HTTP engine through fixed JSON contracts."""
-
-    _ROUTES: ClassVar[dict[str, tuple[type[BaseModel], str]]] = {
-        "system_http_request": (HttpRequestArguments, "request"),
-        "system_http_probe": (HttpProbeArguments, "probe"),
-        "system_web_path_probe": (PathProbeArguments, "path_probe"),
-        "system_web_fingerprint": (FingerprintArguments, "fingerprint"),
-        "system_http_analyze": (HttpAnalyzeArguments, "analyze"),
-        "system_http_output": (HttpOutputArguments, "output"),
-        "system_http_response": (HttpResponseArguments, "response"),
-        "system_http_stop": (HttpStopArguments, "stop"),
-        "system_http_cleanup": (HttpCleanupArguments, "cleanup"),
-    }
-    _TOOL_DEFINITIONS: ClassVar[list[dict[str, Any]]] = [
-        _definition(
-            "system_http_request",
-            "Use for one new HTTP request when the method, URL, parameters, body, and optional Session are already known. It always sends a fresh request. Capture the returned interaction_id/request_id; if the result is queued or running, poll with system_http_output instead of calling this tool again.",
-            HttpRequestArguments,
-        ),
-        _definition(
-            "system_http_probe",
-            "Use for many independent requests generated from finite values, ranges, or workspace files. Choose product for every combination and zip for ordinal pairs. It is for a matrix, not for response-dependent request chains; use separate system_http_request calls with the same session_id for those.",
-            HttpProbeArguments,
-        ),
-        _definition(
-            "system_web_path_probe",
-            "Use after HTTP services are known, and normally after system_web_fingerprint, for high-throughput web path discovery against one base URL. Pick quick for the first surface pass, targeted from the identified stack, and deep for final coverage. This tool discovers paths only: it does not issue implicit homepage/favicon fingerprint requests. Its wordlist plan streams to disk and Runtime controls resource admission. Keep interaction_id and poll with system_http_output; never create another path task merely to check status. Recursion is explicit and only GET/HEAD is supported.",
-            PathProbeArguments,
-        ),
-        _definition(
-            "system_web_fingerprint",
-            "Use to identify the web technology stack on each discovered HTTP service before choosing a targeted/deep path profile. The passive phase reuses one homepage/Header/title/favicon response across TscanPlus, Yakit and EHole rules; the active phase probes known component paths. Results include stable rule_id, merged rule_sources and evidence. Keep interaction_id and poll with system_http_output; polling does not resend traffic. Use system_http_probe instead for parameter, Header, Cookie or Body variants.",
-            FingerprintArguments,
-        ),
-        _definition(
-            "system_http_analyze",
-            "Use after a request or probe to wait for or read deterministic response analysis: content features, structured summaries, exact groups, and similarity groups. Automatic analysis does not resend traffic. Set force=true only to append a new analysis revision for selected requests/groups.",
-            HttpAnalyzeArguments,
-        ),
-        _definition(
-            "system_http_output",
-            "Use to poll an existing interaction and read compact response/analysis records with a cursor and filters. This tool is idempotent and never sends network traffic; use it for queued, running, analyzing, or background work.",
-            HttpOutputArguments,
-        ),
-        _definition(
-            "system_http_response",
-            "Use only when structured output is insufficient and exact Body evidence is needed. Read one owned request Body by byte range; continue with the returned next_offset. Text is decoded and binary data is base64 encoded.",
-            HttpResponseArguments,
-        ),
-        _definition(
-            "system_http_stop",
-            "Use to cancel an owned queued, running, or analyzing interaction. It is idempotent and preserves already stored responses; it does not resend or clean the output.",
-            HttpStopArguments,
-        ),
-        _definition(
-            "system_http_cleanup",
-            "Use only after an interaction reaches a terminal state and no further output or Body evidence is needed. It deletes private files, keeps audit metadata, and repeated cleanup is safe.",
-            HttpCleanupArguments,
-        ),
-    ]
+    """Expose one Agent-bound HTTP engine through the shared ToolExecutor."""
 
     def __init__(self, client: AgentHttpClient) -> None:
         self._client = client
 
-    @classmethod
-    def tool_definitions(cls) -> list[dict[str, Any]]:
-        return deepcopy(cls._TOOL_DEFINITIONS)
-
-    async def dispatch(self, name: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        route = self._ROUTES.get(name)
-        if route is None:
-            return self._failure("validation", "unknown_tool", "Unknown HTTP tool")
-        if arguments is None:
-            arguments = {}
-        if not isinstance(arguments, Mapping):
-            return self._failure("validation", "invalid_arguments", "Tool arguments must be an object")
-        model, operation_name = route
-        try:
-            validated = model.model_validate(arguments)
-            operation: Callable[..., Awaitable[dict[str, Any]]] = getattr(self._client, operation_name)
-            result = await operation(
-                **{name: getattr(validated, name) for name in type(validated).model_fields}
-            )
-            return {"ok": True, "data": result}
-        except ValidationError as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "type": "validation",
-                    "code": "invalid_arguments",
-                    "message": "Invalid HTTP-tool arguments",
-                    "status_code": None,
-                    "detail": [
-                        {key: item[key] for key in ("loc", "msg", "type") if key in item}
-                        for item in exc.errors()
-                    ],
-                },
-            }
-        except SystemToolError as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "type": exc.error_type,
-                    "code": exc.code,
-                    "message": exc.message,
-                    "status_code": None,
-                    "detail": exc.detail,
-                },
-            }
-        except (OSError, ValueError):
-            return self._failure("internal", "http_operation_failed", "HTTP operation could not be completed")
-        except Exception:
-            return self._failure("internal", "http_internal_error", "HTTP tool failed unexpectedly")
+    def tool_specs(self) -> list[ToolSpec]:
+        return [
+            self._spec("system_http_request", "Send one fresh HTTP request from top-level method/URL fields. Reuse session_id for ordered multi-step protocols; poll the returned interaction_id instead of replaying work.", HttpRequestArguments, self._client.request, self._request_claims, self._page_projection),
+            self._spec("system_http_probe", "Generate at most 5,000 independent requests from a finite matrix. Use top-level cases (a single case may be supplied as an object and is normalized to a list); put variables/combine inside each case and keep concurrency/rate_limit_per_second/wait_seconds at the top level. Probe never accepts request, top-level variables/combine, or session_id. Example: {\"cases\":[{\"method\":\"GET\",\"url\":\"http://host/{{path}}\",\"variables\":{\"path\":{\"values\":[\"/\",\"/admin\"],\"encoding\":\"path\"}}}],\"concurrency\":8,\"wait_seconds\":20}. Use system_http_request with session_id for ordered multi-step protocols.", HttpProbeArguments, self._client.probe, self._new_interaction_claims, self._page_projection),
+            self._spec("system_web_path_probe", "Run bounded web path discovery for one base URL. Preserve interaction_id and poll for status.", PathProbeArguments, self._client.path_probe, self._scan_claims, self._page_projection),
+            self._spec("system_web_fingerprint", "Identify the web technology stack using passive and optional active evidence.", FingerprintArguments, self._client.fingerprint, self._scan_claims, self._page_projection),
+            self._spec("system_http_analyze", "Create or read on-demand deterministic analysis for an existing HTTP interaction without resending traffic.", HttpAnalyzeArguments, self._client.analyze, self._interaction_write, self._page_projection),
+            self._spec("system_http_output", "Poll compact response and analysis records for an existing interaction. This never resends traffic.", HttpOutputArguments, self._client.output, self._interaction_read, self._page_projection),
+            self._spec("system_http_response", "Read an exact owned response Body by byte range.", HttpResponseArguments, self._client.response, self._interaction_read),
+            self._spec("system_http_stop", "Cancel an owned queued, running, or analyzing interaction while preserving stored output.", HttpStopArguments, self._client.stop, self._interaction_write),
+        ]
 
     async def close(self) -> None:
         await self._client.close()
 
     @staticmethod
-    def _failure(error_type: str, code: str, message: str) -> dict[str, Any]:
-        return {
-            "ok": False,
-            "error": {
-                "type": error_type,
-                "code": code,
-                "message": message,
-                "status_code": None,
-                "detail": {},
-            },
+    def _spec(
+        name: str,
+        description: str,
+        model: type[BaseModel],
+        operation: Callable[[Any], Awaitable[dict[str, Any]]],
+        claims: Callable[[BaseModel], tuple[AccessClaim, ...]],
+        projector: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    ) -> ToolSpec:
+        async def handler(arguments: BaseModel) -> Any:
+            return await operation(arguments)
+
+        return ToolSpec(
+            name,
+            description,
+            model,
+            handler,
+            access_claims=claims,
+            result_projector=projector,
+        )
+
+    @staticmethod
+    def _request_claims(arguments: BaseModel) -> tuple[AccessClaim, ...]:
+        session = getattr(arguments, "session_id", None)
+        if session:
+            return (AccessClaim("write", f"http-session:{session}"),)
+        return (AccessClaim("write", f"http-new:{id(arguments)}"),)
+
+    @staticmethod
+    def _new_interaction_claims(arguments: BaseModel) -> tuple[AccessClaim, ...]:
+        return (AccessClaim("write", f"http-new:{id(arguments)}"),)
+
+    @staticmethod
+    def _scan_claims(arguments: BaseModel) -> tuple[AccessClaim, ...]:
+        session = getattr(arguments, "session_id", None)
+        if session:
+            return (AccessClaim("read", f"http-session:{session}"),)
+        return HttpTools._new_interaction_claims(arguments)
+
+    @staticmethod
+    def _interaction_read(arguments: BaseModel) -> tuple[AccessClaim, ...]:
+        return (AccessClaim("read", f"http-interaction:{arguments.interaction_id}"),)
+
+    @staticmethod
+    def _interaction_write(arguments: BaseModel) -> tuple[AccessClaim, ...]:
+        return (AccessClaim("write", f"http-interaction:{arguments.interaction_id}"),)
+
+    @staticmethod
+    def _page_projection(result: Mapping[str, Any]) -> Mapping[str, Any]:
+        data = result.get("data")
+        if not isinstance(data, Mapping):
+            return {}
+        projected = {
+            key: data.get(key)
+            for key in (
+                "interaction_id",
+                "request_id",
+                "status",
+                "execution_status",
+                "analysis_status",
+                "resource_status",
+                "cursor",
+                "next_cursor",
+                "recommended_wait_seconds",
+                "recommended_action",
+                "is_terminal",
+                "can_cleanup",
+                "connection_pool",
+                "request_catalog",
+            )
+            if key in data
         }
+        results = data.get("results")
+        if isinstance(results, list):
+            projected["result_count"] = len(results)
+        return projected

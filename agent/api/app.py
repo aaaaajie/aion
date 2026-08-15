@@ -13,12 +13,9 @@ from fastapi.responses import JSONResponse
 from agent.state.capabilities import CapabilityRegistry
 from agent.state.errors import StateError
 from agent.state.schemas import (
-    AgentProgressInput,
     AgentReportInput,
-    AnalysisPlanInput,
     CapabilityContext,
-    CreateCycleInput,
-    VerificationUpdateInput,
+    ChallengeDispatchInput,
 )
 from agent.state.service import StateService
 
@@ -83,35 +80,11 @@ def create_state_app(
             raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
         return await state_service.get_challenge_context(run_id, unique_code, context)
 
-    @app.post("/internal/v1/runs/{run_id}/challenges/{unique_code}/cycles")
-    async def begin_cycle(run_id: str, unique_code: str, payload: CreateCycleInput, context: Cap) -> dict:
+    @app.post("/internal/v1/runs/{run_id}/challenges/{unique_code}/dispatch")
+    async def dispatch_challenge(run_id: str, unique_code: str, payload: ChallengeDispatchInput, context: Cap) -> dict:
         if context.run_id != run_id:
             raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
-        return await state_service.begin_cycle(run_id, unique_code, context, payload)
-
-    @app.put("/internal/v1/runs/{run_id}/cycles/{cycle_id}/analysis-plan")
-    async def analysis_plan(run_id: str, cycle_id: str, payload: AnalysisPlanInput, context: Cap) -> dict:
-        if context.run_id != run_id:
-            raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
-        return await state_service.submit_analysis_plan(run_id, cycle_id, context, payload)
-
-    @app.put("/internal/v1/runs/{run_id}/cycles/{cycle_id}/verification-update")
-    async def verification_update(run_id: str, cycle_id: str, payload: VerificationUpdateInput, context: Cap) -> dict:
-        if context.run_id != run_id:
-            raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
-        return await state_service.commit_cycle(run_id, cycle_id, context, payload)
-
-    @app.get("/internal/v1/runs/{run_id}/agents/{agent_id}/assignment")
-    async def assignment(run_id: str, agent_id: str, context: Cap) -> dict:
-        if context.run_id != run_id:
-            raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
-        return await state_service.get_assignment(run_id, agent_id, context)
-
-    @app.post("/internal/v1/runs/{run_id}/agents/{agent_id}/progress")
-    async def progress(run_id: str, agent_id: str, payload: AgentProgressInput, context: Cap) -> dict:
-        if context.run_id != run_id:
-            raise StateError("invalid_capability", "capability is not valid for this run", status_code=403)
-        return await state_service.update_progress(run_id, agent_id, context, payload)
+        return await state_service.dispatch_challenge(run_id, unique_code, context, payload)
 
     @app.post("/internal/v1/runs/{run_id}/agents/{agent_id}/reports")
     async def report(run_id: str, agent_id: str, payload: AgentReportInput, context: Cap) -> dict:

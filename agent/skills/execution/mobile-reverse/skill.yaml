@@ -1,0 +1,62 @@
+id: binary.mobile_reverse
+name: Mobile Reverse
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Use for authorized Android or iOS application reverse engineering and security testing, including APK or IPA analysis, runtime instrumentation, SSL pinning, and platform protection checks.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - mobile
+  - reverse
+  - use
+  - authorized
+  - android
+  - ios
+  - application
+  - engineering
+  - security
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - burpsuite
+  - ghidra
+  - ida
+  - radare2
+  - frida
+  - objection
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - MOBILE_REVERSE
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- mobile
+- reverse
+- use
+- authorized
+- android
+- ios
+- application

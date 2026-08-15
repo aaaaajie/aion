@@ -41,9 +41,11 @@ class FileSystemService:
         self,
         file_path: str,
         offset: int | None = None,
-        limit: int | None = None,
+        limit_chars: int | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._read_file, file_path, offset, limit)
+        return await asyncio.to_thread(
+            self._read_file, file_path, offset, limit_chars
+        )
 
     async def write_file(self, file_path: str, content: str) -> dict[str, Any]:
         return await asyncio.to_thread(self._write_file, file_path, content)
@@ -61,6 +63,13 @@ class FileSystemService:
             old_string,
             new_string,
             replace_all,
+        )
+
+    async def evidence_snapshot(self, file_path: str) -> str:
+        """Read the exact final UTF-8 file while the caller still owns its lock."""
+
+        return await asyncio.to_thread(
+            self.policy.resolve(file_path).read_text, encoding="utf-8"
         )
 
     async def create_directory(self, path: str, parents: bool = True) -> dict[str, Any]:
@@ -111,7 +120,7 @@ class FileSystemService:
         self,
         file_path: str,
         offset: int | None,
-        limit: int | None,
+        limit_chars: int | None,
     ) -> dict[str, Any]:
         path = self.policy.resolve(file_path, must_exist=True)
         if not path.is_file():
@@ -119,66 +128,90 @@ class FileSystemService:
 
         try:
             size = path.stat().st_size
-            full_read = offset is None and limit is None
+            full_read = offset is None and limit_chars is None
             if full_read and size > MAX_READ_BYTES:
                 raise self._error(
                     "validation",
                     "file_too_large",
-                    "File is too large for a full read; provide offset and limit",
+                    "File is too large for a full read; provide offset and limit_chars",
                     {"size_bytes": size, "max_bytes": MAX_READ_BYTES},
                 )
-            if size > MAX_READ_BYTES and limit is None:
+            if size > MAX_READ_BYTES and limit_chars is None:
                 raise self._error(
                     "validation",
                     "file_too_large",
-                    "Large files require a line limit for safe reading",
+                    "Large files require limit_chars for safe reading",
                     {"size_bytes": size, "max_bytes": MAX_READ_BYTES},
                 )
 
+            start = offset or 0
             if size <= MAX_READ_BYTES:
                 data = path.read_bytes()
                 text = self._decode_text(data)
-                lines = text.splitlines(keepends=True)
-                start = offset or 0
-                end = len(lines) if limit is None else start + limit
-                selected = lines[start:end]
+                end = len(text) if limit_chars is None else start + limit_chars
+                content = text[start:end]
+                truncated = end < len(text)
                 snapshot = self._snapshot(path, data, full_read)
             else:
-                start = offset or 0
-                selected = []
-                selected_bytes = 0
+                remaining_skip = start
+                remaining_take = int(limit_chars or 0)
+                chunks: list[str] = []
+                has_more = False
                 with path.open("r", encoding="utf-8", newline="") as stream:
-                    for line_number, line in enumerate(stream):
-                        if line_number < start:
-                            continue
-                        if limit is not None and len(selected) >= limit:
+                    while remaining_take > 0:
+                        read_chars = min(
+                            64 * 1024,
+                            remaining_skip + remaining_take + 1,
+                        )
+                        chunk = stream.read(read_chars)
+                        if not chunk:
                             break
-                        if "\x00" in line:
-                            raise self._error(
-                                "validation",
-                                "binary_file",
-                                "Binary files cannot be read as text",
-                            )
-                        line_bytes = len(line.encode("utf-8"))
-                        if selected_bytes + line_bytes > MAX_READ_BYTES:
-                            raise self._error(
-                                "validation",
-                                "read_limit_exceeded",
-                                "The selected text exceeds the safe read limit",
-                                {"max_bytes": MAX_READ_BYTES},
-                            )
-                        selected.append(line)
-                        selected_bytes += line_bytes
-                end = start + len(selected)
+                        if remaining_skip:
+                            skipped = min(remaining_skip, len(chunk))
+                            remaining_skip -= skipped
+                            chunk = chunk[skipped:]
+                            if not chunk:
+                                continue
+                        take = min(remaining_take, len(chunk))
+                        chunks.append(chunk[:take])
+                        remaining_take -= take
+                        if take < len(chunk):
+                            has_more = True
+                            break
+                    if not has_more and remaining_take == 0:
+                        has_more = bool(stream.read(1))
+                content = "".join(chunks)
+                if len(content.encode("utf-8")) > MAX_READ_BYTES:
+                    raise self._error(
+                        "validation",
+                        "read_limit_exceeded",
+                        "The selected text exceeds the safe read limit",
+                        {"max_bytes": MAX_READ_BYTES},
+                    )
+                truncated = has_more
                 snapshot = self._snapshot(path, None, False)
 
-            self._read_state[path] = snapshot
+            previous = self._read_state.get(path)
+            if not (
+                previous is not None
+                and previous.full_read
+                and previous.mtime_ns == snapshot.mtime_ns
+                and previous.size == snapshot.size
+                and (
+                    snapshot.digest is None
+                    or previous.digest == snapshot.digest
+                )
+            ):
+                self._read_state[path] = snapshot
+            next_offset = start + len(content)
             return {
                 "file_path": self.policy.relative(path),
-                "content": "".join(selected),
+                "content": content,
                 "offset": start,
-                "num_lines": len(selected),
-                "truncated": limit is not None and end < len(lines) if size <= MAX_READ_BYTES else limit is not None and len(selected) >= limit,
+                "next_offset": next_offset if truncated else None,
+                "num_chars": len(content),
+                "num_lines": len(content.splitlines()),
+                "truncated": truncated,
                 "size_bytes": size,
             }
         except SystemToolError:
@@ -355,7 +388,14 @@ class FileSystemService:
         max_entries: int,
     ) -> dict[str, Any]:
         path = self.policy.resolve(path_value, must_exist=True)
-        if not path.is_dir():
+        try:
+            exists = path.exists()
+            is_directory = path.is_dir() if exists else False
+        except OSError as exc:
+            raise self._filesystem_error(exc) from exc
+        if not exists:
+            raise self._error("semantic", "path_not_found", "Directory disappeared while it was being listed")
+        if not is_directory:
             raise self._error("validation", "not_a_directory", "Path is not a directory")
 
         entries: list[dict[str, Any]] = []
@@ -364,11 +404,26 @@ class FileSystemService:
             current = pending.pop(0)
             try:
                 children = sorted(current.iterdir(), key=lambda item: item.name)
+            except FileNotFoundError as exc:
+                if current == path:
+                    raise self._error(
+                        "semantic", "path_not_found", "Directory disappeared while it was being listed"
+                    ) from exc
+                # A recursive child may legitimately disappear between the
+                # parent snapshot and the walk; continue with the remaining
+                # snapshot instead of surfacing an internal error.
+                continue
             except OSError as exc:
-                raise self._filesystem_error(exc) from exc
+                if current == path:
+                    raise self._filesystem_error(exc) from exc
+                continue
             for child in children:
                 if len(entries) >= max_entries:
                     break
+                # Atomic writes use this private suffix while replacing a
+                # file. It is never a user-visible workspace entry.
+                if child.name.endswith(".system-tools.tmp"):
+                    continue
                 try:
                     if child.is_symlink():
                         entry_type = "symlink"
@@ -385,13 +440,19 @@ class FileSystemService:
                     else:
                         entry_type = "other"
                         size = None
-                except SystemToolError:
+                except (SystemToolError, OSError):
+                    # A child can be renamed or removed while it is being
+                    # inspected. Listing is a best-effort snapshot; skip
+                    # only that entry and keep the rest of the directory.
                     continue
-                relative = (
-                    self.policy.relative_lexical(child)
-                    if child.is_symlink()
-                    else self.policy.relative(child)
-                )
+                try:
+                    relative = (
+                        self.policy.relative_lexical(child)
+                        if child.is_symlink()
+                        else self.policy.relative(child)
+                    )
+                except (SystemToolError, OSError):
+                    continue
                 entries.append(
                     {
                         "path": relative,

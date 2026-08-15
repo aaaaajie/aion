@@ -3,11 +3,21 @@
 config/vpn/*.ovpn
 __pycache__/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+.coverage
 *.egg-info/
 .system-tools/
 .aion/
 .playwright-cli/
 .DS_Store
+
+# VPS-specific operator credentials and host fingerprints
+deploy/vps_known_hosts
+deploy/*.pem
+deploy/*.key
 
 # Local credentials, cookies, and session-forging material
 **/cookies.txt

@@ -37,8 +37,10 @@ def render_prompt(name: str, **values: object) -> str:
 
 
 def system_prompt(role: str) -> str:
-    """Load the role-specific system prompt."""
+    """Load the role prompt followed by the shared global constraints."""
 
-    if role not in {"chief", "challenge", "execution"}:
+    if role not in {"chief", "challenge", "execution", "bootstrap"}:
         raise ValueError("unknown Agent role")
-    return load_prompt(f"{role}_system.txt")
+    role_prompt = load_prompt(f"{role}_system.txt")
+    base = load_prompt("base_system.txt")
+    return f"{role_prompt}\n\n{base}"

@@ -1,0 +1,57 @@
+id: binary.reverse_flow
+name: Reverse Flow
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Guided reverse engineering workflow for binaries, firmware, mobile apps, scripts, document samples, protocol captures, and unknown artifacts. Use when Codex is asked to perform reverse engineering, malware or suspicious-file analysis, static or dynamic analysis, decompilation planning, vulnerability discovery, exploitability assessment, root-cause analysis, patch diffing, firmware analysis, Android/iOS app analysis, or to produce analysis reports, deep reverse reports, evidence-backed vulnerability reports, user-intent recovery for ambiguous reverse-engineering requests, and user-selectable next-step plans.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - reverse
+  - flow
+  - guided
+  - engineering
+  - workflow
+  - binaries
+  - firmware
+  - mobile
+  - apps
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - ida
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - REVERSE_FLOW
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- reverse
+- flow
+- guided
+- engineering
+- workflow
+- binaries
+- firmware

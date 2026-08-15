@@ -106,18 +106,18 @@ class NetworkDiscoveryManager:
         run_id: str,
         *,
         binary_path: Path | None = None,
-        admission_callback: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
         resource_guard: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.policy = policy
         self.service = service
         self.run_id = run_id
         self.binary_path = Path(binary_path or default_binary_path())
-        self.admission_callback = admission_callback
         self.resource_guard = resource_guard
         self.runtime_root = policy.root / ".system-tools" / "runs" / run_id
         self._live: dict[str, LiveNetworkTask] = {}
         self._task_locks: dict[str, asyncio.Lock] = {}
+        self._agent_cleanup_locks: dict[str, asyncio.Lock] = {}
+        self._run_cleanup_lock = asyncio.Lock()
         self._closed = False
 
     def bind(self, agent_id: str) -> AgentNetworkClient:
@@ -240,37 +240,18 @@ class NetworkDiscoveryManager:
                 error_code="resource_work_persistence_failed",
             )
             raise
-        decision = await self._admit(work_id)
-        if not decision.get("ok"):
-            await self.service.update_network_task(
-                self.run_id,
-                agent_id,
-                task_id,
-                resource_status="queued",
-            )
-            return await self.output(
-                agent_id,
-                task_id=task_id,
-                cursor=0,
-                limit=result_limit,
-                wait_seconds=0,
-            )
-        await self.launch_queued(task_id, work_id=work_id)
-        live = self._live.get(task_id)
-        if live is not None:
-            if wait_seconds is None:
-                await live.done.wait()
-            elif wait_seconds > 0:
-                try:
-                    await asyncio.wait_for(live.done.wait(), timeout=wait_seconds)
-                except asyncio.TimeoutError:
-                    pass
+        await self.service.update_network_task(
+            self.run_id,
+            agent_id,
+            task_id,
+            resource_status="queued",
+        )
         return await self.output(
             agent_id,
             task_id=task_id,
             cursor=0,
             limit=result_limit,
-            wait_seconds=0,
+            wait_seconds=wait_seconds,
         )
 
     async def launch_queued(
@@ -353,6 +334,7 @@ class NetworkDiscoveryManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "recommended_wait_seconds": 20 if row["status"] not in TERMINAL else 0,
         }
 
     async def stop(self, agent_id: str, task_id: str) -> dict[str, Any]:
@@ -398,27 +380,27 @@ class NetworkDiscoveryManager:
         }
 
     async def cleanup(self, agent_id: str, task_id: str) -> dict[str, Any]:
-        row = await self._owned(agent_id, task_id)
-        if row["status"] in ACTIVE:
-            raise _error(
-                "conflict",
-                "task_still_running",
-                "Active network task must be stopped before cleanup",
-            )
-        already_cleaned = row["output_cleaned_at"] is not None
-        if not already_cleaned:
-            task_dir = self._task_dir(agent_id, task_id)
-            if task_dir.exists():
-                shutil.rmtree(task_dir)
-            await self.service.mark_network_task_output_cleaned(
-                self.run_id, agent_id, task_id, reason="explicit"
-            )
-        return {
-            "task_id": task_id,
-            "status": row["status"],
-            "cleaned": True,
-            "already_cleaned": already_cleaned,
-        }
+        async with self._task_lock(task_id):
+            row = await self._owned(agent_id, task_id)
+            if row["status"] in ACTIVE:
+                raise _error(
+                    "conflict",
+                    "task_still_running",
+                    "Active network task must be stopped before cleanup",
+                )
+            already_cleaned = row["output_cleaned_at"] is not None
+            if not already_cleaned:
+                task_dir = self._task_dir(agent_id, task_id)
+                await asyncio.to_thread(shutil.rmtree, task_dir, True)
+                await self.service.mark_network_task_output_cleaned(
+                    self.run_id, agent_id, task_id, reason="explicit"
+                )
+            return {
+                "task_id": task_id,
+                "status": row["status"],
+                "cleaned": True,
+                "already_cleaned": already_cleaned,
+            }
 
     async def pause_run(self) -> None:
         self._closed = True
@@ -447,27 +429,26 @@ class NetworkDiscoveryManager:
                 await self._finish_work(row["task_id"], "interrupted", "runtime_paused")
 
     async def finish_agent(self, agent_id: str) -> None:
-        for row in await self.service.list_network_tasks(
-            self.run_id, agent_id=agent_id, statuses=ACTIVE
-        ):
-            await self.stop(agent_id, row["task_id"])
-        for row in await self.service.list_network_tasks(
-            self.run_id, agent_id=agent_id, output_available_only=True
-        ):
-            if row["status"] in TERMINAL:
-                await self.cleanup(agent_id, row["task_id"])
+        async with self._agent_cleanup_lock(agent_id):
+            for row in await self.service.list_network_tasks(
+                self.run_id, agent_id=agent_id, statuses=ACTIVE
+            ):
+                await self.stop(agent_id, row["task_id"])
+            for row in await self.service.list_network_tasks(
+                self.run_id, agent_id=agent_id, output_available_only=True
+            ):
+                if row["status"] in TERMINAL:
+                    await self.cleanup(agent_id, row["task_id"])
 
     async def finish_run(self) -> None:
-        if self._closed:
-            return
-        for row in await self.service.list_network_tasks(self.run_id, statuses=ACTIVE):
-            await self.stop(row["agent_id"], row["task_id"])
-        for row in await self.service.list_network_tasks(
-            self.run_id, output_available_only=True
-        ):
-            if row["status"] in TERMINAL:
-                await self.cleanup(row["agent_id"], row["task_id"])
-        self._closed = True
+        async with self._run_cleanup_lock:
+            if self._closed:
+                return
+            rows = await self.service.list_network_tasks(self.run_id)
+            agent_ids = list(dict.fromkeys(str(row["agent_id"]) for row in rows))
+            for agent_id in agent_ids:
+                await self.finish_agent(agent_id)
+            self._closed = True
 
     async def _spawn(
         self,
@@ -527,12 +508,9 @@ class NetworkDiscoveryManager:
                 live.agent_id,
                 live.task_id,
                 status="running",
-                resource_status="reserved",
+                resource_status="running",
                 pid=process.pid,
                 process_started_at=process_started_at,
-            )
-            await self.service.update_resource_work(
-                self.run_id, work_id, status="running"
             )
         except Exception:
             self._live.pop(live.task_id, None)
@@ -730,7 +708,37 @@ class NetworkDiscoveryManager:
             counters["by_service"][service] = counters["by_service"].get(service, 0) + 1
             if details.get("is_web") or service.lower() in {"http", "https"}:
                 counters["web_ports"] += 1
+            await self._record_service_observation(live, record)
         await self._persist_progress(live)
+
+    async def _record_service_observation(
+        self, live: LiveNetworkTask, record: dict[str, Any]
+    ) -> None:
+        try:
+            runtime = await self.service.get_agent_runtime(
+                self.run_id, live.agent_id
+            )
+        except Exception:
+            return
+        unique_code = runtime["agent"].get("unique_code")
+        if not unique_code:
+            return
+        try:
+            await self.service.record_observation(
+                self.run_id,
+                unique_code,
+                category="service",
+                summary=(
+                    f"{record.get('host')}:{record.get('port')} "
+                    f"{record.get('service') or 'unknown'}"
+                ),
+                detail=dict(record),
+                source="network_discovery",
+                source_ref=live.task_id,
+                confidence=0.7,
+            )
+        except Exception:
+            pass
 
     async def _consume_stderr(self, live: LiveNetworkTask) -> None:
         assert live.process.stderr is not None
@@ -812,6 +820,9 @@ class NetworkDiscoveryManager:
     ) -> None:
         live = self._live.get(task_id)
         if live is not None:
+            if wait_seconds is None:
+                await live.done.wait()
+                return
             if results_path.exists() and results_path.stat().st_size > cursor:
                 return
             live.changed.clear()
@@ -819,20 +830,21 @@ class NetworkDiscoveryManager:
                 results_path.exists() and results_path.stat().st_size > cursor
             ):
                 return
-            if wait_seconds is None:
-                await live.changed.wait()
-            else:
-                try:
-                    await asyncio.wait_for(live.changed.wait(), timeout=wait_seconds)
-                except asyncio.TimeoutError:
-                    pass
+            try:
+                await asyncio.wait_for(live.changed.wait(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                pass
             return
         deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
         while True:
             row = await self._owned(agent_id, task_id)
             if row["status"] in TERMINAL:
                 return
-            if results_path.exists() and results_path.stat().st_size > cursor:
+            if (
+                wait_seconds is not None
+                and results_path.exists()
+                and results_path.stat().st_size > cursor
+            ):
                 return
             if deadline is not None and time.monotonic() >= deadline:
                 return
@@ -870,14 +882,6 @@ class NetworkDiscoveryManager:
             return await self.service.get_network_task(self.run_id, agent_id, task_id)
         except StateNotFound as exc:
             raise _error("not_found", "task_not_found", "Network task was not found") from exc
-
-    async def _admit(self, work_id: str) -> dict[str, Any]:
-        if self.admission_callback is None:
-            await self.service.update_resource_work(
-                self.run_id, work_id, status="reserved"
-            )
-            return {"ok": True, "status": "reserved"}
-        return await self.admission_callback(work_id)
 
     async def _terminate_recorded_process(self, row: dict[str, Any]) -> None:
         pid = row.get("pid")
@@ -1111,3 +1115,6 @@ class NetworkDiscoveryManager:
 
     def _task_lock(self, task_id: str) -> asyncio.Lock:
         return self._task_locks.setdefault(task_id, asyncio.Lock())
+
+    def _agent_cleanup_lock(self, agent_id: str) -> asyncio.Lock:
+        return self._agent_cleanup_locks.setdefault(agent_id, asyncio.Lock())

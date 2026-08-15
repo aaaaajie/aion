@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .models import Base, SchemaMetaRecord
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 15
 
 
 class StateDatabase:

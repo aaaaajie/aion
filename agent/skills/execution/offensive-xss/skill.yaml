@@ -1,0 +1,57 @@
+id: web.offensive_xss
+name: Offensive Xss
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: 'Cross-Site Scripting testing checklist: stored/reflected/DOM/blind XSS discovery, polyglot payloads, CSP bypass, XSS filter bypass, event handler injection, DOM clobbering, mutation XSS, and impact escalation (session hijack, phishing, keylogging). Use for web app XSS testing and bug bounty.'
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - xss
+  - cross
+  - site
+  - scripting
+  - checklist
+  - stored
+  - reflected
+  - dom
+  - blind
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_XSS
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- xss
+- cross
+- site
+- scripting
+- checklist
+- stored
+- reflected

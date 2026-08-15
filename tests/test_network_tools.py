@@ -12,6 +12,7 @@ from agent.subagents.policy import AgentPolicy
 from tools.network import NetworkDiscoveryManager, NetworkTools
 from tools.network.manager import default_binary_path
 from tools.system.policy import SystemToolError, WorkspacePolicy
+from tests.resource_runtime import install_resource_runtime
 
 
 _FAKE_BRIDGE = r'''#!/usr/bin/env python3
@@ -65,8 +66,8 @@ async def _harness(
     root: Path,
     binary_path: Path,
     *,
-    admission=None,
     resource_guard=None,
+    start_runtime: bool = True,
 ) -> tuple[StateService, NetworkDiscoveryManager, str]:
     run_root = root / "runs"
     service = StateService(run_root / "run-1" / "state.sqlite3", run_root=run_root)
@@ -79,10 +80,11 @@ async def _harness(
         service,
         "run-1",
         binary_path=binary_path,
-        admission_callback=admission,
         resource_guard=resource_guard,
     )
     await manager.initialize()
+    if start_runtime:
+        install_resource_runtime(manager, service, "run-1", root=root)
     return service, manager, agent["agent_id"]
 
 
@@ -98,6 +100,7 @@ async def test_discovery_uses_network_tasks_and_paginates(tmp_path: Path) -> Non
         wait_seconds=None,
     )
     assert result["status"] == "completed"
+    assert result["recommended_wait_seconds"] == 0
     assert result["scan_intent"] == "initial_surface"
     assert result["scanner_version"] == "test-fscan"
     assert result["bridge_protocol_version"] == "1"
@@ -147,6 +150,28 @@ async def test_discovery_uses_network_tasks_and_paginates(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_network_agent_and_run_cleanup_are_concurrently_idempotent(
+    tmp_path: Path,
+) -> None:
+    service, manager, agent_id = await _harness(tmp_path, _fake_bridge(tmp_path))
+    result = await manager.start_discovery(
+        agent_id,
+        targets="127.0.0.1",
+        ports="80",
+        wait_seconds=None,
+    )
+    assert result["status"] == "completed"
+    await asyncio.gather(
+        *(manager.finish_agent(agent_id) for _ in range(20)),
+        *(manager.finish_run() for _ in range(5)),
+    )
+    row = await service.get_network_task("run-1", agent_id, result["task_id"])
+    assert row["output_cleaned_at"] is not None
+    assert not manager._task_dir(agent_id, result["task_id"]).exists()
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_running_stop_cleanup_and_ownership_without_sleep(tmp_path: Path) -> None:
     service, manager, agent_id = await _harness(
         tmp_path, _fake_bridge(tmp_path, complete=False)
@@ -154,6 +179,14 @@ async def test_running_stop_cleanup_and_ownership_without_sleep(tmp_path: Path) 
     result = await manager.start_discovery(
         agent_id, targets="127.0.0.1", ports="80", ping=False, wait_seconds=0
     )
+    assert result["status"] == "queued"
+    for _ in range(100):
+        result = await manager.output(
+            agent_id, task_id=result["task_id"], wait_seconds=0
+        )
+        if result["status"] == "running":
+            break
+        await asyncio.sleep(0.001)
     assert result["status"] == "running"
     with pytest.raises(SystemToolError) as running_cleanup:
         await manager.cleanup(agent_id, result["task_id"])
@@ -201,11 +234,8 @@ async def test_running_stop_cleanup_and_ownership_without_sleep(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_queued_output_stop_cleanup_and_recovery_are_persistent(tmp_path: Path) -> None:
-    async def queued(_work_id: str) -> dict:
-        return {"ok": False, "status": "queued", "reason": "cpu_limit"}
-
     service, manager, agent_id = await _harness(
-        tmp_path, _fake_bridge(tmp_path), admission=queued
+        tmp_path, _fake_bridge(tmp_path), start_runtime=False
     )
     first = await manager.start_discovery(
         agent_id, targets="127.0.0.1", ports="80", wait_seconds=0
@@ -287,6 +317,13 @@ async def test_pause_interrupts_without_replay_and_unexpected_eof_fails(
     running = await manager.start_discovery(
         agent_id, targets="127.0.0.1", ports="80", wait_seconds=0
     )
+    for _ in range(100):
+        running = await manager.output(
+            agent_id, task_id=running["task_id"], wait_seconds=0
+        )
+        if running["status"] == "running":
+            break
+        await asyncio.sleep(0.001)
     await manager.pause_run()
     interrupted = await manager.output(
         agent_id, task_id=running["task_id"], wait_seconds=0
@@ -342,6 +379,10 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
             web_mark=False,
             wait_seconds=None,
         )
+        while result["status"] not in {"completed", "failed", "stopped"}:
+            result = await manager.output(
+                agent_id, task_id=result["task_id"], wait_seconds=1
+            )
         assert result["status"] == "completed"
         assert result["open_ports"] == 1
         assert not any(
@@ -356,6 +397,10 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
             web_mark=True,
             wait_seconds=None,
         )
+        while marked["status"] not in {"completed", "failed", "stopped"}:
+            marked = await manager.output(
+                agent_id, task_id=marked["task_id"], wait_seconds=1
+            )
         assert marked["status"] == "completed"
         assert marked["web_ports"] >= 1
         assert any(item.get("plugin") == "webtitle" for item in marked["results"]), marked[
@@ -368,8 +413,14 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
     await service.close()
 
 
-def test_tool_definitions_are_execution_only_and_prompted() -> None:
-    definitions = NetworkTools.tool_definitions()
+def test_tool_definitions_are_execution_only_and_prompted(tmp_path: Path) -> None:
+    service = StateService(tmp_path / "state.sqlite3")
+    manager = NetworkDiscoveryManager(
+        WorkspacePolicy(tmp_path), service, "run-1", binary_path=_fake_bridge(tmp_path)
+    )
+    from agent.tooling import ToolRegistry
+
+    definitions = ToolRegistry([NetworkTools(manager.bind("execution-test"))]).definitions()
     names = {item["function"]["name"] for item in definitions}
     assert names <= AgentPolicy("execution").allowed_tools
     assert names.isdisjoint(AgentPolicy("chief").allowed_tools)

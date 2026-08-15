@@ -6,10 +6,12 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import signal
+import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +34,13 @@ TERMINAL_TASK_STATUSES = {
     "stopped",
     "interrupted",
 }
+_OFFLINE_INSTALL_PATTERN = re.compile(
+    r"(?ix)"
+    r"(?:^|[;&|]\s*)(?:sudo\s+)?"
+    r"(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip\b|pip3?\s+(?:install|download|uninstall|upgrade)\b|"
+    r"(?:apt(?:-get)?|dnf|yum|apk|brew)\s+(?:install|update|upgrade|add)\b)"
+    r"|(?:curl|wget)\b[^\n|;]*\|\s*(?:sh|bash)\b"
+)
 ShellTaskStatus = Literal[
     "running",
     "completed",
@@ -50,8 +59,12 @@ class SandboxBackend:
         root: Path,
         executable: str | None = None,
         platform_name: str | None = None,
+        read_only_paths: Sequence[Path] = (),
     ) -> None:
         self.root = root
+        self.read_only_paths = tuple(
+            dict.fromkeys(path.expanduser().resolve(strict=True) for path in read_only_paths)
+        )
         self.platform = platform_name or platform.system()
         if executable is not None:
             self.executable = executable
@@ -71,7 +84,12 @@ class SandboxBackend:
             and os.access(self.executable, os.X_OK)
         )
 
-    def command(self, shell_command: str, cwd: Path | None = None) -> list[str]:
+    def command(
+        self,
+        shell_command: str,
+        cwd: Path | None = None,
+        temp_dir: Path | None = None,
+    ) -> list[str]:
         if self.platform not in {"Darwin", "Linux"}:
             raise SystemToolError(
                 error_type="execution",
@@ -95,10 +113,11 @@ class SandboxBackend:
                 "-lc",
                 shell_command,
             ]
-        return self._linux_command(shell_command, cwd)
+        return self._linux_command(shell_command, cwd, temp_dir)
 
     def _macos_profile(self) -> str:
         root = json.dumps(str(self.root))
+        read_only_paths = [json.dumps(str(path)) for path in self.read_only_paths]
         system_read_paths = [
             "/System",
             "/Library",
@@ -124,22 +143,31 @@ class SandboxBackend:
             f"(allow file-read* (subpath {json.dumps(path)}))"
             for path in system_read_paths
         )
+        lines.extend(f"(allow file-read* (subpath {path}))" for path in read_only_paths)
+        lines.extend(f"(deny file-write* (subpath {path}))" for path in read_only_paths)
         return "\n".join(lines)
 
-    def _linux_command(self, shell_command: str, cwd: Path | None) -> list[str]:
+    def _linux_command(
+        self,
+        shell_command: str,
+        cwd: Path | None,
+        temp_dir: Path | None,
+    ) -> list[str]:
         command = [
             self.executable,
             "--die-with-parent",
             "--new-session",
             "--tmpfs",
             "/",
-            "--tmpfs",
-            "/tmp",
             "--proc",
             "/proc",
             "--dev",
             "/dev",
         ]
+        if temp_dir is None:
+            command.extend(["--tmpfs", "/tmp"])
+        else:
+            command.extend(["--dir", "/tmp"])
         bind_paths: list[tuple[str, str]] = []
         for system_path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
             if Path(system_path).exists():
@@ -161,8 +189,13 @@ class SandboxBackend:
             if resolv_target is not None:
                 bind_paths.append((str(resolv_target), "/etc/resolv.conf"))
 
+        read_only_bind_paths = [
+            (str(path), str(path)) for path in self.read_only_paths
+        ]
         destination_parents: set[Path] = set()
-        for _, destination in bind_paths + [(str(self.root), str(self.root))]:
+        for _, destination in bind_paths + read_only_bind_paths + [
+            (str(self.root), str(self.root))
+        ]:
             parent = Path(destination).parent
             while parent != Path("/"):
                 destination_parents.add(parent)
@@ -171,7 +204,11 @@ class SandboxBackend:
             command.extend(["--dir", str(parent)])
         for source, destination in bind_paths:
             command.extend(["--ro-bind", source, destination])
+        if temp_dir is not None:
+            command.extend(["--bind", str(temp_dir), "/tmp"])
         command.extend(["--bind", str(self.root), str(self.root)])
+        for source, destination in read_only_bind_paths:
+            command.extend(["--ro-bind", source, destination])
         if cwd is not None:
             command.extend(["--chdir", str(cwd)])
         command.extend(["/bin/bash", "--noprofile", "--norc", "-lc", shell_command])
@@ -256,16 +293,23 @@ class ShellTaskManager:
         psutil_module: Any = psutil,
         clock: Callable[[], datetime] = utc_now,
         reap_interval_seconds: float = DEFAULT_REAP_INTERVAL_SECONDS,
+        read_only_paths: Sequence[Path] = (),
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.policy = policy
         self.service = service
         self.run_id = self._component(run_id, "run_id")
-        self.sandbox = sandbox or SandboxBackend(policy.root)
+        self.sandbox = sandbox or SandboxBackend(
+            policy.root, read_only_paths=read_only_paths
+        )
+        self.environment = dict(environment or {})
         self.psutil = psutil_module
         self.clock = clock
         self.reap_interval_seconds = reap_interval_seconds
         self.runtime_root = policy.root / ".system-tools" / "runs" / self.run_id
         self._live: dict[str, LiveShellTask] = {}
+        self._agent_cleanup_locks: dict[str, asyncio.Lock] = {}
+        self._run_cleanup_lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
         self._initialized = False
         self._closed = False
@@ -317,6 +361,12 @@ class ShellTaskManager:
             raise self._error(
                 "validation", "command_too_long", "Shell command is too long"
             )
+        if _OFFLINE_INSTALL_PATTERN.search(command):
+            raise self._error(
+                "validation",
+                "offline_install_blocked",
+                "Package-manager and network installer commands are disabled in the offline runtime",
+            )
         owner = await self.service.get_agent_runtime(self.run_id, agent_id)
         if owner["agent"]["status"] in {
             "completed",
@@ -334,13 +384,14 @@ class ShellTaskManager:
         owner_root, home_dir, temp_dir, task_dir = self._owner_directories(agent_id)
         for directory in (owner_root, home_dir, temp_dir, task_dir, home_dir / ".config"):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_offline_home(home_dir)
         task_id = f"task-{uuid.uuid4().hex}"
         output_path = task_dir / f"{task_id}.log"
         output_path.touch(mode=0o600, exist_ok=False)
         process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
-                *self.sandbox.command(command, working_directory),
+                *self.sandbox.command(command, working_directory, temp_dir),
                 cwd=str(working_directory),
                 env=self._safe_environment(home_dir, temp_dir, working_directory),
                 stdin=asyncio.subprocess.DEVNULL,
@@ -460,50 +511,52 @@ class ShellTaskManager:
 
     async def task_stop(self, agent_id: str, task_id: str) -> dict[str, Any]:
         self._require_open()
-        row = await self._owned_task(agent_id, task_id)
-        if row["status"] == "running":
-            live = self._live.get(task_id)
-            if live is None:
-                row = await self._finish_persisted(row, status="interrupted")
-            else:
-                live.stop_requested = True
-                await self._terminate(live)
-                await live.done.wait()
-                if live.persistence_error is not None:
-                    raise self._error(
-                        "internal",
-                        "shell_task_persistence_failed",
-                        "The Shell task result could not be persisted",
-                    )
-                row = await self._owned_task(agent_id, task_id)
-        return await self._result(row, tail_chars=row["capture_limit"])
+        async with self._agent_cleanup_lock(agent_id):
+            row = await self._owned_task(agent_id, task_id)
+            if row["status"] == "running":
+                live = self._live.get(task_id)
+                if live is None:
+                    row = await self._finish_persisted(row, status="interrupted")
+                else:
+                    live.stop_requested = True
+                    await self._terminate(live)
+                    await live.done.wait()
+                    if live.persistence_error is not None:
+                        raise self._error(
+                            "internal",
+                            "shell_task_persistence_failed",
+                            "The Shell task result could not be persisted",
+                        )
+                    row = await self._owned_task(agent_id, task_id)
+            return await self._result(row, tail_chars=row["capture_limit"])
 
     async def task_cleanup(self, agent_id: str, task_id: str) -> dict[str, Any]:
         self._require_open()
-        row = await self._owned_task(agent_id, task_id)
-        if row["status"] == "running":
-            raise self._error(
-                "conflict",
-                "task_still_running",
-                "Running Shell task must be stopped before cleanup",
+        async with self._agent_cleanup_lock(agent_id):
+            row = await self._owned_task(agent_id, task_id)
+            if row["status"] == "running":
+                raise self._error(
+                    "conflict",
+                    "task_still_running",
+                    "Running Shell task must be stopped before cleanup",
+                )
+            if row["output_cleaned_at"] is not None:
+                return {
+                    "task_id": task_id,
+                    "status": row["status"],
+                    "cleaned": False,
+                    "already_cleaned": True,
+                }
+            await self._remove_task_output(row)
+            await self.service.mark_shell_task_output_cleaned(
+                self.run_id, agent_id, task_id, reason="explicit"
             )
-        if row["output_cleaned_at"] is not None:
             return {
                 "task_id": task_id,
                 "status": row["status"],
-                "cleaned": False,
-                "already_cleaned": True,
+                "cleaned": True,
+                "already_cleaned": False,
             }
-        await self._remove_task_output(row)
-        await self.service.mark_shell_task_output_cleaned(
-            self.run_id, agent_id, task_id, reason="explicit"
-        )
-        return {
-            "task_id": task_id,
-            "status": row["status"],
-            "cleaned": True,
-            "already_cleaned": False,
-        }
 
     async def pause_run(self) -> None:
         await self._stop_live_tasks(status="interrupted")
@@ -513,29 +566,31 @@ class ShellTaskManager:
 
     async def finish_agent(self, agent_id: str) -> None:
         agent_id = self._component(agent_id, "agent_id")
-        await self._stop_live_tasks(status="stopped", agent_id=agent_id)
-        rows = await self.service.list_shell_tasks(self.run_id, agent_id=agent_id)
-        for row in rows:
-            if row["status"] == "running":
-                await self._finish_persisted(row, status="stopped")
-        owner_root = self._owner_root(agent_id)
-        if owner_root.exists() or owner_root.is_symlink():
-            await asyncio.to_thread(self._remove_tree, owner_root)
-        await self._mark_rows_cleaned(rows, reason="agent_terminal")
+        async with self._agent_cleanup_lock(agent_id):
+            await self._stop_live_tasks(status="stopped", agent_id=agent_id)
+            rows = await self.service.list_shell_tasks(self.run_id, agent_id=agent_id)
+            for row in rows:
+                if row["status"] == "running":
+                    await self._finish_persisted(row, status="stopped")
+            await asyncio.to_thread(self._remove_tree, self._owner_root(agent_id))
+            await self._mark_rows_cleaned(rows, reason="agent_terminal")
 
     async def finish_run(self) -> None:
-        if self._closed:
-            return
-        await self._stop_live_tasks(status="stopped")
-        rows = await self.service.list_shell_tasks(self.run_id)
-        for row in rows:
-            if row["status"] == "running":
-                await self._finish_persisted(row, status="stopped")
-        if self.runtime_root.exists() or self.runtime_root.is_symlink():
+        async with self._run_cleanup_lock:
+            if self._closed:
+                return
+            rows = await self.service.list_shell_tasks(self.run_id)
+            agent_ids = list(
+                dict.fromkeys(
+                    [str(row["agent_id"]) for row in rows]
+                    + [task.agent_id for task in self._live.values()]
+                )
+            )
+            for agent_id in agent_ids:
+                await self.finish_agent(agent_id)
             await asyncio.to_thread(self._remove_tree, self.runtime_root)
-        await self._mark_rows_cleaned(rows, reason="run_terminal")
-        await self._stop_reaper()
-        self._closed = True
+            await self._stop_reaper()
+            self._closed = True
 
     async def reap_expired(self) -> int:
         rows = await self.service.list_shell_tasks(
@@ -813,17 +868,23 @@ class ShellTaskManager:
     def _safe_environment(
         self, home_dir: Path, temp_dir: Path, working_directory: Path
     ) -> dict[str, str]:
+        venv_bin = self.environment.get("AION_VENV_BIN", "")
+        toolchain_bin = self.environment.get("AION_TOOLCHAIN_BIN", "")
         path_entries = [
-            str(self.policy.root / ".venv" / "bin"),
-            "/usr/local/bin",
-            "/opt/homebrew/bin",
-            "/home/linuxbrew/.linuxbrew/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
+            entry
+            for entry in (
+                venv_bin,
+                toolchain_bin,
+                "/usr/local/sbin",
+                "/usr/local/bin",
+                "/usr/sbin",
+                "/usr/bin",
+                "/sbin",
+                "/bin",
+            )
+            if entry
         ]
-        return {
+        environment = {
             "HOME": str(home_dir),
             "TMPDIR": str(temp_dir),
             "TMP": str(temp_dir),
@@ -838,6 +899,24 @@ class ShellTaskManager:
             "USER": "sandbox",
             "LOGNAME": "sandbox",
         }
+        environment.update(self.environment)
+        return environment
+
+    @staticmethod
+    def _prepare_offline_home(home_dir: Path) -> None:
+        """Disable pwntools' network update check for the offline competition."""
+
+        cache_dir = home_dir / ".cache"
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pwn_cache = cache_dir / f".pwntools-cache-{sys.version_info.major}.{sys.version_info.minor}"
+        pwn_cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        update_file = pwn_cache / "update"
+        if not update_file.is_file():
+            update_file.write_text("never\n", encoding="ascii")
+            try:
+                update_file.chmod(0o600)
+            except OSError:
+                pass
 
     def _require_open(self) -> None:
         if not self._initialized or self._closed:
@@ -867,7 +946,11 @@ class ShellTaskManager:
         if path.is_symlink() or path.is_file():
             path.unlink(missing_ok=True)
         elif path.is_dir():
-            shutil.rmtree(path)
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _agent_cleanup_lock(self, agent_id: str) -> asyncio.Lock:
+        agent_id = self._component(agent_id, "agent_id")
+        return self._agent_cleanup_locks.setdefault(agent_id, asyncio.Lock())
 
     @staticmethod
     def _error(

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
 
 import pytest
+from sqlalchemy import func, select
 
 from agent.config import AgentSettings
-from agent.runtime import AgentRuntime
+from agent.runner import AgentRunnerError
+from agent.runtime import AgentRuntime, RuntimePausedError
+from agent.state import StateService
+from agent.state.models import StateEventRecord
+from tests.benchmark_tools import benchmark_tool_specs
 
 
 def _settings() -> AgentSettings:
@@ -22,9 +28,16 @@ def _settings() -> AgentSettings:
 
 
 class _Network:
-    def __init__(self, events: list[str], *, start_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        start_error: Exception | None = None,
+        failure_error: Exception | None = None,
+    ) -> None:
         self.events = events
         self.start_error = start_error
+        self.failure_error = failure_error or RuntimeError("vpn disconnected")
         self.failure = asyncio.Event()
         self.closed = False
 
@@ -35,7 +48,7 @@ class _Network:
 
     async def wait_failure(self) -> None:
         await self.failure.wait()
-        raise RuntimeError("vpn disconnected")
+        raise self.failure_error
 
     async def close(self) -> None:
         self.closed = True
@@ -51,6 +64,9 @@ class _Benchmark:
         self.events.append(f"benchmark:{name}")
         assert name == "benchmark_list_challenges"
         return {"ok": True, "data": []}
+
+    def tool_specs(self):
+        return benchmark_tool_specs(self.dispatch)
 
     async def close(self) -> None:
         self.closed = True
@@ -70,6 +86,54 @@ class _BlockingRunner:
 
     async def close(self) -> None:
         return None
+
+
+class _RecoveringControllerRunner:
+    attempts = 0
+    recovered = asyncio.Event()
+
+    def __init__(self, *_args: Any, **kwargs: Any) -> None:
+        self.role = kwargs.get("role")
+
+    async def run_session(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        type(self).attempts += 1
+        if type(self).attempts == 1:
+            raise AgentRunnerError(
+                "temporary controller context pressure",
+                code="context_capacity_deferred",
+                recoverable=True,
+            )
+        type(self).recovered.set()
+        await asyncio.Event().wait()
+        return {"status": "stopped"}
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_runtime_loop_diagnostics_are_visible_and_rate_limited(
+    tmp_path: Path,
+) -> None:
+    service = StateService(tmp_path / "state.sqlite3")
+    await service.create_run("diagnostic")
+    runtime = AgentRuntime(_settings(), project_root=tmp_path, run_root=tmp_path / "runs")
+    runtime.state_service = service
+    runtime.run_id = "diagnostic"
+
+    await runtime._record_loop_diagnostic("stagnation", ValueError("bad state"))
+    await runtime._record_loop_diagnostic("stagnation", ValueError("bad state"))
+    async with service.db.sessions() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(StateEventRecord)
+            .where(
+                StateEventRecord.run_id == "diagnostic",
+                StateEventRecord.event_type == "runtime_loop_failed",
+            )
+        )
+    assert count == 1
+    await service.close()
 
 
 @pytest.mark.asyncio
@@ -97,6 +161,42 @@ async def test_runtime_waits_for_network_before_benchmark_and_chief(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_recoverable_chief_session_does_not_close_runtime_or_children(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    network = _Network(events)
+    _RecoveringControllerRunner.attempts = 0
+    _RecoveringControllerRunner.recovered = asyncio.Event()
+    runtime = AgentRuntime(
+        _settings(),
+        benchmark=_Benchmark(events),
+        network_manager=network,
+        project_root=tmp_path,
+        run_root=tmp_path / "runs",
+        runner_factory=_RecoveringControllerRunner,
+        catalog_reconcile_interval_seconds=0,
+    )
+    await runtime.start("test", run_id="controller-recovers")
+    await asyncio.wait_for(_RecoveringControllerRunner.recovered.wait(), timeout=3)
+    assert _RecoveringControllerRunner.attempts >= 2
+    assert network.closed is False
+    assert runtime.state_service is not None
+    overview = await runtime.state_service.get_overview("controller-recovers")
+    chief = next(item for item in overview["agents"] if item["role"] == "chief")
+    assert chief["status"] in {"running", "waiting"}
+    assert overview["run"]["status"] == "active"
+    events_rows = await runtime.state_service.list_agent_events(
+        "controller-recovers", chief["agent_id"]
+    )
+    assert any(
+        item["event_type"] == "controller_session_recovery_scheduled"
+        for item in events_rows
+    )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_pause_preserves_chief_for_resume(tmp_path: Path) -> None:
     events: list[str] = []
     _BlockingRunner.events = events
@@ -118,7 +218,18 @@ async def test_runtime_pause_preserves_chief_for_resume(tmp_path: Path) -> None:
         chief_status = connection.execute(
             "SELECT status FROM agents WHERE role = 'chief'"
         ).fetchone()
+        run_status = connection.execute(
+            "SELECT status, pause_reason FROM runs WHERE run_id = 'pause-resume'"
+        ).fetchone()
+        outbox_count = connection.execute(
+            "SELECT COUNT(*) FROM audit_outbox"
+        ).fetchone()[0]
     assert chief_status == ("running",)
+    assert run_status == ("paused", "runtime_pause")
+    assert outbox_count == 0
+    assert json.loads(
+        (run_root / "pause-resume" / "checkpoint.json").read_text(encoding="utf-8")
+    )["status"] == "paused"
 
     resumed_events: list[str] = []
     _BlockingRunner.events = resumed_events
@@ -133,6 +244,8 @@ async def test_runtime_pause_preserves_chief_for_resume(tmp_path: Path) -> None:
     )
     await resumed.start("", run_id="pause-resume", resume=True)
     assert "runner:chief" in resumed_events
+    assert resumed.state_service is not None
+    assert (await resumed.state_service.get_overview("pause-resume"))["run"]["status"] == "active"
     await resumed.close()
 
 
@@ -201,3 +314,42 @@ async def test_network_disconnect_fails_running_runtime(tmp_path: Path) -> None:
     await runtime.close()
     assert benchmark.closed is True
     assert network.closed is True
+
+
+class _RemoteHalt(RuntimeError):
+    code = "vpn_remote_halt"
+
+
+@pytest.mark.asyncio
+async def test_remote_vpn_halt_pauses_without_reconnect_or_run_failure(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    _BlockingRunner.events = events
+    run_root = tmp_path / "runs"
+    network = _Network(events, failure_error=_RemoteHalt("server halt"))
+    runtime = AgentRuntime(
+        _settings(),
+        benchmark=_Benchmark(events),
+        network_manager=network,
+        project_root=tmp_path,
+        run_root=run_root,
+        runner_factory=_BlockingRunner,
+        catalog_reconcile_interval_seconds=0,
+    )
+
+    await runtime.start("test", run_id="remote-halt")
+    network.failure.set()
+    assert runtime._network_failure_event is not None
+    await asyncio.wait_for(runtime._network_failure_event.wait(), timeout=1)
+    with pytest.raises(RuntimePausedError) as paused:
+        await runtime.ensure_healthy()
+    assert paused.value.reason == "vpn_remote_halt"
+    assert events.count("vpn-ready") == 1
+    with sqlite3.connect(run_root / "remote-halt" / "state.sqlite3") as connection:
+        run_state = connection.execute(
+            "SELECT status, pause_reason FROM runs WHERE run_id = 'remote-halt'"
+        ).fetchone()
+    assert run_state == ("paused", "vpn_remote_halt")
+    assert network.closed is True
+    await runtime.close()

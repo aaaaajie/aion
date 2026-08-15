@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent.config import AgentSettings
 from agent.prompts import load_prompt
-from agent.runtime import AgentRuntime
+from agent.runtime import AgentRuntime, RuntimePausedError
 from challenges_sdk import ChallengesClient, ChallengesSettings
 from scripts.network_manager import VPNManager, discover_vpn_config
 from scripts.runtime_web import RuntimeMonitor
@@ -236,8 +236,32 @@ async def run_online(
             interrupted = True
             result_code, result_message = _signal_result(signal_state["signal"])
         print(f"[online] result: {result_message}", flush=True)
+    except RuntimePausedError as exc:
+        result_code = 0
+        result_message = f"online Runtime paused: {exc.reason}"
+        print(f"[online] paused: {exc.reason}", flush=True)
     except Exception as exc:
         result_message = f"online Runtime failed: {type(exc).__name__}: {exc}"
+        try:
+            if runtime.state_service is not None and runtime.run_id is not None:
+                await runtime.state_service.append_run_event(
+                    runtime.run_id,
+                    "runtime_fatal_error",
+                    {
+                        "code": "runtime_fatal",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                await runtime.state_service.finish_run(
+                    runtime.run_id,
+                    "failed",
+                    report={
+                        "type": "runtime_fatal_error",
+                        "summary": "The online Runtime encountered an unrecoverable failure",
+                    },
+                )
+        except Exception:
+            pass
         print(f"[online] failed: {type(exc).__name__}: {exc}", flush=True)
     finally:
         pause_requested = (

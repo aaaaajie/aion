@@ -1,0 +1,55 @@
+id: exploit.auditing_foundry_smart_contract_security
+name: Auditing Foundry Smart Contract Security
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: Pre-deployment security audit of Solidity smart contracts in a Foundry project. Combines static analysis (Slither, Aderyn), symbolic execution (Mythril), and property-based testing (forge fuzz + invariant tests with handlers) to catch reentrancy, access-control, oracle/price manipulation, and arithmetic bugs BEFORE deploying to an EVM chain. Also enforces key hygiene (no plaintext private keys, encrypted cast keystore) and a secure deploy workflow. Use when writing, reviewing, testing, or deploying Solidity/Foundry contracts, building a dApp, or working with forge/cast/anvil, MetaMask, or Web3/DeFi code.
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - auditing
+  - foundry
+  - smart
+  - contract
+  - security
+  - pre
+  - deployment
+  - audit
+  - solidity
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - AUDITING_FOUNDRY_SMART_CONTRACT_SECURITY
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- auditing
+- foundry
+- smart
+- contract
+- security
+- pre
+- deployment

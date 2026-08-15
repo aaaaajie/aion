@@ -24,6 +24,9 @@ def test_fresh_cleanup_removes_only_runtime_owned_paths(tmp_path: Path) -> None:
     run_dir = run_root / "fresh-run"
     run_dir.mkdir(parents=True)
     (run_dir / "state.sqlite3").write_text("stale", encoding="utf-8")
+    evidence_dir = workspace / ".aion" / "runs" / "fresh-run"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "stale.json").write_text("stale", encoding="utf-8")
 
     evidence = workspace / "evidence" / "keep.txt"
     evidence.parent.mkdir(parents=True)
@@ -40,6 +43,7 @@ def test_fresh_cleanup_removes_only_runtime_owned_paths(tmp_path: Path) -> None:
 
     assert not cache.exists()
     assert not run_dir.exists()
+    assert not evidence_dir.exists()
     assert evidence.read_text(encoding="utf-8") == "archive"
     assert old_run.read_text(encoding="utf-8") == "archive"
 
@@ -78,11 +82,11 @@ async def test_cleanup_failure_blocks_runtime_start(
             llm_api_key="test-key",
         ),
         project_root=tmp_path / "workspace",
-        run_root=tmp_path / "runs",
+        run_root=tmp_path / "workspace" / "runs",
     )
 
     with pytest.raises(FreshRunCleanupError, match="cleanup failed"):
         await runtime.start("fresh", run_id="blocked")
 
     assert runtime.state_service is None
-    assert not (tmp_path / "runs" / "blocked").exists()
+    assert not (tmp_path / "workspace" / "runs" / "blocked").exists()

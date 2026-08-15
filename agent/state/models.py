@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -71,6 +72,8 @@ class RunRecord(Base):
     last_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_projected_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     stagnation_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pause_reason: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -90,7 +93,14 @@ class ChallengeRecord(Base):
     platform_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     container_status: Mapped[str] = mapped_column(String(32), default="stopped", nullable=False)
     container_addr: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    direction: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
     work_status: Mapped[str] = mapped_column(String(32), default="unassigned", nullable=False)
+    control_state: Mapped[str] = mapped_column(
+        String(32), default="ok", nullable=False
+    )
+    control_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pause_reason: Mapped[str | None] = mapped_column(String(128))
+    evidence_root: Mapped[str | None] = mapped_column(Text)
     stagnation_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     hint_eligible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     hint_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -99,8 +109,6 @@ class ChallengeRecord(Base):
     last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exploration_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    l2_explorer_created: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    extension_cycle_pending: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
@@ -121,16 +129,22 @@ class AgentRecord(Base):
     cycle_id: Mapped[str | None] = mapped_column(String(128))
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), default="general", nullable=False)
+    task_stage: Mapped[str | None] = mapped_column(String(32))
     priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
     mission: Mapped[str] = mapped_column(Text, default="", nullable=False)
     initial_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
     session_memory: Mapped[str] = mapped_column(Text, default=DEFAULT_SESSION_MEMORY, nullable=False)
+    active_skills: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     final_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     last_summarized_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     report_cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     report_cursors: Mapped[dict[str, int]] = mapped_column(JSON, default=dict, nullable=False)
     success_criteria: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     context_refs: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    hypothesis_key: Mapped[str | None] = mapped_column(String(128))
+    task_key: Mapped[str | None] = mapped_column(String(128))
+    branch_key: Mapped[str | None] = mapped_column(String(256))
+    terminal_report_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     timeout_seconds: Mapped[int | None] = mapped_column(Integer)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -146,6 +160,143 @@ class AgentRecord(Base):
     __table_args__ = (
         Index("ix_agents_run_status", "run_id", "status"),
         Index("ix_agents_challenge_status", "run_id", "unique_code", "status"),
+        UniqueConstraint(
+            "run_id", "unique_code", "task_key", name="uq_execution_task_key"
+        ),
+        Index(
+            "ix_agents_challenge_hypothesis",
+            "run_id",
+            "unique_code",
+            "hypothesis_key",
+        ),
+        Index(
+            "ix_agents_challenge_branch",
+            "run_id",
+            "unique_code",
+            "branch_key",
+        ),
+    )
+
+
+class ObservationRecord(Base):
+    __tablename__ = "observation_records"
+
+    observation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
+    target_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(String(128))
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "unique_code",
+            "target_fingerprint",
+            "category",
+            "fingerprint",
+            name="uq_observation_fingerprint",
+        ),
+        Index(
+            "ix_observations_challenge",
+            "run_id",
+            "unique_code",
+            "target_fingerprint",
+        ),
+    )
+
+
+class HypothesisRecord(Base):
+    __tablename__ = "hypothesis_records"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
+    hypothesis_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    based_on_observations: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="proposed", nullable=False
+    )
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "run_id", "unique_code", "hypothesis_key", name="pk_hypothesis"
+        ),
+        Index(
+            "ix_hypotheses_challenge",
+            "run_id",
+            "unique_code",
+            "status",
+        ),
+    )
+
+
+class ExecutionBranchRecord(Base):
+    __tablename__ = "execution_branches"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
+    branch_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    target_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    hypothesis_key: Mapped[str | None] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    task_stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), default="proposed", nullable=False
+    )
+    priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    mission: Mapped[str | None] = mapped_column(Text)
+    agent_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    outcome: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "run_id", "unique_code", "branch_key", name="pk_execution_branch"
+        ),
+        Index(
+            "ix_execution_branches_challenge_status",
+            "run_id",
+            "unique_code",
+            "status",
+        ),
     )
 
 
@@ -264,7 +415,7 @@ class HttpInteractionRecord(Base):
         String(32), default="queued", nullable=False
     )
     analysis_status: Mapped[str] = mapped_column(
-        String(32), default="pending", nullable=False
+        String(32), default="not_requested", nullable=False
     )
     resource_status: Mapped[str] = mapped_column(
         String(32), default="queued", nullable=False
@@ -322,6 +473,8 @@ class CycleRecord(Base):
     plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     verification: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     state_update: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    report_cursor_at_start: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    decision_report_sequence: Mapped[int | None] = mapped_column(Integer)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     state_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     analysis_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -360,6 +513,33 @@ class FindingRecord(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "unique_code", "category", "fingerprint", name="uq_finding_fingerprint"),
         Index("ix_findings_challenge_verification", "run_id", "unique_code", "verification_status"),
+    )
+
+
+class EvidenceRecord(Base):
+    __tablename__ = "evidence_items"
+
+    evidence_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=dict, nullable=False
+    )
+    storage_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_chars: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_evidence_owner", "run_id", "agent_id", "created_at"),
+        Index("ix_evidence_challenge", "run_id", "unique_code", "created_at"),
     )
 
 

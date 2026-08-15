@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -32,24 +31,6 @@ WEB_ROOT = Path(__file__).resolve().parent
 POLL_SECONDS = 0.75
 GLOBAL_EVENT_LIMIT = 5_000
 AGENT_EVENT_LIMIT = 500
-
-_REDACTED = "[REDACTED]"
-_SENSITIVE_KEYS = {
-    "api_key",
-    "apikey",
-    "authorization",
-    "benchmark_token",
-    "candidate_flag",
-    "flag",
-    "flag_candidate",
-    "password",
-    "secret",
-    "secret_value",
-    "token",
-}
-_FLAG_PATTERN = re.compile(r"(?i)\b[a-z0-9_]{0,32}\{[^{}\r\n]{1,512}\}")
-_BEARER_PATTERN = re.compile(r"(?i)(bearer\s+)[^\s,;]+")
-
 
 LOGGER = logging.getLogger("aion.runtime_web")
 if not LOGGER.handlers:
@@ -74,17 +55,9 @@ def _json_load(value: Any, default: Any) -> Any:
 
 
 def _redact(value: Any, *, key: str | None = None) -> Any:
-    """Apply a second presentation-layer redaction to persisted JSON."""
+    """Return persisted JSON unchanged for local plaintext analysis."""
 
-    if key and key.lower() in _SENSITIVE_KEYS:
-        return _REDACTED
-    if isinstance(value, str):
-        value = _BEARER_PATTERN.sub(r"\1[REDACTED]", value)
-        return _FLAG_PATTERN.sub("[REDACTED_FLAG]", value)
-    if isinstance(value, dict):
-        return {str(item_key): _redact(item, key=str(item_key)) for item_key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
+    del key
     return value
 
 
@@ -140,10 +113,9 @@ def _challenge(row: sqlite3.Row) -> dict[str, Any]:
         "slot_occupied": container_slot_occupied(row["container_status"]),
         "container_addr": _redact(_json_load(row["container_addr"], [])),
         "work_status": row["work_status"],
-        "stagnation_level": row["stagnation_level"],
+        "low_yield": bool(row["stagnation_level"]),
         "hint_eligible": bool(row["hint_eligible"]),
         "hint_requested": bool(row["hint_requested"]),
-        "extension_active": bool(row["extension_cycle_pending"]),
         "exploration_seconds": row["exploration_seconds"],
         "active_since": _iso(row["active_since"]),
         "last_progress_at": _iso(row["last_progress_at"]),
@@ -173,7 +145,6 @@ def _agent(row: sqlite3.Row, *, include_runtime: bool = False) -> dict[str, Any]
         "last_report_sequence": row["last_report_sequence"],
         "report_cursor": row["report_cursor"],
         "report_cursors": _redact(_json_load(row["report_cursors"], {})),
-        "controller_cursor": row["controller_cursor"],
         "last_summarized_sequence": row["last_summarized_sequence"],
         "started_at": _iso(row["started_at"]),
         "ended_at": _iso(row["ended_at"]),
@@ -256,7 +227,7 @@ def _report(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _credential(row: sqlite3.Row) -> dict[str, Any]:
-    """Expose credential metadata only; never select or serialize the secret."""
+    """Expose the complete credential record for local plaintext analysis."""
 
     return {
         "credential_id": row["credential_id"],
@@ -265,6 +236,7 @@ def _credential(row: sqlite3.Row) -> dict[str, Any]:
         "finding_id": row["finding_id"],
         "kind": row["kind"],
         "principal": row["principal"],
+        "secret_value": row["secret_value"],
         "scope": row["scope"],
         "verified": bool(row["verified"]),
         "created_at": _iso(row["created_at"]),
@@ -397,7 +369,7 @@ class _ReadOnlyStore:
                 for row in connection.execute(
                     """
                     SELECT credential_id, run_id, unique_code, finding_id,
-                           kind, principal, scope, verified, created_at
+                           kind, principal, secret_value, scope, verified, created_at
                     FROM credentials
                     WHERE run_id = ? ORDER BY created_at, credential_id
                     """,
@@ -771,7 +743,19 @@ class RuntimeMonitor:
                         )
                         self._send_json(detail, HTTPStatus.OK, send_body)
                     elif path == "/api/health":
-                        self._send_json({"ok": True, "run_id": monitor.run_id}, HTTPStatus.OK, send_body)
+                        with monitor._lock:
+                            state = monitor._state
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "run_id": monitor.run_id,
+                                "mode": state.mode,
+                                "test_code": state.test_code,
+                                "message": state.message,
+                            },
+                            HTTPStatus.OK,
+                            send_body,
+                        )
                     else:
                         self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND, send_body)
                 except LookupError:
