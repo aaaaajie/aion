@@ -1,0 +1,121 @@
+{
+  "version": 2,
+  "note": "Fixed-version Linux x86_64 tool chain shipped with each AION release. Runtime never installs or upgrades these. Python wheels are in tools/binaries/wheelhouse; system executables are in tools/binaries/bin.",
+  "target": {
+    "os": "linux",
+    "arch": "x86_64",
+    "python": "3.11",
+    "libc": "glibc>=2.24",
+    "binary_dir": "bin"
+  },
+  "python_runtime": {
+    "lock": "offline-requirements.lock",
+    "wheelhouse": "wheelhouse",
+    "checksums": "wheelhouse.sha256"
+  },
+  "python_packages": {
+    "pwntools": {
+      "version": "4.13.1",
+      "package": "pwntools",
+      "purpose": "Exploit scripting and payload packing",
+      "required": true
+    },
+    "angr": {
+      "version": "9.2.120",
+      "package": "angr",
+      "purpose": "Symbolic execution for binary analysis",
+      "required": false
+    },
+    "capstone": {
+      "version": "5.0.7",
+      "package": "capstone",
+      "purpose": "Disassembly engine (upstream 5.0.9 wheel reports runtime version 5.0.7)",
+      "required": true
+    },
+    "ropper": {
+      "version": "1.13.10",
+      "package": "ropper",
+      "purpose": "ROP gadget search (broken wheel: import ropper fails on 1.13.10; use pwn_rop_search or the CLI)",
+      "required": false
+    },
+    "unicorn": {
+      "version": "2.1.4",
+      "package": "unicorn",
+      "purpose": "CPU emulation",
+      "required": true
+    }
+  },
+  "system_binaries": {
+    "checksec": {
+      "version": "2.6.0",
+      "path": "bin/checksec",
+      "sha256": "220359d4fc02fc910fc5e373bc42a3285a3a06a85dcd1a925343abd0125c23de",
+      "version_args": ["--version"],
+      "purpose": "ELF hardening report",
+      "required": true
+    },
+    "patchelf": {
+      "version": "0.18.0",
+      "path": "bin/patchelf",
+      "sha256": "c93d3159f9154762bd9999a3288237090b087836acae25bbc490fce54c2d0fa2",
+      "version_args": ["--version"],
+      "purpose": "ELF patching"
+    },
+    "seccomp-tools": {
+      "version": "1.6.3",
+      "path": "bin/seccomp-tools",
+      "sha256": null,
+      "version_args": ["--version"],
+      "purpose": "Seccomp BPF disassembly",
+      "required": false
+    },
+    "radare2": {
+      "version": "6.0.4",
+      "path": "bin/radare2",
+      "sha256": "d19b8d0c3b9258e79d4b0ae650d27dc40a8ee37307f2bbea90ac2263fe5992bf",
+      "version_args": ["-v"],
+      "purpose": "Binary analysis and disassembly",
+      "required": true
+    },
+    "gdb": {
+      "version": "13.2",
+      "path": "bin/gdb",
+      "sha256": "122975f0e808793e9caf483dcce41fd92dda309296d897db87b87c45b6e44bf9",
+      "version_args": ["--version"],
+      "purpose": "Debugger batch scripts",
+      "required": true
+    },
+    "nmap": {
+      "version": "7.93",
+      "path": "bin/nmap",
+      "sha256": "2dc380700e92209f39a0c79cf5bb7de4306a47d44be287eed3a6f92b1b864bca",
+      "version_args": ["--version"],
+      "purpose": "Network service discovery",
+      "required": true
+    },
+    "hydra": {
+      "version": "9.5",
+      "path": "bin/hydra",
+      "sha256": null,
+      "version_args": ["-h"],
+      "purpose": "Bounded credential testing",
+      "required": false
+    },
+    "sqlmap": {
+      "version": "1.8.6",
+      "path": "bin/sqlmap",
+      "sha256": null,
+      "version_args": ["--version"],
+      "purpose": "SQL injection verification",
+      "required": false
+    },
+    "ffuf": {
+      "version": "2.1.0",
+      "path": "bin/ffuf",
+      "sha256": null,
+      "version_args": ["-V"],
+      "purpose": "Directory fuzzing",
+      "required": false
+    }
+  }
+}

@@ -30,6 +30,7 @@ from tools.http.fingerprint import (
     murmur3_32,
 )
 from tools.system.policy import SystemToolError, WorkspacePolicy
+from tests.resource_runtime import install_resource_runtime
 
 
 async def _manager(
@@ -48,6 +49,7 @@ async def _manager(
         path_transport=httpx.MockTransport(handler),
     )
     await manager.initialize()
+    install_resource_runtime(manager, service, "run-1", root=root)
     return service, manager, agent["agent_id"]
 
 

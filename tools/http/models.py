@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Literal
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class HttpModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class HttpAuth(HttpModel):
@@ -27,17 +28,45 @@ class HttpAuth(HttpModel):
         return self
 
 
-class HttpBody(HttpModel):
-    type: Literal["json", "form", "raw", "base64", "multipart"]
-    value: Any
+class HttpJsonBody(HttpModel):
+    type: Literal["json"]
+    value: Any = Field(description="Any JSON value, including objects, arrays, strings, numbers, booleans, or null.")
     content_type: str | None = None
 
 
-class HttpRequestSpec(HttpModel):
-    request_intent: str = Field(
-        min_length=1,
-        description="Why this request is being made, such as page_probe, api_validation, parameter_analysis, or status_check. Informational only; it does not change execution.",
-    )
+class HttpFormBody(HttpModel):
+    type: Literal["form"]
+    value: dict[str, Any] = Field(description="Form fields as a key/value object, not an encoded string.")
+    content_type: str | None = None
+
+
+class HttpRawBody(HttpModel):
+    type: Literal["raw"]
+    value: str
+    content_type: str | None = None
+
+
+class HttpBase64Body(HttpModel):
+    type: Literal["base64"]
+    value: str
+    content_type: str | None = None
+
+
+class HttpMultipartBody(HttpModel):
+    type: Literal["multipart"]
+    value: dict[str, Any] = Field(description="Multipart fields; file values use {file_path, filename?, content_type?}.")
+    content_type: str | None = None
+
+
+HttpBody = Annotated[
+    Union[HttpJsonBody, HttpFormBody, HttpRawBody, HttpBase64Body, HttpMultipartBody],
+    Field(discriminator="type"),
+]
+
+
+class HttpRequestInput(HttpModel):
+    """Compact model-facing fields shared by request and probe cases."""
+
     method: str = Field(default="GET", min_length=1, description="HTTP method for this request.")
     url: str = Field(
         min_length=1,
@@ -48,6 +77,46 @@ class HttpRequestSpec(HttpModel):
     cookies: dict[str, str] = Field(default_factory=dict)
     auth: HttpAuth | None = None
     body: HttpBody | None = None
+    verify_tls: bool = True
+    follow_redirects: bool = False
+    timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+
+    @model_validator(mode="after")
+    def validate_request_fields(self) -> "HttpRequestInput":
+        if "{{" not in self.url and not self.url.lower().startswith(("http://", "https://")):
+            raise ValueError("HTTP request URL must use http or https")
+        if "{{" not in self.method and not self.method.replace("-", "").isalnum():
+            raise ValueError("HTTP method is invalid")
+        lowered = {name.lower() for name in self.headers}
+        if "authorization" in lowered and self.auth is not None:
+            raise ValueError("auth and Authorization header cannot both be provided")
+        if "cookie" in lowered and self.cookies:
+            raise ValueError("Cookie header cannot be combined with cookies")
+        return self
+
+    def to_spec(
+        self,
+        *,
+        request_intent: str,
+        session_id: str | None = None,
+        update_session: bool = False,
+    ) -> "HttpRequestSpec":
+        values = {
+            name: getattr(self, name)
+            for name in HttpRequestInput.model_fields
+        }
+        return HttpRequestSpec(
+            request_intent=request_intent,
+            session_id=session_id,
+            update_session=update_session,
+            **values,
+        )
+
+
+class HttpRequestSpec(HttpRequestInput):
+    """Internal durable request plan; not exposed as a tool input schema."""
+
+    request_intent: str = Field(default="http_request", min_length=1)
     parent_request_id: str | None = Field(
         default=None,
         description="Optional earlier request in the same Run and Agent. Use this for context lineage, not to build a dynamic request from a response.",
@@ -75,17 +144,10 @@ class HttpRequestSpec(HttpModel):
         default=False,
         description="Persist response cookies into session_id after this request. Set true for login or other session-establishing requests.",
     )
-    verify_tls: bool = True
-    follow_redirects: bool = False
     proxy: str | None = None
-    timeout_seconds: float | None = Field(default=30.0, gt=0)
 
     @model_validator(mode="after")
     def reject_ambiguous_credentials(self) -> "HttpRequestSpec":
-        if "{{" not in self.url and not self.url.lower().startswith(("http://", "https://")):
-            raise ValueError("HTTP request URL must use http or https")
-        if "{{" not in self.method and not self.method.replace("-", "").isalnum():
-            raise ValueError("HTTP method is invalid")
         if self.proxy is not None and not self.proxy.lower().startswith(
             ("http://", "https://", "socks5://")
         ):
@@ -146,42 +208,120 @@ class HttpProbeCase(HttpModel):
     )
 
 
-class HttpRequestArguments(HttpModel):
-    request: HttpRequestSpec
-    concurrency: int = Field(default=1, gt=0)
-    expected_response_bytes: int | None = Field(
-        default=None,
-        ge=0,
-        description="Optional expected body size used only for Runtime resource admission; it is not a response-size limit.",
+class HttpProbeInputCase(HttpRequestInput):
+    variables: dict[str, HttpVariableSource] = Field(default_factory=dict)
+    combine: Literal["product", "zip"] = Field(
+        default="product",
+        description="product tests every value combination; zip pairs values by ordinal and requires equal source lengths.",
     )
-    priority: int = Field(default=50, ge=0, le=100)
-    wait_seconds: float | None = Field(
+
+    def to_case(self) -> HttpProbeCase:
+        return HttpProbeCase(
+            request=self.to_spec(request_intent="http_probe"),
+            variables=self.variables,
+            combine=self.combine,
+        )
+
+
+class HttpRequestArguments(HttpRequestInput):
+    session_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_.-]{1,128}$",
+        description="Agent-private ordered Cookie Jar. Reuse it across request calls for a multi-step protocol.",
+    )
+    update_session: bool = Field(
+        default=False,
+        description="Persist response cookies into session_id. Requires session_id.",
+    )
+    wait_seconds: float = Field(
         default=20.0,
         ge=0,
-        description="20 seconds by default; 0 returns immediately in background; null waits until the request phase ends. Waiting never sends the request again.",
+        le=20,
+        description="Wait at most 20 seconds; 0 returns immediately for background work.",
     )
-    result_limit: int = Field(default=100, gt=0)
+
+    @model_validator(mode="after")
+    def validate_session(self) -> "HttpRequestArguments":
+        if self.update_session and self.session_id is None:
+            raise ValueError("update_session requires session_id")
+        if "cookie" in {name.lower() for name in self.headers} and self.session_id:
+            raise ValueError("Cookie header cannot be combined with session_id")
+        return self
+
+    def to_request_spec(self) -> HttpRequestSpec:
+        return self.to_spec(
+            request_intent="http_request",
+            session_id=self.session_id,
+            update_session=self.update_session,
+        )
 
 
 class HttpProbeArguments(HttpModel):
-    cases: list[HttpProbeCase] = Field(
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_unambiguous_shapes(cls, value: Any) -> Any:
+        """Accept only mechanical rewrites of the current Probe contract."""
+
+        if not isinstance(value, Mapping):
+            return value
+        raw = dict(value)
+        if set(raw) == {"arguments"} and isinstance(raw["arguments"], Mapping):
+            raw = dict(raw["arguments"])
+
+        cases_value = raw.get("cases")
+        if isinstance(cases_value, Mapping):
+            cases_value = [dict(cases_value)]
+            raw["cases"] = cases_value
+
+        shared_fields = (
+            "concurrency",
+            "rate_limit_per_second",
+            "wait_seconds",
+        )
+        if isinstance(cases_value, list):
+            case_controls = [
+                key
+                for case in cases_value
+                if isinstance(case, Mapping)
+                for key in shared_fields
+                if key in case
+            ]
+            if case_controls:
+                if len(cases_value) != 1:
+                    raise ValueError(
+                        "Probe shared controls must be top-level; moving case-level "
+                        "controls is ambiguous when cases contains multiple items"
+                    )
+                case = dict(cases_value[0])
+                conflicts = [key for key in shared_fields if key in case and key in raw]
+                if conflicts:
+                    raise ValueError(
+                        "Probe shared controls cannot appear in both a case and the top level: "
+                        + ", ".join(conflicts)
+                    )
+                moved = {key: case.pop(key) for key in shared_fields if key in case}
+                raw["cases"] = [case]
+                raw.update(moved)
+        return raw
+
+    cases: list[HttpProbeInputCase] = Field(
         min_length=1,
-        description="Use one case for a finite variable matrix. Place variables with exactly {{name}} in method, URL, query, headers, cookies, or body; single-brace {name} is invalid. Do not put response-dependent chained steps in one batch; make separate calls with a Session.",
+        max_length=32,
+        description="A list of flat request cases. Each case owns variables and combine. Shared controls stay at the top level. Probe never accepts request, top-level variables/combine, or session_id. Use exact {{name}} placeholders.",
     )
-    concurrency: int = Field(default=8, gt=0)
-    rate_limit_per_second: float | None = Field(default=None, gt=0)
-    expected_response_bytes: int | None = Field(
-        default=None,
-        ge=0,
-        description="Expected body size for resource estimation only, not a hard limit.",
+    concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description="Maximum parallel HTTP requests in this probe (1-32).",
     )
-    priority: int = Field(default=50, ge=0, le=100)
-    wait_seconds: float | None = Field(
+    rate_limit_per_second: float | None = Field(default=None, gt=0, le=1_000)
+    wait_seconds: float = Field(
         default=20.0,
         ge=0,
-        description="20 seconds by default; 0 returns immediately; null waits for request execution to finish.",
+        le=20,
+        description="Wait at most 20 seconds; 0 returns immediately.",
     )
-    result_limit: int = Field(default=10, gt=0)
 
 
 class HttpOutputFilters(HttpModel):
@@ -189,9 +329,6 @@ class HttpOutputFilters(HttpModel):
     status_codes: list[int] = Field(default_factory=list)
     outcomes: list[str] = Field(default_factory=list)
     request_group_id: str | None = None
-    connection_context_id: str | None = None
-    sequence_id_min: int | None = Field(default=None, ge=0)
-    sequence_id_max: int | None = Field(default=None, ge=0)
     min_body_bytes: int | None = Field(default=None, ge=0)
     max_body_bytes: int | None = Field(default=None, ge=0)
     header_contains: dict[str, str] = Field(default_factory=dict)
@@ -217,11 +354,12 @@ class HttpOutputArguments(HttpModel):
         description="Interaction ID returned by system_http_request or system_http_probe. Use this to poll; do not resend the request.",
     )
     cursor: int = Field(default=0, ge=0)
-    limit: int = Field(default=100, gt=0)
-    wait_seconds: float | None = Field(
+    limit: int = Field(default=100, ge=1, le=200)
+    wait_seconds: float = Field(
         default=0.0,
         ge=0,
-        description="0 reads immediately; a positive value long-polls for new results; null waits indefinitely while the interaction is active.",
+        le=20,
+        description="0 reads immediately; a positive value long-polls for at most 20 seconds.",
     )
     filters: HttpOutputFilters = Field(default_factory=HttpOutputFilters)
 
@@ -233,7 +371,7 @@ class HttpResponseArguments(HttpModel):
         description="Request ID from the structured output. Use this only when the full response Body is needed as evidence.",
     )
     offset_bytes: int = Field(default=0, ge=0)
-    length_bytes: int = Field(default=30_000, gt=0)
+    length_bytes: int = Field(default=30_000, ge=1, le=100_000)
 
 
 class HttpAnalyzeArguments(HttpModel):
@@ -250,13 +388,14 @@ class HttpAnalyzeArguments(HttpModel):
         default=False,
         description="When true, append a new deterministic analysis revision; never use it to repeat network requests.",
     )
-    wait_seconds: float | None = Field(
+    wait_seconds: float = Field(
         default=20.0,
         ge=0,
-        description="How long to wait for analysis; null waits until the selected analysis revision finishes.",
+        le=20,
+        description="How long to wait for analysis, up to 20 seconds.",
     )
     cursor: int = Field(default=0, ge=0)
-    limit: int = Field(default=100, gt=0)
+    limit: int = Field(default=100, ge=1, le=200)
 
 
 class HttpStopArguments(HttpModel):
@@ -273,26 +412,15 @@ class PathProbeArguments(HttpModel):
         description="Base http(s) URL to scan. One path probe covers one base URL.",
     )
     profile: Literal["quick", "targeted", "deep"] = Field(
+        default="quick",
         description=(
             "quick (~300 paths) for a first surface pass, targeted (~9k) after "
             "technology fingerprinting, deep (~16k) for final coverage."
         )
     )
-    request_intent: str = Field(
-        default="path_discovery",
-        min_length=1,
-        description="Why this scan is being made; informational only.",
-    )
-    parent_request_id: str | None = Field(
-        default=None,
-        description="Optional earlier request in the same Run and Agent for context lineage.",
-    )
-    request_group_id: str | None = Field(
-        default=None,
-        description="Stable identifier for this scan chain; defaults to the interaction ID.",
-    )
     session_id: str | None = Field(
         default=None,
+        pattern=r"^[A-Za-z0-9_.-]{1,128}$",
         description="Agent-private Cookie Jar reused by every request in this scan.",
     )
     extensions: list[str] | None = Field(
@@ -328,13 +456,11 @@ class PathProbeArguments(HttpModel):
     auth: HttpAuth | None = None
     follow_redirects: bool = False
     verify_tls: bool = False
-    timeout_seconds: float | None = Field(default=None, gt=0)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
     max_body_bytes: int | None = Field(default=None, ge=1024)
-    concurrency: int | None = Field(default=None, gt=0)
-    rate_limit_per_second: float | None = Field(default=None, gt=0)
-    priority: int = Field(default=50, ge=0, le=100)
-    wait_seconds: float | None = Field(default=20.0, ge=0)
-    result_limit: int = Field(default=100, gt=0)
+    concurrency: int | None = Field(default=None, ge=1, le=32)
+    rate_limit_per_second: float | None = Field(default=None, gt=0, le=1_000)
+    wait_seconds: float = Field(default=20.0, ge=0, le=20)
 
     @model_validator(mode="after")
     def validate_url(self) -> "PathProbeArguments":
@@ -348,21 +474,9 @@ class FingerprintArguments(HttpModel):
         min_length=1,
         description="Base http(s) URL to fingerprint.",
     )
-    request_intent: str = Field(
-        default="technology_fingerprint",
-        min_length=1,
-        description="Why this fingerprint scan is being made; informational only.",
-    )
-    parent_request_id: str | None = Field(
-        default=None,
-        description="Optional earlier request in the same Run and Agent for context lineage.",
-    )
-    request_group_id: str | None = Field(
-        default=None,
-        description="Stable identifier for this fingerprint chain; defaults to the interaction ID.",
-    )
     session_id: str | None = Field(
         default=None,
+        pattern=r"^[A-Za-z0-9_.-]{1,128}$",
         description="Agent-private Cookie Jar reused by fingerprint requests.",
     )
     passive: bool = Field(
@@ -386,11 +500,9 @@ class FingerprintArguments(HttpModel):
     auth: HttpAuth | None = None
     follow_redirects: bool = False
     verify_tls: bool = False
-    timeout_seconds: float | None = Field(default=None, gt=0)
-    concurrency: int | None = Field(default=None, gt=0)
-    priority: int = Field(default=50, ge=0, le=100)
-    wait_seconds: float | None = Field(default=20.0, ge=0)
-    result_limit: int = Field(default=100, gt=0)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
+    concurrency: int | None = Field(default=None, ge=1, le=32)
+    wait_seconds: float = Field(default=20.0, ge=0, le=20)
 
     @model_validator(mode="after")
     def validate_url(self) -> "FingerprintArguments":

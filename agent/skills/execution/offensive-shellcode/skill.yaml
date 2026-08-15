@@ -1,0 +1,57 @@
+id: binary.offensive_shellcode
+name: Offensive Shellcode
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Shellcode development reference for offensive security engagements. Use when writing custom x86/x64 shellcode, implementing position-independent code (PIC), building shellcode loaders, evading AV/EDR detection, or converting PE files to shellcode. Covers null byte avoidance, API hashing, encoder/decoder patterns, staged vs stageless payloads, Windows PEB traversal, and cross-platform shellcode techniques.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - shellcode
+  - development
+  - reference
+  - security
+  - engagements.
+  - use
+  - when
+  - writing
+  - custom
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - ida
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_SHELLCODE
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- shellcode
+- development
+- reference
+- security
+- engagements.
+- use
+- when

@@ -1,0 +1,60 @@
+id: binary.radare2
+name: Radare2
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Use this skill whenever the user wants to analyze binaries with radare2/r2 from the command line, including reverse engineering, disassembly, function analysis, strings/import inspection, patching, binary diffing, hex inspection, or r2 scripting. Also use it when the user mentions PE/ELF/Mach-O/DEX/WASM files together with CLI analysis, `rabin2`, `rasm2`, `radiff2`, `r2pipe`, or asks for radare2 command help on Windows/Linux/macOS.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - radare2
+  - use
+  - this
+  - skill
+  - whenever
+  - user
+  - wants
+  - analyze
+  - binaries
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - ida
+  - radare2
+  - gdb
+  - frida
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - RADARE2
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- radare2
+- use
+- this
+- skill
+- whenever
+- user
+- wants

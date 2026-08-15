@@ -11,8 +11,16 @@ class ToolArguments(BaseModel):
 
 class ReadFileArguments(ToolArguments):
     file_path: str = Field(min_length=1)
-    offset: int | None = Field(default=None, ge=0)
-    limit: int | None = Field(default=None, gt=0)
+    offset: int | None = Field(
+        default=None,
+        ge=0,
+        description="Character offset in the UTF-8 file; omit to start at 0.",
+    )
+    limit_chars: int | None = Field(
+        default=None,
+        gt=0,
+        description="Maximum characters to return; this field is limit_chars, not limit.",
+    )
 
 
 class WriteFileArguments(ToolArguments):
@@ -67,7 +75,12 @@ class ShellArguments(ToolArguments):
 
 class TaskOutputArguments(ToolArguments):
     task_id: str = Field(min_length=1)
-    wait_seconds: float = Field(default=0.0, ge=0, le=30.0)
+    wait_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        le=30.0,
+        description="Bounded foreground wait; use 0 to read immediately and poll again.",
+    )
     tail_chars: int = Field(default=30_000, gt=0, le=1_000_000)
 
 

@@ -3,7 +3,6 @@
 from .models import (
     AgentReport,
     AgentRole,
-    AgentStatusReport,
     ExecutionReport,
 )
 from .policy import AgentPolicy
@@ -20,7 +19,6 @@ __all__ = [
     "AgentPolicy",
     "AgentReport",
     "AgentRole",
-    "AgentStatusReport",
     "AgentSupervisor",
     "ChallengeAgentTools",
     "ChiefAgentTools",

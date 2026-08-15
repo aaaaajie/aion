@@ -1,0 +1,57 @@
+id: web.prototype_pollution
+name: Prototype Pollution
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: Prototype pollution testing for JavaScript stacks. Use when user input is merged into objects (query parsers, JSON bodies, deep assign), when configuring libraries via untrusted keys, or when hunting RCE gadgets via polluted Object.prototype in Node or the browser.
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - prototype
+  - pollution
+  - javascript
+  - stacks.
+  - use
+  - when
+  - user
+  - input
+  - merged
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - PROTOTYPE_POLLUTION
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- prototype
+- pollution
+- javascript
+- stacks.
+- use
+- when
+- user

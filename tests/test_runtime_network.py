@@ -12,9 +12,11 @@ import pytest
 from sqlalchemy import func, select
 
 from agent.config import AgentSettings
+from agent.runner import AgentRunnerError
 from agent.runtime import AgentRuntime, RuntimePausedError
 from agent.state import StateService
 from agent.state.models import StateEventRecord
+from tests.benchmark_tools import benchmark_tool_specs
 
 
 def _settings() -> AgentSettings:
@@ -63,6 +65,9 @@ class _Benchmark:
         assert name == "benchmark_list_challenges"
         return {"ok": True, "data": []}
 
+    def tool_specs(self):
+        return benchmark_tool_specs(self.dispatch)
+
     async def close(self) -> None:
         self.closed = True
         self.events.append("benchmark-close")
@@ -76,6 +81,29 @@ class _BlockingRunner:
         self.events.append(f"runner:{self.role}")
 
     async def run_session(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        await asyncio.Event().wait()
+        return {"status": "stopped"}
+
+    async def close(self) -> None:
+        return None
+
+
+class _RecoveringControllerRunner:
+    attempts = 0
+    recovered = asyncio.Event()
+
+    def __init__(self, *_args: Any, **kwargs: Any) -> None:
+        self.role = kwargs.get("role")
+
+    async def run_session(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        type(self).attempts += 1
+        if type(self).attempts == 1:
+            raise AgentRunnerError(
+                "temporary controller context pressure",
+                code="context_capacity_deferred",
+                recoverable=True,
+            )
+        type(self).recovered.set()
         await asyncio.Event().wait()
         return {"status": "stopped"}
 
@@ -130,6 +158,42 @@ async def test_runtime_waits_for_network_before_benchmark_and_chief(tmp_path: Pa
 
     await runtime.close()
     assert events.index("benchmark-close") < events.index("vpn-close")
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chief_session_does_not_close_runtime_or_children(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    network = _Network(events)
+    _RecoveringControllerRunner.attempts = 0
+    _RecoveringControllerRunner.recovered = asyncio.Event()
+    runtime = AgentRuntime(
+        _settings(),
+        benchmark=_Benchmark(events),
+        network_manager=network,
+        project_root=tmp_path,
+        run_root=tmp_path / "runs",
+        runner_factory=_RecoveringControllerRunner,
+        catalog_reconcile_interval_seconds=0,
+    )
+    await runtime.start("test", run_id="controller-recovers")
+    await asyncio.wait_for(_RecoveringControllerRunner.recovered.wait(), timeout=3)
+    assert _RecoveringControllerRunner.attempts >= 2
+    assert network.closed is False
+    assert runtime.state_service is not None
+    overview = await runtime.state_service.get_overview("controller-recovers")
+    chief = next(item for item in overview["agents"] if item["role"] == "chief")
+    assert chief["status"] in {"running", "waiting"}
+    assert overview["run"]["status"] == "active"
+    events_rows = await runtime.state_service.list_agent_events(
+        "controller-recovers", chief["agent_id"]
+    )
+    assert any(
+        item["event_type"] == "controller_session_recovery_scheduled"
+        for item in events_rows
+    )
+    await runtime.close()
 
 
 @pytest.mark.asyncio

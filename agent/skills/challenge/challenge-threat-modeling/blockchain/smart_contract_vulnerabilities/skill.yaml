@@ -1,0 +1,56 @@
+id: exploit.smart_contract_vulnerabilities
+name: Smart Contract Vulnerabilities
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: Smart contract vulnerability playbook. Use when auditing Solidity/EVM contracts for reentrancy, integer overflow, access control, delegatecall, flash loan, signature replay, and MEV-related attack patterns.
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - smart
+  - contract
+  - vulnerabilities
+  - vulnerability
+  - playbook.
+  - use
+  - when
+  - auditing
+  - solidity
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - ida
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - SMART_CONTRACT_VULNERABILITIES
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- smart
+- contract
+- vulnerabilities
+- vulnerability
+- playbook.
+- use
+- when

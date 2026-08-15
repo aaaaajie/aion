@@ -1,0 +1,57 @@
+id: web.offensive_idor
+name: Offensive Idor
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: 'IDOR (Insecure Direct Object Reference) testing checklist: object ID enumeration, horizontal/vertical privilege escalation, GUID predictability, indirect references via hashes, chained IDOR, and API endpoint IDOR. Use for web app pentests and bug bounty IDOR discovery.'
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - idor
+  - insecure
+  - direct
+  - object
+  - reference
+  - checklist
+  - enumeration
+  - horizontal
+  - vertical
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_IDOR
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- idor
+- insecure
+- direct
+- object
+- reference
+- checklist
+- enumeration

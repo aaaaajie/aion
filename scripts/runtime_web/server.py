@@ -113,10 +113,9 @@ def _challenge(row: sqlite3.Row) -> dict[str, Any]:
         "slot_occupied": container_slot_occupied(row["container_status"]),
         "container_addr": _redact(_json_load(row["container_addr"], [])),
         "work_status": row["work_status"],
-        "stagnation_level": row["stagnation_level"],
+        "low_yield": bool(row["stagnation_level"]),
         "hint_eligible": bool(row["hint_eligible"]),
         "hint_requested": bool(row["hint_requested"]),
-        "extension_active": bool(row["extension_cycle_pending"]),
         "exploration_seconds": row["exploration_seconds"],
         "active_since": _iso(row["active_since"]),
         "last_progress_at": _iso(row["last_progress_at"]),
@@ -146,7 +145,6 @@ def _agent(row: sqlite3.Row, *, include_runtime: bool = False) -> dict[str, Any]
         "last_report_sequence": row["last_report_sequence"],
         "report_cursor": row["report_cursor"],
         "report_cursors": _redact(_json_load(row["report_cursors"], {})),
-        "controller_cursor": row["controller_cursor"],
         "last_summarized_sequence": row["last_summarized_sequence"],
         "started_at": _iso(row["started_at"]),
         "ended_at": _iso(row["ended_at"]),
@@ -745,7 +743,19 @@ class RuntimeMonitor:
                         )
                         self._send_json(detail, HTTPStatus.OK, send_body)
                     elif path == "/api/health":
-                        self._send_json({"ok": True, "run_id": monitor.run_id}, HTTPStatus.OK, send_body)
+                        with monitor._lock:
+                            state = monitor._state
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "run_id": monitor.run_id,
+                                "mode": state.mode,
+                                "test_code": state.test_code,
+                                "message": state.message,
+                            },
+                            HTTPStatus.OK,
+                            send_body,
+                        )
                     else:
                         self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND, send_body)
                 except LookupError:

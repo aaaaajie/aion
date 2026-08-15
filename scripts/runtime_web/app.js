@@ -51,18 +51,42 @@
     benchmark_close_challenge: "关闭挑战",
     chief_create_challenge_agent: "创建挑战 Agent",
     chief_get_challenge_reports: "读取挑战报告",
+    chief_get_core_state: "读取核心状态",
+    chief_get_schedule: "读取任务排期",
+    chief_refresh_challenges: "刷新挑战目录",
     chief_request_hint: "申请挑战提示",
+    chief_wait_for_state: "等待全局状态",
+    challenge_advance_cycle: "推进分析周期",
     challenge_begin_cycle: "开始分析周期",
-    challenge_submit_analysis_plan: "提交分析计划",
+    challenge_close_challenge: "关闭挑战",
+    challenge_commit_cycle: "提交分析周期",
     challenge_create_execution_agent: "创建执行 Agent",
     challenge_get_execution_reports: "读取执行报告",
+    challenge_get_state: "读取挑战状态",
     challenge_get_updates: "读取协作更新",
-    challenge_commit_cycle: "提交分析周期",
     challenge_report_status: "报告挑战状态",
+    challenge_start_cycle: "启动分析周期",
+    challenge_submit_analysis_plan: "提交分析计划",
     challenge_submit_flag: "提交候选 Flag",
-    challenge_close_challenge: "关闭挑战",
+    challenge_wait_for_state: "等待挑战状态",
+    execution_get_assignment: "读取执行任务",
     execution_update_progress: "更新执行进度",
     execution_report: "提交执行报告",
+    skill_invoke: "调用技能",
+    skill_list: "列出技能",
+    skill_read: "读取技能说明",
+    skill_resource_read: "读取技能资源",
+    skill_search: "搜索技能",
+    system_http_analyze: "分析 HTTP 响应",
+    system_http_cleanup: "清理 HTTP 任务",
+    system_http_output: "获取 HTTP 输出",
+    system_http_probe: "探测 HTTP 服务",
+    system_http_request: "发起 HTTP 请求",
+    system_http_response: "读取 HTTP 响应",
+    system_http_stop: "停止 HTTP 任务",
+    system_web_fingerprint: "识别 Web 服务",
+    system_web_path_probe: "探测 Web 路径",
+    tool_result_read: "读取工具结果",
   };
 
   const state = {
@@ -78,6 +102,8 @@
     detailTabScroll: new Map(),
     expandedToolGroups: new Set(),
     expandedToolCalls: new Set(),
+    toolViewModes: new Map(),
+    toolBatchSelections: new Map(),
     toolScrollPositions: new Map(),
     scrollByAgent: new Map(),
     unreadByAgent: new Map(),
@@ -172,15 +198,27 @@
   }
 
   function dateValue(value) {
-    if (!value) return 0;
-    const parsed = new Date(value).getTime();
-    return Number.isNaN(parsed) ? 0 : parsed;
+    const parsed = timestampDate(value);
+    return parsed ? parsed.getTime() : 0;
+  }
+
+  function timestampDate(value) {
+    if (!value) return null;
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+    const text = String(value).trim();
+    if (!text) return null;
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+    const normalized = !hasTimezone && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(text)
+      ? `${text.replace(" ", "T")}Z`
+      : text;
+    const parsed = new Date(normalized);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
 
   function clock(value) {
     if (!value) return "—";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return short(value, 18);
+    const date = timestampDate(value);
+    if (!date) return short(value, 18);
     return date.toLocaleTimeString("zh-CN", {
       hour12: false,
       hour: "2-digit",
@@ -197,6 +235,18 @@
     if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
     return `${Math.floor(seconds / 86400)} 天前`;
+  }
+
+  function runtimeDuration(agent, challenge) {
+    const startedAt = dateValue(agent?.started_at) || dateValue(challenge?.started_at) || dateValue(agent?.created_at);
+    if (!startedAt) return "—";
+    const status = String(agent?.status || "").toLowerCase();
+    const workStatus = String(challenge?.work_status || "").toLowerCase();
+    const finishedAt = TERMINAL.has(status) || workStatus === "closed"
+      ? dateValue(agent?.ended_at) || dateValue(challenge?.updated_at) || Date.now()
+      : Date.now();
+    const minutes = Math.max(0, Math.floor((Math.max(startedAt, finishedAt) - startedAt) / 60_000));
+    return `${minutes} 分钟`;
   }
 
   function stateTone(value) {
@@ -294,7 +344,7 @@
     const text = String(value || "").toLowerCase();
     if (["failed", "error"].some((part) => text.includes(part))) return "error";
     if (["running", "working", "active"].some((part) => text === part)) return "active";
-    if (["pending", "queued", "starting", "blocked", "stopping"].some((part) => text === part)) return "pending";
+    if (["pending", "queued", "starting", "waiting", "blocked", "stopping"].some((part) => text === part)) return "pending";
     if (text === "completed") return "completed";
     return "muted";
   }
@@ -306,11 +356,17 @@
 
   function challengeMachineActive(agent) {
     const challenge = challengeForAgent(agent);
+    const containerStatus = String(challenge?.container_status || "").toLowerCase();
+    const released = challenge?.slot_occupied === false || ["stopped", "closed"].includes(containerStatus);
+    const agentStatus = String(agent?.status || "").toLowerCase();
     return Boolean(
       agent?.role === "challenge"
-      && challenge?.slot_occupied === true
-      && !challenge.is_completed
-      && ACTIVE_CHALLENGE_WORK.has(String(challenge.work_status || "").toLowerCase()),
+      && !released
+      && !challenge?.is_completed
+      && (
+        ACTIVE_CHALLENGE_WORK.has(String(challenge?.work_status || "").toLowerCase())
+        || ["running", "working", "active"].includes(agentStatus)
+      ),
     );
   }
 
@@ -330,6 +386,12 @@
       // The icon represents the challenge machine, so use the persisted machine
       // state instead of turning the occupied machine gray.
       return "active";
+    }
+    if (agent?.role === "challenge" && status === "muted") {
+      const challenge = challengeForAgent(agent);
+      const containerStatus = String(challenge?.container_status || "").toLowerCase();
+      const occupied = challenge?.slot_occupied !== false && !["stopped", "closed"].includes(containerStatus);
+      if (occupied && !challenge?.is_completed) return "pending";
     }
     if (agent?.role !== "execution" || status !== "error") return status;
     const containerStatus = String(challengeForAgent(agent)?.container_status || "").toLowerCase();
@@ -436,8 +498,8 @@
 
   function executionAgentName(agent) {
     if (!agent?.started_at) return "Exec Agent.—.—";
-    const started = new Date(agent.started_at);
-    if (Number.isNaN(started.getTime())) return "Exec Agent.—.—";
+    const started = timestampDate(agent.started_at);
+    if (!started) return "Exec Agent.—.—";
     return `Exec Agent.${String(started.getHours()).padStart(2, "0")}.${String(started.getMinutes()).padStart(2, "0")}`;
   }
 
@@ -497,10 +559,18 @@
     return String(agent.initial_prompt || "");
   }
 
+  function agentRoleLabel(agent) {
+    if (agent?.kind === "bootstrap") return "Bootstrap";
+    if (agent?.kind === "exploration") return "探索";
+    return ROLE_NAMES[agent?.role] || agent?.role || "Agent";
+  }
+
   function displayName(agent) {
     if (!agent) return "未选择 Agent";
     if (agent.role === "chief") return "首席 Agent";
     if (agent.role === "challenge") return agent.unique_code || "挑战 Agent";
+    if (agent.kind === "bootstrap") return "Bootstrap";
+    if (agent.kind === "exploration") return "探索";
     return executionAgentName(agent);
   }
 
@@ -664,6 +734,7 @@
       const update = mergeSnapshot(await response.json());
       if (update.meaningful) renderAll();
       else renderChrome();
+      refreshRuntimeDuration();
       if (state.selectedAgent && !state.selectedDetail) loadAgent(state.selectedAgent, { reset: true });
     } catch (error) {
       setText("#monitor-status", "连接等待");
@@ -675,6 +746,7 @@
         lastPollErrorAt = now;
       }
     } finally {
+      refreshRuntimeDuration();
       window.setTimeout(poll, 750);
     }
   }
@@ -708,7 +780,7 @@
 
   function agentMatches(agent, query) {
     if (!query) return true;
-    return [agent.agent_id, agent.unique_code, agent.mission, agent.status]
+    return [displayName(agent), agent.kind, agent.agent_id, agent.unique_code, agent.mission, agent.status]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(query));
   }
@@ -853,7 +925,7 @@
     const thinking = thinkingStatus(agent, events);
     const avatar = $("#selected-avatar");
     avatar.replaceChildren(makeAgentIcon(agent?.role || "chief", agentIconStatus(agent)));
-    setText("#selected-role", agent ? `${ROLE_NAMES[agent.role] || agent.role} · ${agent.unique_code || "全局"}` : "未选择 Agent");
+    setText("#selected-role", agent ? `${agentRoleLabel(agent)} · ${agent.unique_code || "全局"}` : "未选择 Agent");
     setText("#selected-name", agent ? displayName(agent) : "选择左侧 Agent");
     setText("#selected-mission", agent ? short(agentMission(agent) || agent.agent_id, 110) : "选择后显示该 Agent 的任务、思考和工具活动");
     $("#selected-mission").dataset.tooltip = agent ? agentMission(agent) || agent.agent_id : "";
@@ -1154,16 +1226,208 @@
     return name.replace(/_/g, " ");
   }
 
+  function isRecord(value) {
+    return Boolean(value && typeof value === "object" && !Array.isArray(value));
+  }
+
+  function isHttpTool(name) {
+    return String(name || "").startsWith("system_http_");
+  }
+
+  function toolArguments(row) {
+    const value = row.call?.payload?.arguments;
+    return isRecord(value) ? value : {};
+  }
+
+  function toolResultValue(row) {
+    if (!row.result) return null;
+    const payload = row.result.payload || {};
+    return payload.result === undefined ? payload : payload.result;
+  }
+
+  function summaryValue(value, length = 96) {
+    if (value === undefined || value === null || value === "") return "—";
+    if (typeof value === "string") return short(value.replace(/\s+/g, " ").trim(), length);
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    if (Array.isArray(value)) return `${value.length} 项`;
+    if (isRecord(value)) return `${Object.keys(value).length} 个字段`;
+    return short(value, length);
+  }
+
+  function summaryItemsForTool(name, args) {
+    const items = [];
+    const seen = new Set();
+    const add = (label, value, key = label) => {
+      if (value === undefined || value === null || value === "") return;
+      items.push([label, summaryValue(value)]);
+      seen.add(key);
+    };
+    const request = isRecord(args.request) ? args.request : args;
+    if (name === "system_shell") {
+      add("命令", args.command, "command");
+      add("超时", args.timeout, "timeout");
+    } else if (["system_read_file", "system_write_file", "system_edit_file"].includes(name)) {
+      add("文件", args.file_path || args.filePath || args.path, "file");
+      if (name === "system_write_file") add("内容", args.content === undefined ? undefined : `${copyText(args.content).length} 字符`, "content");
+      if (name === "system_edit_file") {
+        add("旧文本", args.old_string === undefined ? undefined : `${copyText(args.old_string).length} 字符`, "old_string");
+        add("新文本", args.new_string === undefined ? undefined : `${copyText(args.new_string).length} 字符`, "new_string");
+      }
+    } else if (name === "system_http_request" || name === "system_http_probe") {
+      add("方法", request.method || (name === "system_http_probe" ? "批量" : "GET"), "method");
+      add("目标", request.url, "url");
+      if (name === "system_http_probe") add("请求模板", args.cases, "cases");
+      if (request.query && Object.keys(request.query).length) add("Query", `${Object.keys(request.query).length} 个字段`, "query");
+      if (request.headers && Object.keys(request.headers).length) add("Header", `${Object.keys(request.headers).length} 个字段`, "headers");
+      if (request.cookies && Object.keys(request.cookies).length) add("Cookie", `${Object.keys(request.cookies).length} 个字段`, "cookies");
+      if (request.body !== undefined) add("Body", `${copyText(request.body).length} 字符`, "body");
+      add("等待", args.wait_seconds, "wait_seconds");
+      add("并发", args.concurrency, "concurrency");
+    } else if (name === "system_http_response") {
+      add("交互", args.interaction_id, "interaction_id");
+      add("请求", args.request_id, "request_id");
+      add("范围", args.offset_bytes === undefined ? undefined : `${args.offset_bytes} + ${args.length_bytes || 0} 字节`, "range");
+    } else if (isHttpTool(name)) {
+      add("交互", args.interaction_id, "interaction_id");
+      add("等待", args.wait_seconds, "wait_seconds");
+      add("游标", args.cursor, "cursor");
+      add("数量", args.limit, "limit");
+    } else if (name.includes("agent")) {
+      add("标识", args.unique_code || args.agent_id, "identity");
+      add("任务", args.mission, "mission");
+      add("状态", args.status, "status");
+      add("阶段", args.phase, "phase");
+    } else {
+      const preferred = ["file_path", "path", "pattern", "query", "skill_id", "resource", "status", "phase", "summary", "wait_seconds", "max_reports", "limit", "task_id", "interaction_id"];
+      preferred.forEach((key) => add(key, args[key], key));
+    }
+    Object.entries(args).forEach(([key, value]) => {
+      if (seen.has(key) || items.length >= 5) return;
+      add(key, value, key);
+    });
+    if (!items.length) items.push(["参数", Object.keys(args).length ? `${Object.keys(args).length} 项` : "无参数"]);
+    return items;
+  }
+
+  function resultSummaryItems(name, value) {
+    const items = [];
+    const data = isRecord(value?.data) ? value.data : value;
+    const add = (label, candidate) => {
+      if (candidate === undefined || candidate === null || candidate === "") return;
+      items.push([label, summaryValue(candidate)]);
+    };
+    if (isRecord(data)) {
+      add("状态", data.status || data.outcome || (data.ok === false ? "失败" : data.ok === true ? "成功" : undefined));
+      add("HTTP 状态", data.status_code);
+      add("交互", data.interaction_id);
+      add("请求", data.request_id);
+      add("耗时", data.elapsed_ms === undefined ? undefined : `${data.elapsed_ms} ms`);
+      add("大小", data.body_bytes === undefined ? data.bytes_returned : `${data.body_bytes} 字节`);
+      add("结果数", Array.isArray(data.results) ? data.results.length : undefined);
+      add("错误", data.error || data.error_code);
+      if (!items.length) add("输出", data);
+    } else {
+      add("输出", data);
+    }
+    return items.length ? items : [["输出", "—"]];
+  }
+
+  function resultContentItems(name, value) {
+    const items = [];
+    const seen = new Set();
+    const data = isRecord(value?.data) ? value.data : value;
+    const add = (label, candidate, key = label) => {
+      if (seen.has(key) || candidate === undefined || candidate === null || candidate === "") return;
+      const text = copyText(candidate).trim();
+      if (!text) return;
+      if (items.some(([, existing]) => existing === text)) return;
+      seen.add(key);
+      items.push([label, text]);
+    };
+
+    if (!isRecord(data)) {
+      add("输出", data);
+      return items;
+    }
+
+    if (name === "system_shell") {
+      add("标准输出", data.output, "stdout");
+      add("错误输出", data.stderr || data.error_output, "stderr");
+    } else if (name === "system_read_file") {
+      add("文件内容", data.content, "content");
+    } else if (name === "system_write_file" || name === "system_edit_file") {
+      add("文件", data.file_path || data.path, "path");
+      add("操作结果", data.message || data.type || data.status, "operation");
+    }
+
+    [
+      ["内容", "content"],
+      ["输出", "output"],
+      ["标准输出", "stdout"],
+      ["错误输出", "stderr"],
+      ["响应正文", "body"],
+      ["文本", "text"],
+      ["消息", "message"],
+      ["摘要", "summary"],
+      ["标题", "title"],
+      ["错误详情", "error"],
+    ].forEach(([label, key]) => add(label, data[key], key));
+
+    if (!items.length) add("结构化输出", data, "structured");
+    return items.slice(0, 4);
+  }
+
+  function renderSummaryGrid(items) {
+    const grid = make("dl", "tool-summary-grid");
+    items.forEach(([label, value]) => {
+      grid.append(make("dt", "", label), make("dd", "", value));
+    });
+    return grid;
+  }
+
+  function renderSummaryContent(items, keyPrefix) {
+    if (!items.length) return null;
+    const section = make("section", "tool-summary-content");
+    const header = make("div", "tool-detail-section-header");
+    header.append(make("strong", "", "具体输出"));
+    section.append(header);
+    items.forEach(([label, value], index) => {
+      const block = make("div", "tool-summary-content-block");
+      const blockHeader = make("div", "tool-summary-content-header");
+      blockHeader.append(make("strong", "", label), makeCopyButton(`复制${label}`, value));
+      const pre = make("pre", "tool-summary-content-pre", value);
+      pre.dataset.scrollKey = `${keyPrefix}-content-${index}`;
+      pre.addEventListener("scroll", () => state.toolScrollPositions.set(pre.dataset.scrollKey, pre.scrollTop));
+      block.append(blockHeader, pre);
+      section.append(block);
+    });
+    return section;
+  }
+
+  function toolRecovery(value) {
+    if (!isRecord(value)) return null;
+    const error = isRecord(value.error) ? value.error : null;
+    if (!error) return null;
+    const retry = isRecord(error.retry) ? error.retry : {};
+    const recovery = [
+      error.stage ? `阶段：${error.stage}` : "",
+      error.code ? `错误码：${error.code}` : "",
+      retry.action && retry.action !== "none" ? `恢复动作：${retry.action}` : "",
+      retry.tool ? `所需工具：${retry.tool}` : "",
+    ].filter(Boolean).join(" · ");
+    return recovery ? make("p", "muted-line tool-recovery", recovery) : null;
+  }
+
   function toolTarget(row) {
-    const argumentsValue = row.call?.payload?.arguments;
-    if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) return "";
+    const argumentsValue = toolArguments(row);
+    const request = isRecord(argumentsValue.request) ? argumentsValue.request : argumentsValue;
     if (typeof argumentsValue.description === "string" && argumentsValue.description.trim()) return short(argumentsValue.description.trim(), 56);
-    const filePath = argumentsValue.file_path || argumentsValue.filePath || argumentsValue.path;
+    const filePath = request.file_path || request.filePath || request.path;
     if (typeof filePath === "string" && filePath.trim()) return basename(filePath);
-    if (typeof argumentsValue.pattern === "string" && argumentsValue.pattern.trim()) return short(argumentsValue.pattern.trim(), 56);
+    if (typeof request.pattern === "string" && request.pattern.trim()) return short(request.pattern.trim(), 56);
     if (typeof argumentsValue.unique_code === "string" && argumentsValue.unique_code.trim()) return argumentsValue.unique_code.trim();
     if (typeof argumentsValue.mission === "string" && argumentsValue.mission.trim()) return short(argumentsValue.mission.trim(), 56);
-    const url = argumentsValue.url || argumentsValue.address;
+    const url = request.url || request.address;
     if (typeof url === "string" && url.trim()) {
       try {
         return new URL(url).hostname || short(url, 56);
@@ -1225,12 +1489,529 @@
     shell.id = `${callId}-detail`;
     shell.setAttribute("aria-hidden", String(!expanded));
     const detail = make("div", "tool-detail tool-event-body");
-    if (row.call) detail.append(toolDetailSection("调用参数", row.call.payload?.arguments || {}, `${row.id}-input`));
-    if (row.result) detail.append(toolDetailSection("输出结果", row.result.payload?.result ?? row.result.payload ?? {}, `${row.id}-output`));
-    if (!row.result) detail.append(make("p", "muted-line", "工具尚未返回结果。"));
+    detail.append(renderToolViews(row, callId));
     shell.append(detail);
     wrapper.append(head, shell);
     return wrapper;
+  }
+
+  function renderToolViews(row, callId) {
+    const name = toolName(row);
+    const options = isHttpTool(name)
+      ? [["packet", "报文"], ["json", "JSON"]]
+      : [["summary", "摘要"], ["json", "JSON"]];
+    let mode = state.toolViewModes.get(callId) || options[0][0];
+    if (!options.some(([key]) => key === mode)) mode = options[0][0];
+    state.toolViewModes.set(callId, mode);
+    const wrapper = make("div", "tool-view");
+    const tabs = make("div", "tool-view-tabs");
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", `${toolDisplayName(name)}详情视图`);
+    const panel = make("div", "tool-view-panel");
+    panel.id = `${callId}-view`;
+    const buttons = [];
+    const update = (nextMode, focus = false) => {
+      state.toolViewModes.set(callId, nextMode);
+      buttons.forEach((button) => {
+        const active = button.dataset.view === nextMode;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+      });
+      panel.replaceChildren(renderToolView(row, callId, nextMode));
+      restoreToolScrollPositions(panel);
+      if (focus) buttons.find((button) => button.dataset.view === nextMode)?.focus();
+    };
+    options.forEach(([key, label]) => {
+      const button = make("button", `tool-view-tab ${key === mode ? "active" : ""}`, label);
+      button.type = "button";
+      button.dataset.view = key;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", String(key === mode));
+      button.setAttribute("aria-controls", panel.id);
+      button.tabIndex = key === mode ? 0 : -1;
+      button.addEventListener("click", () => update(key));
+      tabs.append(button);
+      buttons.push(button);
+    });
+    tabs.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const index = buttons.indexOf(document.activeElement);
+      const nextIndex = event.key === "Home" ? 0
+        : event.key === "End" ? buttons.length - 1
+          : (index + (event.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+      update(buttons[nextIndex].dataset.view, true);
+    });
+    wrapper.append(tabs, panel);
+    update(mode);
+    return wrapper;
+  }
+
+  function renderToolView(row, callId, mode) {
+    if (mode === "json") return renderToolJsonView(row);
+    if (mode === "packet") return renderHttpView(row, callId);
+    return renderToolSummaryView(row);
+  }
+
+  function renderToolSummaryView(row) {
+    const name = toolName(row);
+    const args = toolArguments(row);
+    const view = make("div", "tool-summary-view");
+    view.append(toolSummarySection("参数摘要", summaryItemsForTool(name, args), "复制完整调用参数", args, "input"));
+    if (row.result) {
+      const result = toolResultValue(row);
+      const recovery = toolRecovery(result);
+      if (recovery) view.append(recovery);
+      view.append(toolSummarySection("输出摘要", resultSummaryItems(name, result), "复制完整输出结果", result, "output"));
+      const outputContent = renderSummaryContent(resultContentItems(name, result), row.id);
+      if (outputContent) view.append(outputContent);
+      const resultRef = result?.result_ref || row.result.payload?.result_ref;
+      if (resultRef) view.append(make("p", "muted-line", `完整结果：${resultRef}`));
+    } else {
+      view.append(make("p", "muted-line", "工具尚未返回结果。"));
+    }
+    return view;
+  }
+
+  function toolSummarySection(label, items, copyLabel, copyValue, key) {
+    const section = make("section", "tool-summary-section");
+    const header = make("div", "tool-detail-section-header");
+    const meta = make("span", "tool-detail-meta");
+    meta.append(makeCopyButton(copyLabel, copyValue));
+    header.append(make("strong", "", label), meta);
+    section.append(header, renderSummaryGrid(items));
+    section.dataset.summaryKey = key;
+    return section;
+  }
+
+  function renderToolJsonView(row) {
+    const view = make("div", "tool-json-view");
+    if (row.call) view.append(toolDetailSection("调用参数", toolArguments(row), `${row.id}-input`));
+    if (row.result) {
+      const result = toolResultValue(row);
+      const recovery = toolRecovery(result);
+      if (recovery) view.append(recovery);
+      view.append(toolDetailSection("输出结果", result, `${row.id}-output`));
+    }
+    if (!row.result) view.append(make("p", "muted-line", "工具尚未返回结果。"));
+    return view;
+  }
+
+  function httpRequestEntries(name, args) {
+    if (name === "system_http_probe") {
+      return (Array.isArray(args.cases) ? args.cases : []).map((entry, index) => ({
+        id: `request-${index + 1}`,
+        kind: "request",
+        index,
+        request: isRecord(entry?.request) ? entry.request : entry,
+        variables: entry?.variables,
+        combine: entry?.combine,
+      }));
+    }
+    if (name === "system_http_request") {
+      const request = isRecord(args.request) ? args.request : args;
+      return [
+        {
+          id: "request-1",
+          kind: "request",
+          index: 0,
+          request: isRecord(request) ? request : {},
+        },
+      ];
+    }
+    return [];
+  }
+
+  function httpResultEntries(value) {
+    const preview = httpPreviewValue(value);
+    const data = isRecord(preview.value?.data) ? preview.value.data : preview.value;
+    if (!isRecord(data)) return [];
+    const list = Array.isArray(data.results) ? data.results
+      : Array.isArray(data.preview) ? data.preview
+        : Array.isArray(data.request_catalog) ? data.request_catalog : null;
+    if (list) {
+      return list.map((entry, index) => ({
+        id: String(entry?.request_id || entry?.interaction_id || entry?.id || `response-${index + 1}`),
+        kind: "response",
+        index,
+        response: isRecord(entry) ? entry : { content: entry },
+        previewed: preview.previewed,
+        previewFragment: preview.previewFragment,
+      }));
+    }
+    const hasResponse = ["status_code", "final_url", "headers", "content", "bytes_returned", "body_bytes", "outcome"].some((key) => data[key] !== undefined);
+    return hasResponse ? [{ id: String(data.request_id || "response-1"), kind: "response", index: 0, response: data, previewed: preview.previewed, previewFragment: preview.previewFragment }] : [];
+  }
+
+  function httpTargetContext(args) {
+    const interactionId = args?.interaction_id;
+    const requestId = args?.request_id;
+    if (!interactionId && !requestId) return null;
+    const events = [...(state.events || [])].reverse();
+    for (const event of events) {
+      if (event.event_type !== "tool_call") continue;
+      const payload = event.payload || {};
+      if (!isHttpTool(payload.tool_name) || !["system_http_request", "system_http_probe"].includes(payload.tool_name)) continue;
+      const callArgs = isRecord(payload.arguments) ? payload.arguments : {};
+      const callId = payload.tool_call_id;
+      const resultEvent = events.find((candidate) => candidate.event_type === "tool_result" && candidate.payload?.tool_call_id === callId);
+      const resultPayload = resultEvent?.payload || {};
+      const result = resultPayload.result === undefined ? resultPayload : resultPayload.result;
+      const preview = httpPreviewValue(result);
+      const data = isRecord(preview.value?.data) ? preview.value.data : preview.value;
+      const matchesInteraction = interactionId && data?.interaction_id === interactionId;
+      const matchingResponse = Array.isArray(data?.results)
+        ? data.results.find((entry) => requestId && entry?.request_id === requestId)
+        : null;
+      if (!matchesInteraction && !matchingResponse) continue;
+      const requests = httpRequestEntries(payload.tool_name, callArgs);
+      return { request: requests[0]?.request || null };
+    }
+    return null;
+  }
+
+  function normalizeJsonControls(source) {
+    let output = "";
+    let insideString = false;
+    let escaped = false;
+    for (const character of String(source || "")) {
+      if (insideString && character === "\\" && !escaped) {
+        output += character;
+        escaped = true;
+        continue;
+      }
+      if (character === '"' && !escaped) insideString = !insideString;
+      if (insideString && character.charCodeAt(0) < 32) {
+        output += character === "\n" ? "\\n" : character === "\r" ? "\\r" : character === "\t" ? "\\t" : " ";
+      } else {
+        output += character;
+      }
+      escaped = false;
+    }
+    return output;
+  }
+
+  function parseJsonFragment(source) {
+    for (const candidate of [source, normalizeJsonControls(source)]) {
+      try {
+        return JSON.parse(candidate);
+      } catch (_) {
+        // A tool preview can end in the middle of a large string or object.
+      }
+    }
+    return null;
+  }
+
+  function extractJsonArrayObjects(source, key) {
+    const marker = `"${key}"`;
+    const markerIndex = String(source || "").indexOf(marker);
+    if (markerIndex < 0) return [];
+    const openIndex = String(source).indexOf("[", markerIndex + marker.length);
+    if (openIndex < 0) return [];
+    const objects = [];
+    let depth = 0;
+    let start = -1;
+    let insideString = false;
+    let escaped = false;
+    for (let index = openIndex + 1; index < source.length; index += 1) {
+      const character = source[index];
+      if (insideString) {
+        if (character === "\\" && !escaped) {
+          escaped = true;
+          continue;
+        }
+        if (character === '"' && !escaped) insideString = false;
+        escaped = false;
+        continue;
+      }
+      if (character === '"') {
+        insideString = true;
+        continue;
+      }
+      if (character === "{") {
+        if (depth === 0) start = index;
+        depth += 1;
+        continue;
+      }
+      if (character === "}") {
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          const parsed = parseJsonFragment(source.slice(start, index + 1));
+          if (isRecord(parsed)) objects.push(parsed);
+          start = -1;
+        }
+      }
+      if (character === "]" && depth === 0) break;
+    }
+    return objects;
+  }
+
+  function httpPreviewValue(value) {
+    if (!isRecord(value) || value.truncated !== true || typeof value.preview !== "string") {
+      return { value, previewed: false };
+    }
+    const parsed = parseJsonFragment(value.preview);
+    if (parsed) return { value: parsed, previewed: true };
+    for (const key of ["results", "preview", "request_catalog"]) {
+      const entries = extractJsonArrayObjects(value.preview, key);
+      if (entries.length) return { value: { data: { [key]: entries } }, previewed: true, previewFragment: true };
+    }
+    return {
+      value: {
+        data: {
+          content: value.preview,
+          encoding: "json-preview",
+        },
+      },
+      previewed: true,
+      previewFragment: true,
+    };
+  }
+
+  function httpTarget(value) {
+    const target = value?.final_url || value?.url || value?.path || "";
+    if (!target) return "未命名请求";
+    try {
+      const url = new URL(target);
+      return `${url.hostname}${url.pathname || "/"}`;
+    } catch (_) {
+      return short(target, 80);
+    }
+  }
+
+  function httpEntryLabel(entry, index) {
+    const value = entry.kind === "request" ? entry.request : entry.response;
+    const method = entry.kind === "request" ? String(value?.method || "GET").toUpperCase() : String(value?.status_code || value?.outcome || "响应");
+    const size = value?.body_bytes === undefined ? value?.bytes_returned : value.body_bytes;
+    const suffix = size === undefined ? "" : ` · ${size} B`;
+    return `${index + 1}. ${method} · ${httpTarget(value)}${suffix}`;
+  }
+
+  function httpMetaItems(name, args, result) {
+    const items = [];
+    const add = (label, value) => {
+      if (value !== undefined && value !== null && value !== "") items.push([label, summaryValue(value, 72)]);
+    };
+    const preview = httpPreviewValue(result);
+    const data = isRecord(preview.value?.data) ? preview.value.data : preview.value;
+    add("交互", args.interaction_id || data?.interaction_id);
+    add("请求", args.request_id || data?.request_id);
+    add("等待", args.wait_seconds);
+    add("会话", args.session_id);
+    add("并发", args.concurrency);
+    add("范围", args.offset_bytes === undefined ? undefined : `${args.offset_bytes} + ${args.length_bytes || 0} 字节`);
+    add("编码", data?.encoding);
+    if (preview.previewed) add("载荷", "工具结果预览");
+    if (preview.previewFragment) add("完整性", "结果列表可能不完整");
+    if (data?.truncated === true || data?.eof === false) add("完整性", "当前仅为部分内容");
+    return items;
+  }
+
+  function httpTargetItems(name, args, request, response, entry) {
+    const items = [];
+    const add = (label, value) => {
+      if (value !== undefined && value !== null && value !== "") items.push([label, summaryValue(value, 120)]);
+    };
+    const url = request?.url || response?.final_url || response?.url || args.url;
+    const parts = requestParts(url, request?.query);
+    add("方法", request?.method);
+    add("主机", parts.host);
+    add("路径", parts.target);
+    add("请求意图", request?.request_intent);
+    if (isRecord(request?.query) && Object.keys(request.query).length) {
+      add("查询参数", Object.entries(request.query).map(([key, value]) => `${key}=${summaryValue(value, 48)}`).join("&"));
+    }
+    if (entry?.variables && Object.keys(entry.variables).length) add("模板变量", Object.keys(entry.variables).join(", "));
+    add("状态", response?.status_code === undefined ? response?.outcome : response.status_code);
+    add("最终地址", response?.final_url);
+    add("耗时", response?.elapsed_ms === undefined ? undefined : `${response.elapsed_ms} ms`);
+    add("大小", response?.body_bytes === undefined ? response?.bytes_returned : `${response.body_bytes} 字节`);
+    add("类型", response?.content_type);
+    add("标题", response?.title);
+    add("交互", args.interaction_id || response?.interaction_id);
+    add("请求 ID", args.request_id || response?.request_id);
+    return items;
+  }
+
+  function renderHttpTargetCard(name, args, request, response, entry) {
+    const section = make("section", "http-target-card");
+    const header = make("div", "tool-detail-section-header");
+    const url = request?.url || response?.final_url || response?.url || args.url || "";
+    header.append(make("strong", "", "目标信息"));
+    if (url) header.append(makeCopyButton("复制目标 URL", url));
+    section.append(header);
+    section.append(make("div", `http-target-url ${url ? "" : "is-missing"}`, url || "目标 URL 未随此事件返回"));
+    const items = httpTargetItems(name, args, request, response, entry);
+    if (items.length) section.append(renderSummaryGrid(items));
+    return section;
+  }
+
+  function renderHttpMeta(items) {
+    if (!items.length) return null;
+    const meta = make("div", "http-meta-line");
+    items.forEach(([label, value]) => meta.append(make("span", "http-meta-item", `${label} ${value}`)));
+    return meta;
+  }
+
+  function requestParts(url, query) {
+    const original = String(url || "");
+    try {
+      const parsed = new URL(original);
+      const params = new URLSearchParams(parsed.search);
+      Object.entries(isRecord(query) ? query : {}).forEach(([key, value]) => {
+        if (Array.isArray(value)) value.forEach((item) => params.append(key, String(item)));
+        else params.set(key, String(value));
+      });
+      return { host: parsed.host, target: `${parsed.pathname || "/"}${params.toString() ? `?${params.toString()}` : ""}` };
+    } catch (_) {
+      return { host: "", target: original || "/" };
+    }
+  }
+
+  function base64(value) {
+    try {
+      const bytes = new TextEncoder().encode(String(value));
+      let binary = "";
+      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+      return btoa(binary);
+    } catch (_) {
+      return String(value);
+    }
+  }
+
+  function requestHeaderLines(request) {
+    const headers = isRecord(request?.headers) ? Object.entries(request.headers).map(([key, value]) => [key, String(value)]) : [];
+    const lower = new Set(headers.map(([key]) => key.toLowerCase()));
+    const parts = requestParts(request?.url, request?.query);
+    if (parts.host && !lower.has("host")) headers.unshift(["Host", parts.host]);
+    if (isRecord(request?.cookies) && Object.keys(request.cookies).length && !lower.has("cookie")) {
+      headers.push(["Cookie", Object.entries(request.cookies).map(([key, value]) => `${key}=${value}`).join("; ")]);
+    }
+    if (isRecord(request?.auth) && !lower.has("authorization")) {
+      const auth = request.auth;
+      if (auth.type === "bearer" && auth.token) headers.push(["Authorization", `Bearer ${auth.token}`]);
+      if (auth.type === "basic" && auth.username !== undefined && auth.password !== undefined) headers.push(["Authorization", `Basic ${base64(`${auth.username}:${auth.password}`)}`]);
+    }
+    const body = request?.body;
+    if (isRecord(body) && body.content_type && !lower.has("content-type")) headers.push(["Content-Type", body.content_type]);
+    return headers;
+  }
+
+  function requestBodyText(body) {
+    if (body === undefined || body === null) return "";
+    if (!isRecord(body) || !body.type) return copyText(body);
+    if (body.type === "json") return pretty(body.value);
+    if (body.type === "form") return new URLSearchParams(Object.entries(body.value || {}).map(([key, value]) => [key, String(value)])).toString();
+    if (body.type === "multipart") return pretty(body.value);
+    return copyText(body.value);
+  }
+
+  function httpRequestText(request) {
+    const parts = requestParts(request?.url, request?.query);
+    const method = String(request?.method || "GET").toUpperCase();
+    const lines = [`${method} ${parts.target} HTTP/1.1`];
+    requestHeaderLines(request).forEach(([key, value]) => lines.push(`${key}: ${value}`));
+    const body = requestBodyText(request?.body);
+    if (body) lines.push("", body);
+    return lines.join("\n");
+  }
+
+  function httpResponseText(response) {
+    const lines = [];
+    if (response?.status_code !== undefined) lines.push(`HTTP/1.1 ${response.status_code}`);
+    const headers = isRecord(response?.headers) ? response.headers : isRecord(response?.header_features) ? response.header_features : {};
+    Object.entries(headers).forEach(([key, value]) => lines.push(`${key}: ${value}`));
+    const body = response?.content === undefined ? response?.body : response.content;
+    if (body !== undefined && body !== null && body !== "") lines.push("", copyText(body));
+    return lines.join("\n") || "当前事件没有可构造的 HTTP 响应报文。";
+  }
+
+  function renderHttpPacket(label, text, key, note) {
+    const section = make("section", "http-packet-section");
+    const header = make("div", "tool-detail-section-header");
+    header.append(make("strong", "", label), makeCopyButton(`复制${label}`, text));
+    section.append(header);
+    if (note) section.append(make("p", "muted-line", note));
+    const pre = make("pre", "http-packet-pre", text);
+    pre.dataset.scrollKey = key;
+    pre.addEventListener("scroll", () => state.toolScrollPositions.set(key, pre.scrollTop));
+    section.append(pre);
+    return section;
+  }
+
+  function renderHttpSelectionList(entries, callId, row) {
+    if (entries.length <= 1) return null;
+    const list = make("div", "http-selection-list");
+    list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "HTTP 请求或响应列表");
+    const selectedId = state.toolBatchSelections.get(callId) || entries[0].id;
+    entries.forEach((entry, index) => {
+      const button = make("button", `http-selection-item ${entry.id === selectedId ? "active" : ""}`);
+      button.type = "button";
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", String(entry.id === selectedId));
+      button.append(make("span", "http-selection-label", httpEntryLabel(entry, index)));
+      button.addEventListener("click", () => {
+        state.toolBatchSelections.set(callId, entry.id);
+        const parent = button.closest(".tool-view-panel");
+        if (parent) {
+          parent.replaceChildren(renderHttpView(row, callId));
+          restoreToolScrollPositions(parent);
+        }
+      });
+      list.append(button);
+    });
+    return list;
+  }
+
+  function renderHttpView(row, callId) {
+    const name = toolName(row);
+    const args = toolArguments(row);
+    const result = toolResultValue(row);
+    const view = make("div", "http-view");
+    const meta = renderHttpMeta(httpMetaItems(name, args, result));
+    if (meta) view.append(meta);
+    const requests = httpRequestEntries(name, args);
+    const responses = row.result ? httpResultEntries(result) : [];
+    const linkedRequest = httpTargetContext(args)?.request || null;
+    const entries = responses.length > 1 ? responses : requests.length > 1 ? requests : [];
+    if (entries.length > 1) {
+      const selectedId = state.toolBatchSelections.get(callId) || entries[0].id;
+      const list = renderHttpSelectionList(entries, callId, row);
+      if (list) view.append(list);
+      const selected = entries.find((entry) => entry.id === selectedId) || entries[0];
+      view.append(renderHttpTargetCard(
+        name,
+        args,
+        selected.kind === "request" ? selected.request : null,
+        selected.kind === "response" ? selected.response : null,
+        selected,
+      ));
+      if (selected.kind === "request") {
+        view.append(renderHttpPacket("请求报文预览", httpRequestText(selected.request), `${callId}-${selected.id}-request`, "Host 等字段可能由目标 URL 推导；完整工具参数见 JSON 页签。"));
+      } else {
+        const partial = selected.response?.truncated === true || selected.response?.eof === false;
+        const previewNote = selected.previewed ? (selected.previewFragment ? "工具结果是截断的 JSON 预览，当前显示预览原文；完整外层 JSON 见 JSON 页签。" : "当前报文由工具结果预览解析；完整外层 JSON 见 JSON 页签。") : "报文由当前工具结果重建，不代表字节级网络抓包。";
+        view.append(renderHttpPacket("响应报文预览", httpResponseText(selected.response), `${callId}-${selected.id}-response`, partial ? "当前仅为部分内容，显示当前事件返回的字节范围。" : previewNote));
+      }
+      return view;
+    }
+    const request = requests[0]?.request || linkedRequest;
+    const response = responses[0]?.response || null;
+    if (request || response) view.append(renderHttpTargetCard(name, args, request, response, requests[0] || responses[0]));
+    if (request) view.append(renderHttpPacket("请求报文预览", httpRequestText(request), `${callId}-request`, "Host 等字段可能由目标 URL 推导；完整工具参数见 JSON 页签。"));
+    if (responses.length) {
+      const partial = response?.truncated === true || response?.eof === false;
+      const previewNote = responses[0].previewed ? (responses[0].previewFragment ? "工具结果是截断的 JSON 预览，当前显示预览原文；完整外层 JSON 见 JSON 页签。" : "当前报文由工具结果预览解析；完整外层 JSON 见 JSON 页签。") : "报文由当前工具结果重建，不代表字节级网络抓包。";
+      view.append(renderHttpPacket("响应报文预览", httpResponseText(response), `${callId}-response`, partial ? "当前仅为部分内容，显示当前事件返回的字节范围。" : previewNote));
+    }
+    if (!requests.length && !responses.length) {
+      view.append(make("p", "muted-line", row.result ? "当前 HTTP 操作返回的是交互状态，未包含可构造的请求或响应报文。" : "暂无可构造的 HTTP 报文。"));
+    }
+    const recovery = toolRecovery(result);
+    if (recovery) view.append(recovery);
+    return view;
   }
 
   function toolDetailSection(label, value, key) {
@@ -1318,10 +2099,21 @@
     items.forEach(([label, value, tooltip]) => {
       const stat = make("div", "detail-stat");
       stat.append(make("small", "", label), make("b", "", value || "—"));
+      if (label === "已运行时长") stat.dataset.runtimeDuration = "true";
       if (tooltip) stat.dataset.tooltip = tooltip;
       grid.append(stat);
     });
     return grid;
+  }
+
+  function refreshRuntimeDuration() {
+    const value = document.querySelector("[data-runtime-duration] b");
+    if (!value || state.detailTab !== "overview") return;
+    const agent = selectedAgent();
+    const detailAgent = state.selectedDetail?.agent || agent;
+    if (!detailAgent) return;
+    const challenge = (state.snapshot?.challenges || []).find((item) => item.unique_code === detailAgent.unique_code);
+    value.textContent = runtimeDuration(detailAgent, challenge);
   }
 
   function detailBlock(label, value) {
@@ -1339,7 +2131,7 @@
     identityAvatar.append(makeAgentIcon(agent.role, agentIconStatus(agent)));
     identity.append(identityAvatar);
     const copy = make("div", "identity-copy");
-    copy.append(make("strong", "", ROLE_NAMES[agent.role] || agent.role), make("small", "", agent.agent_id));
+    copy.append(make("strong", "", agentRoleLabel(agent)), make("small", "", agent.agent_id));
     identity.append(copy);
     target.append(identity);
     if (agent.role === "chief") {
@@ -1349,14 +2141,18 @@
         ["获得分数", `${stats.score} 分`],
       ]));
     }
-    target.append(detailGrid([
+    const overviewStats = [
       ["状态", statusLabel(agent.status)],
       ["Challenge", agent.unique_code || "全局"],
       ["父 Agent", agent.parent_id ? short(agent.parent_id, 19) : "根 Agent", agent.parent_id || ""],
       ["Cycle", agent.cycle_id ? short(agent.cycle_id, 19) : "—", agent.cycle_id || ""],
       ["最近心跳", agent.last_heartbeat_at ? elapsed(agent.last_heartbeat_at) : "无"],
       ["创建时间", clock(agent.created_at)],
-    ]));
+    ];
+    if (agent.role === "chief" || agent.role === "challenge") {
+      overviewStats.splice(1, 0, ["已运行时长", runtimeDuration(agent, challenge)]);
+    }
+    target.append(detailGrid(overviewStats));
     if (agent.mission) target.append(detailBlock("任务", agent.mission));
     if (challenge) {
       target.append(detailGrid([
@@ -1443,7 +2239,7 @@
       tone: stateTone(item.status),
     })));
     target.append(runtimeListCard("准入", snapshot.admissions || [], (item) => ({
-      title: `${ROLE_NAMES[item.role] || item.role} · P${item.priority ?? "—"}`,
+      title: `${item.kind === "bootstrap" ? "Bootstrap" : item.kind === "exploration" ? "探索" : ROLE_NAMES[item.role] || item.role} · P${item.priority ?? "—"}`,
       meta: short(item.agent_id, 30),
       state: statusLabel(item.status),
       tone: stateTone(item.status),

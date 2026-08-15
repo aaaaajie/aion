@@ -4,27 +4,16 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator
 
 from agent.state.schemas import (
-    AttackPathInput,
     ChallengeDirection,
-    CredentialInput,
-    ExecutionKind,
     ExecutionTaskInput,
-    FindingInput,
-    FindingResolutionInput,
     HypothesisOutcome,
-    HypothesisInput,
-    TaskStage,
+    ReportFindingInput,
 )
 
 AgentRole = Literal["chief", "challenge", "execution"]
-HintBasis = Literal[
-    "high_probability_path",
-    "second_pass_convergence",
-    "near_deadline",
-]
 AgentStatus = Literal[
     "pending",
     "running",
@@ -56,129 +45,81 @@ class UniqueCodeArguments(_Arguments):
         return value
 
 
-class HintArguments(UniqueCodeArguments):
-    basis: HintBasis
-    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+class ReportQueryArguments(_Arguments):
+    max_reports: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+        description="Maximum new reports to consume in this snapshot (1-50).",
+    )
+
+
+class LaunchChallengesArguments(_Arguments):
+    unique_codes: list[str] = Field(min_length=1, max_length=16)
+
+    @field_validator("unique_codes")
+    @classmethod
+    def unique_non_blank_codes(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("challenge codes must not be blank")
+        if len(set(values)) != len(values):
+            raise ValueError("challenge codes must be unique")
+        return values
+
+
+class ControllerWaitArguments(_Arguments):
+    reason: str | None = Field(default=None, max_length=1_000)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class SimpleHintArguments(UniqueCodeArguments):
     reason: str = Field(min_length=1, max_length=1_000)
+
+
+class ChallengeDispatchArguments(_Arguments):
+    summary: str = Field(
+        min_length=1,
+        max_length=8_000,
+        description="Decision summary at the top level; do not wrap arguments in another object.",
+    )
+    outcome: Literal["continue", "blocked", "completed", "failed"] = "continue"
+    direction: ChallengeDirection | None = None
+    tasks: SkipValidation[list[ExecutionTaskInput]] = Field(
+        default_factory=list,
+        description=(
+            "Independent tasks. Each task requires only objective; optional malformed "
+            "metadata is dropped or defaulted with warnings."
+        ),
+    )
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+    next_steps: list[str] = Field(default_factory=list, max_length=50)
 
     @field_validator("evidence_refs")
     @classmethod
     def non_blank_evidence_refs(cls, values: list[str]) -> list[str]:
         if any(not value.strip() for value in values):
-            raise ValueError("evidence_refs must not be blank")
-        return values
-
-
-class CreateExecutionArguments(_Arguments):
-    mission: str = Field(min_length=1, max_length=4_000)
-    hypothesis_key: str = Field(min_length=1, max_length=128)
-    task_key: str = Field(min_length=1, max_length=128)
-    cycle_id: str | None = Field(default=None, min_length=1, max_length=128)
-    kind: Literal["general", "recon", "web", "exploit", "credential", "privilege", "verification", "exploration"] = "general"
-    task_stage: TaskStage
-    priority: int = Field(default=50, ge=0, le=100)
-    success_criteria: list[str] = Field(default_factory=list, max_length=20)
-    context_refs: list[str] = Field(default_factory=list, max_length=50)
-    branch_key: str | None = Field(default=None, min_length=1, max_length=256)
-    timeout_seconds: int = Field(default=1_800, ge=1, le=3_600)
-
-    @field_validator("mission")
-    @classmethod
-    def mission_non_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("mission must not be blank")
-        return value
-
-
-class ReportQueryArguments(_Arguments):
-    max_reports: int = Field(default=20, ge=1, le=50)
-
-
-class CycleArguments(_Arguments):
-    expected_challenge_version: int = Field(ge=1)
-
-
-class AnalysisPlanArguments(_Arguments):
-    cycle_id: str = Field(min_length=1, max_length=128)
-    expected_version: int = Field(ge=1)
-    analysis_summary: str = Field(min_length=1, max_length=8_000)
-    direction: ChallengeDirection = "unknown"
-    hypotheses: list[HypothesisInput] = Field(default_factory=list, max_length=50)
-    information_gaps: list[str] = Field(default_factory=list, max_length=50)
-    avoid_repeating: list[str] = Field(default_factory=list, max_length=50)
-    tasks: list[ExecutionTaskInput] = Field(default_factory=list, max_length=50)
-
-
-class CommitCycleArguments(_Arguments):
-    cycle_id: str = Field(min_length=1, max_length=128)
-    expected_version: int = Field(ge=1)
-    summary: str = Field(min_length=1, max_length=8_000)
-    findings: list[FindingInput] = Field(default_factory=list, max_length=100)
-    credentials: list[CredentialInput] = Field(default_factory=list, max_length=50)
-    next_steps: list[str] = Field(default_factory=list, max_length=50)
-    new_attack_paths: list[AttackPathInput] = Field(default_factory=list, max_length=20)
-    outcome: Literal["progress", "no_progress", "completed", "blocked", "failed"]
-
-
-class ProgressArguments(_Arguments):
-    status: Literal["working", "blocked", "completed", "failed", "cancelled"]
-    phase: str = Field(min_length=1, max_length=64)
-    summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
-    evidence_paths: list[str] = Field(default_factory=list, max_length=50)
-    expected_result_seconds: int | None = Field(default=None, ge=1, le=300)
-
-
-ChallengeReportStatus = Literal[
-    "analyzing",
-    "blocked",
-    "ready_for_hint",
-    "flag_candidate",
-    "completed",
-    "failed",
-]
-
-
-class ChallengeStatusArguments(_Arguments):
-    status: ChallengeReportStatus
-    summary: str = Field(min_length=1, max_length=4_000)
-    hint_recommended: bool = False
-    blocker: str | None = Field(default=None, max_length=1_000)
-    next_steps: list[str] = Field(default_factory=list, max_length=20)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
-
-    @model_validator(mode="after")
-    def validate_hint_recommendation(self) -> "ChallengeStatusArguments":
-        if any(not value.strip() for value in self.evidence_refs):
-            raise ValueError("evidence_refs must not be blank")
-        if self.status == "ready_for_hint" and self.hint_recommended:
-            if not self.blocker or not self.blocker.strip():
-                raise ValueError(
-                    "blocker is required when hint_recommended is true"
-                )
-            if not self.evidence_refs:
-                raise ValueError(
-                    "evidence_refs are required when hint_recommended is true"
-                )
-        return self
-
-
-class StagnationExtensionArguments(_Arguments):
-    unique_code: str = Field(min_length=1, max_length=256)
-    reason: Literal["high_probability_path", "waiting_remote", "imminent_result"]
-    evidence_refs: list[str] = Field(min_length=1, max_length=20)
-    note: str | None = Field(default=None, max_length=1_000)
-
-    @field_validator("evidence_refs")
-    @classmethod
-    def non_blank_refs(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("evidence_refs must not be blank")
+            raise ValueError("evidence references must not be blank")
         return values
 
 
 class SubmitFlagArguments(_Arguments):
     flag: str = Field(min_length=1, max_length=4_096)
+
+
+class EvidenceReadArguments(_Arguments):
+    evidence_ref: str = Field(
+        pattern=r"^evidence:evidence_[0-9a-f]{32}$",
+        description="Complete evidence:evidence_<32 hex> reference.",
+    )
+    offset: int = Field(default=0, ge=0)
+    limit_chars: int = Field(default=8_000, ge=1, le=8_000)
 
 
 ExecutionReportStatus = Literal["completed", "blocked", "failed", "cancelled"]
@@ -187,27 +128,33 @@ ExecutionReportStatus = Literal["completed", "blocked", "failed", "cancelled"]
 class ExecutionReport(_Arguments):
     status: ExecutionReportStatus
     summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
-    evidence_paths: list[str] = Field(default_factory=list, max_length=50)
-    next_steps: list[str] = Field(default_factory=list, max_length=20)
-    candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    hypothesis_outcome: HypothesisOutcome
-    finding_resolutions: list[FindingResolutionInput] = Field(
-        default_factory=list, max_length=50
+    hypothesis_outcome: SkipValidation[HypothesisOutcome] = Field(
+        default="inconclusive",
+        description="Use exactly supported, rejected, or inconclusive.",
     )
-
-    @model_validator(mode="after")
-    def validate_terminal_outcome(self) -> "ExecutionReport":
-        if self.hypothesis_outcome in {"supported", "rejected"}:
-            has_evidence = bool(self.evidence_paths) or any(
-                finding.evidence_paths for finding in self.findings
-            ) or any(item.evidence_paths for item in self.finding_resolutions)
-            if not has_evidence:
-                raise ValueError(
-                    "supported or rejected outcomes require structured evidence"
-                )
-        return self
+    findings: SkipValidation[list[ReportFindingInput]] = Field(
+        default_factory=list,
+        description=(
+            "Optional best-effort findings. Each item uses summary, optional object detail, "
+            "category, confidence, verification_status, finding_ref, and evidence_refs. "
+            "Malformed items are warnings and never invalidate the terminal report."
+        ),
+    )
+    evidence_refs: SkipValidation[list[str]] = Field(
+        default_factory=list,
+        description="Optional Evidence refs; malformed refs are dropped with warnings.",
+    )
+    next_steps: list[str] = Field(default_factory=list, max_length=20)
+    candidate_flag: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4_096,
+        description=(
+            "An exact flag token ready for challenge_submit_flag. Omit it for task names, "
+            "credentials, URLs, vulnerability descriptions, or unverified guesses."
+        ),
+    )
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class AgentReport(_Arguments):
@@ -216,36 +163,9 @@ class AgentReport(_Arguments):
     unique_code: str | None = None
     status: str = Field(min_length=1, max_length=64)
     summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[FindingInput] = Field(default_factory=list, max_length=50)
-    evidence_paths: list[str] = Field(default_factory=list, max_length=50)
+    findings: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    evidence_refs: list[Any] = Field(default_factory=list, max_length=50)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     sequence: int = Field(default=0, ge=0)
-
-
-class AgentStatusReport(_Arguments):
-    agent_id: str = Field(min_length=1)
-    unique_code: str = Field(min_length=1)
-    status: ChallengeReportStatus
-    summary: str = Field(min_length=1, max_length=4_000)
-    hint_recommended: bool = False
-    blocker: str | None = Field(default=None, max_length=1_000)
-    next_steps: list[str] = Field(default_factory=list, max_length=20)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
-    sequence: int = Field(default=0, ge=0)
-
-    @model_validator(mode="after")
-    def validate_hint_recommendation(self) -> "AgentStatusReport":
-        if any(not value.strip() for value in self.evidence_refs):
-            raise ValueError("evidence_refs must not be blank")
-        if self.status == "ready_for_hint" and self.hint_recommended:
-            if not self.blocker or not self.blocker.strip():
-                raise ValueError(
-                    "blocker is required when hint_recommended is true"
-                )
-            if not self.evidence_refs:
-                raise ValueError(
-                    "evidence_refs are required when hint_recommended is true"
-                )
-        return self

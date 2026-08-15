@@ -1,0 +1,217 @@
+{
+  "directions": [
+    "web",
+    "pentest",
+    "binary",
+    "exploit",
+    "cloud",
+    "evasion"
+  ],
+  "packs": {
+    "binary": {
+      "skills": [
+        "ctf-reverse",
+        "ida-reverse",
+        "ghidra-reverse",
+        "radare2",
+        "binary-diff",
+        "protocol-reverse",
+        "dotnet-reverse",
+        "go-rust-reverse",
+        "apk-reverse",
+        "mobile-reverse",
+        "macos-reverse",
+        "reverse-flow"
+      ],
+      "tools": [
+        "bin_identify",
+        "bin_strings",
+        "bin_checksec",
+        "bin_symbols",
+        "bin_disassemble",
+        "bin_patch_elf",
+        "pwn_pack",
+        "pwn_rop_search",
+        "pwn_libc_offsets",
+        "bin_seccomp",
+        "bin_debug"
+      ]
+    },
+    "cloud": {
+      "skills": [
+        "cloud-infra-supply-chain",
+        "cloud-k8s",
+        "dependency-confusion",
+        "auditing-mcp-servers-for-tool-poisoning"
+      ],
+      "tools": [
+        "system_network_discovery",
+        "system_http_request",
+        "system_http_probe",
+        "cloud_enum"
+      ]
+    },
+    "evasion": {
+      "skills": [
+        "offensive-waf-bypass",
+        "offensive-shellcode",
+        "llm-prompt-injection",
+        "detecting-indirect-prompt-injection",
+        "ai-llm-agent-security",
+        "continuous-llm-red-teaming-with-promptfoo",
+        "testing-prompt-injection-in-rag-pipelines",
+        "orchestrating-llm-attacks-with-pyrit"
+      ],
+      "tools": [
+        "system_http_request",
+        "system_http_probe",
+        "evasion_payload_analyze"
+      ]
+    },
+    "exploit": {
+      "skills": [
+        "ctf-pwn",
+        "stack-overflow-and-rop",
+        "heap-exploitation",
+        "format-string-exploitation",
+        "pwn-chain",
+        "kernel-exploitation",
+        "browser-exploitation-v8",
+        "offensive-exploit-development",
+        "offensive-basic-exploitation",
+        "offensive-crash-analysis",
+        "symbolic-execution-tools",
+        "patch-diff-exploit"
+      ],
+      "tools": [
+        "bin_identify",
+        "bin_checksec",
+        "bin_symbols",
+        "bin_disassemble",
+        "bin_patch_elf",
+        "pwn_pack",
+        "pwn_rop_search",
+        "pwn_libc_offsets",
+        "bin_seccomp",
+        "bin_debug"
+      ]
+    },
+    "pentest": {
+      "skills": [
+        "api-protocol-security",
+        "api-recon-and-docs",
+        "graphql-and-hidden-parameters",
+        "idor-broken-object-authorization",
+        "oauth-oidc-misconfiguration",
+        "http-host-header-attacks",
+        "http-parameter-pollution",
+        "web-cache-deception",
+        "websocket-security",
+        "performing-web-application-vulnerability-triage",
+        "src-hunter",
+        "401-403-bypass-techniques"
+      ],
+      "tools": [
+        "system_network_discovery",
+        "system_network_output",
+        "system_http_request",
+        "system_http_probe",
+        "pentest_service_probe",
+        "pentest_auth_brute",
+        "pentest_dir_fuzz",
+        "pentest_credential_lookup"
+      ]
+    },
+    "web": {
+      "skills": [
+        "sqli-sql-injection",
+        "xss-cross-site-scripting",
+        "csrf-cross-site-request-forgery",
+        "path-traversal-lfi",
+        "upload-insecure-files",
+        "cmdi-command-injection",
+        "deserialization-insecure",
+        "api-auth-and-jwt-abuse",
+        "auth-access-control",
+        "source-code-audit",
+        "recon-js-analysis",
+        "php-file-upload-audit"
+      ],
+      "tools": [
+        "system_http_request",
+        "system_http_probe",
+        "system_web_path_probe",
+        "system_web_fingerprint",
+        "system_http_analyze",
+        "system_network_discovery",
+        "pentest_dir_fuzz",
+        "pentest_sqlmap"
+      ]
+    }
+  },
+  "skills": [
+    "challenge/challenge-threat-modeling",
+    "common/recognize-challenge-direction",
+    "execution/401-403-bypass-techniques",
+    "execution/ai-llm-agent-security",
+    "execution/api-auth-and-jwt-abuse",
+    "execution/api-protocol-security",
+    "execution/api-recon-and-docs",
+    "execution/apk-reverse",
+    "execution/auditing-mcp-servers-for-tool-poisoning",
+    "execution/auth-access-control",
+    "execution/binary-diff",
+    "execution/browser-exploitation-v8",
+    "execution/cloud-infra-supply-chain",
+    "execution/cloud-k8s",
+    "execution/cmdi-command-injection",
+    "execution/continuous-llm-red-teaming-with-promptfoo",
+    "execution/csrf-cross-site-request-forgery",
+    "execution/ctf-pwn",
+    "execution/ctf-reverse",
+    "execution/dependency-confusion",
+    "execution/deserialization-insecure",
+    "execution/detecting-indirect-prompt-injection",
+    "execution/dotnet-reverse",
+    "execution/format-string-exploitation",
+    "execution/ghidra-reverse",
+    "execution/go-rust-reverse",
+    "execution/graphql-and-hidden-parameters",
+    "execution/heap-exploitation",
+    "execution/http-host-header-attacks",
+    "execution/http-parameter-pollution",
+    "execution/ida-reverse",
+    "execution/idor-broken-object-authorization",
+    "execution/kernel-exploitation",
+    "execution/llm-prompt-injection",
+    "execution/macos-reverse",
+    "execution/mobile-reverse",
+    "execution/oauth-oidc-misconfiguration",
+    "execution/offensive-basic-exploitation",
+    "execution/offensive-crash-analysis",
+    "execution/offensive-exploit-development",
+    "execution/offensive-shellcode",
+    "execution/offensive-waf-bypass",
+    "execution/orchestrating-llm-attacks-with-pyrit",
+    "execution/patch-diff-exploit",
+    "execution/path-traversal-lfi",
+    "execution/performing-web-application-vulnerability-triage",
+    "execution/php-file-upload-audit",
+    "execution/protocol-reverse",
+    "execution/pwn-chain",
+    "execution/radare2",
+    "execution/recon-js-analysis",
+    "execution/reverse-flow",
+    "execution/source-code-audit",
+    "execution/sqli-sql-injection",
+    "execution/src-hunter",
+    "execution/stack-overflow-and-rop",
+    "execution/symbolic-execution-tools",
+    "execution/testing-prompt-injection-in-rag-pipelines",
+    "execution/upload-insecure-files",
+    "execution/web-cache-deception",
+    "execution/websocket-security",
+    "execution/xss-cross-site-scripting"
+  ],
+  "version": 1
+}

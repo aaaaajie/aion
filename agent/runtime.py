@@ -18,6 +18,7 @@ from agent.state import (
     AgentReportInput,
     CapabilityContext,
     CapabilityRegistry,
+    ChallengeScheduler,
     ResourceController,
     StateService,
     StagnationManager,
@@ -64,11 +65,9 @@ class AgentRuntime:
         capability_registry: CapabilityRegistry | None = None,
         psutil_module: Any = psutil,
         clock: Callable[[], datetime] = utc_now,
-        admission_interval_seconds: float = 2.0,
         stagnation_interval_seconds: float = 30.0,
         projection_interval_seconds: float = 1.0,
         catalog_reconcile_interval_seconds: float = 120.0,
-        second_pass_min_remaining_seconds: int = 30 * 60,
     ) -> None:
         self.settings = settings
         self.benchmark = benchmark
@@ -79,11 +78,9 @@ class AgentRuntime:
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.psutil_module = psutil_module
         self.clock = clock
-        self.admission_interval_seconds = admission_interval_seconds
         self.stagnation_interval_seconds = stagnation_interval_seconds
         self.projection_interval_seconds = projection_interval_seconds
         self.catalog_reconcile_interval_seconds = catalog_reconcile_interval_seconds
-        self.second_pass_min_remaining_seconds = second_pass_min_remaining_seconds
         self.run_id: str | None = None
         self.chief_agent_id: str | None = None
         self.state_service: StateService | None = None
@@ -99,6 +96,7 @@ class AgentRuntime:
         self._network_failure_recorded = False
         self._network_failure_record_lock = asyncio.Lock()
         self._loop_diagnostics: dict[str, float] = {}
+        self._shutdown_event = asyncio.Event()
         self._closed = False
 
     @classmethod
@@ -118,8 +116,6 @@ class AgentRuntime:
     ) -> str:
         if self.state_service is not None:
             raise RuntimeError("AgentRuntime is already started")
-        if not self.run_root.is_relative_to(self.project_root):
-            raise ValueError("run_root must be inside the SystemTools workspace")
         run_id = run_id or uuid4().hex
         run_dir = self.run_root / run_id
         database_path = run_dir / "state.sqlite3"
@@ -157,7 +153,6 @@ class AgentRuntime:
                 "state_service": service,
                 "capability_registry": self.capability_registry,
                 "catalog_reconcile_interval_seconds": self.catalog_reconcile_interval_seconds,
-                "second_pass_min_remaining_seconds": self.second_pass_min_remaining_seconds,
                 "duration_minutes": self.settings.run_duration_minutes,
             }
             if self.runner_factory is not None:
@@ -167,7 +162,6 @@ class AgentRuntime:
                 run_id,
                 cpu_limit_percent=self.settings.cpu_limit_percent,
                 memory_limit_percent=self.settings.memory_limit_percent,
-                start_interval_seconds=self.settings.agent_start_interval_seconds,
                 storage_root=self.project_root,
                 disk_reserve_bytes=self.settings.disk_reserve_bytes,
                 disk_reserve_percent=self.settings.disk_reserve_percent,
@@ -260,16 +254,34 @@ class AgentRuntime:
             await self.supervisor.close()
         raise self._network_failure
 
-    async def admission_once(self) -> dict[str, Any] | None:
+    async def admission_once(
+        self,
+        *,
+        sample: dict[str, float] | None = None,
+    ) -> dict[str, Any] | None:
         controller = self._resource()
-        sample = await controller.sample()
+        sample = sample or await controller.sample()
         item = await controller.next_queued_work_item()
         if item is None:
             return None
+        return await self._admit_item(item, sample=sample)
+
+    async def _admit_item(
+        self,
+        item: dict[str, Any],
+        *,
+        sample: dict[str, float],
+    ) -> dict[str, Any]:
+        """Admit the already selected queue item without re-reading another queue."""
+
+        controller = self._resource()
         if item["kind"] == "resource":
             decision = await controller.admit_resource_work(item["id"], sample=sample)
             if not decision.get("ok") or decision.get("status") != "reserved":
                 return decision
+            claim = await controller.claim_resource_work(item["id"])
+            if not claim.get("claimed"):
+                return {"ok": True, **claim}
             try:
                 assert self.supervisor is not None
                 if item["owner_type"] == "http_interaction":
@@ -292,6 +304,8 @@ class AgentRuntime:
         agent_id = item["id"]
         decision = await controller.admit(agent_id, sample=sample)
         if not decision.get("ok") or decision.get("status") != "starting":
+            return decision
+        if not decision.get("claimed"):
             return decision
         try:
             assert self.supervisor is not None
@@ -321,12 +335,62 @@ class AgentRuntime:
                     AgentReportInput(
                         status="failed",
                         summary="Execution Agent could not be started",
-                        failure_code="agent_start_failed",
                         hypothesis_outcome="inconclusive",
                     ),
                     allow_inactive=True,
                 )
             return {"ok": False, "status": "failed", "agent_id": agent_id}
+
+    async def admission_drain(self) -> list[dict[str, Any]]:
+        """Fairly drain explicit resource and Agent batches for one wakeup."""
+
+        controller = self._resource()
+        sample = await controller.sample()
+        results: list[dict[str, Any]] = []
+        resource_blocked = False
+        agent_blocked = False
+        while not (resource_blocked and agent_blocked):
+            made_progress = False
+            if not resource_blocked:
+                for _ in range(8):
+                    item = await controller.next_queued_resource_work_item()
+                    if item is None:
+                        resource_blocked = True
+                        break
+                    result = await self._admit_item(item, sample=sample)
+                    results.append(result)
+                    if not result.get("ok") or result.get("status") not in {
+                        "reserved",
+                        "starting",
+                        "running",
+                    }:
+                        resource_blocked = True
+                        break
+                    made_progress = True
+                    sample = await controller.sample()
+
+            if not agent_blocked:
+                for _ in range(4):
+                    agent_id = await controller.next_queued_agent_id()
+                    if agent_id is None:
+                        agent_blocked = True
+                        break
+                    result = await self._admit_item(
+                        {"kind": "agent", "id": agent_id}, sample=sample
+                    )
+                    results.append(result)
+                    if not result.get("ok") or result.get("status") not in {
+                        "starting",
+                        "running",
+                    }:
+                        agent_blocked = True
+                        break
+                    made_progress = True
+                    sample = await controller.sample()
+
+            if not made_progress:
+                break
+        return results
 
     async def stagnation_once(self) -> list[dict[str, Any]]:
         if self.stagnation_manager is None or self.state_service is None:
@@ -340,20 +404,39 @@ class AgentRuntime:
                 self._run_id(), challenge["unique_code"]
             )
             results.append(result)
+            if result.get("action") == "pause_stagnation" and self.supervisor is not None:
+                await self.supervisor.stop_challenge_work(
+                    challenge["unique_code"],
+                    reason=str(result.get("pause_reason") or "stagnation_timeout"),
+                )
             if result.get("event_sequence") is not None:
                 await self.state_service.signal_challenge_changes(
                     self._run_id(),
                     [challenge["unique_code"]],
                     int(result["event_sequence"]),
                 )
-            if result.get("action") == "pause" and self.supervisor is not None:
-                chief_id = self.supervisor.chief_agent_id
-                if chief_id is not None:
-                    pause_result = await self.supervisor.pause_stagnant_challenge(
-                        chief_id, challenge["unique_code"]
-                    )
-                    result["pause_result"] = pause_result
+        await self._restart_exhausted_challenges()
         return results
+
+    async def _restart_exhausted_challenges(self) -> None:
+        """Start the next solving round when every unfinished challenge is paused."""
+
+        if self.supervisor is None or self.state_service is None or self.chief_agent_id is None:
+            return
+        scheduled = await ChallengeScheduler(self.state_service, clock=self.clock).select(
+            self._run_id()
+        )
+        restart_codes = [
+            str(item["unique_code"])
+            for item in scheduled
+            if item.get("restart_required") is True
+        ]
+        if not restart_codes:
+            return
+        await self.supervisor.launch_challenges(
+            self.chief_agent_id,
+            restart_codes,
+        )
 
     async def project_once(self) -> int:
         if self.state_service is None:
@@ -368,6 +451,7 @@ class AgentRuntime:
     async def pause(self, *, reason: str = "runtime_pause") -> None:
         """Release external resources while keeping the run resumable."""
 
+        self._shutdown_event.set()
         if self.state_service is not None and self.run_id is not None:
             await self.state_service.pause_run(self.run_id, reason=reason)
         await self._shutdown(preserve_run=True)
@@ -376,6 +460,7 @@ class AgentRuntime:
         if self._closed:
             return
         self._closed = True
+        self._shutdown_event.set()
         if self._network_watch_task is not None:
             self._network_watch_task.cancel()
             await asyncio.gather(self._network_watch_task, return_exceptions=True)
@@ -418,6 +503,12 @@ class AgentRuntime:
                     self._run_id(), run_dir=self.run_root / self._run_id(), limit=500
                 ):
                     pass
+                await self.state_service.project_pending_events(
+                    self._run_id(),
+                    run_dir=self.run_root / self._run_id(),
+                    limit=500,
+                    force_checkpoint=True,
+                )
             except Exception:
                 pass
             try:
@@ -434,14 +525,35 @@ class AgentRuntime:
             raise supervisor_error
 
     async def _admission_loop(self) -> None:
+        assert self.state_service is not None
+        signal_key = self.state_service.run_signal_key(self._run_id())
+        signal_sequence = await self.state_service.notifier.current(signal_key)
         while True:
             try:
-                await self.admission_once()
+                await self.admission_drain()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
-            await asyncio.sleep(self.admission_interval_seconds)
+            except Exception as exc:
+                await self._record_loop_diagnostic("admission", exc)
+            signal_wait = asyncio.create_task(
+                self.state_service.notifier.wait(
+                    signal_key,
+                    signal_sequence,
+                    0.5,
+                )
+            )
+            shutdown_wait = asyncio.create_task(self._shutdown_event.wait())
+            done, pending = await asyncio.wait(
+                {signal_wait, shutdown_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if shutdown_wait in done:
+                return
+            signal_sequence = signal_wait.result()
 
     async def _stagnation_loop(self) -> None:
         while True:
@@ -485,11 +597,9 @@ class AgentRuntime:
 
     async def _projection_loop(self) -> None:
         while True:
-            projection = asyncio.create_task(self.project_once())
             try:
-                await asyncio.shield(projection)
+                await self.project_once()
             except asyncio.CancelledError:
-                await asyncio.gather(projection, return_exceptions=True)
                 raise
             except Exception:
                 pass

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from scripts import quick_runtime_test as quick
+from agent.tooling import ToolExecutor, ToolRegistry
+import json
 
 
 def test_local_challenge_slot_normalizes_name_and_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,15 +52,22 @@ async def test_local_challenge_benchmark_has_no_external_dependency() -> None:
         "container_addr": ["http://127.0.0.1:8080"],
     }
     benchmark = quick.LocalChallengeBenchmark([challenge])
-    catalog = await benchmark.dispatch("benchmark_list_challenges")
+    async def call(name: str, arguments: dict[str, str] | None = None):
+        calls = await ToolExecutor(ToolRegistry([benchmark])).execute(
+            [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments or {})}}]
+        )
+        assert calls[0].result is not None
+        return calls[0].result
+
+    catalog = await call("benchmark_list_challenges")
     assert catalog["ok"] is True
     assert catalog["data"][0]["container_status"] == "stopped"
 
-    started = await benchmark.dispatch(
+    started = await call(
         "benchmark_start_challenge", {"unique_code": "local-web"}
     )
     assert started["ok"] is True
-    catalog = await benchmark.dispatch("benchmark_list_challenges")
+    catalog = await call("benchmark_list_challenges")
     assert catalog["data"][0]["container_status"] == "running"
 
 

@@ -28,7 +28,11 @@ def cleanup_fresh_run_artifacts(
     runs = run_root.expanduser().resolve()
     _validate_run_id(run_id)
 
-    for target in (workspace / ".system-tools", runs / run_id):
+    for target in (
+        workspace / ".system-tools",
+        workspace / ".aion" / "runs" / run_id,
+        runs / run_id,
+    ):
         _remove_exact(target)
 
 

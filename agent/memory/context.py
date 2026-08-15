@@ -7,7 +7,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from agent.config import ContextBudget
+from agent.config import ContextBudget, RoleContextProfile
 
 
 REQUIRED_MEMORY_SECTIONS = (
@@ -21,10 +21,16 @@ REQUIRED_MEMORY_SECTIONS = (
     "Worklog",
 )
 MEMORY_SECTION_MAX_TOKENS = 2_000
-SUMMARY_INIT_TOKENS = 50_000
-SUMMARY_UPDATE_TOKENS = 50_000
 SUMMARY_UPDATE_TOOL_CALLS = 20
+ROLE_SUMMARY_TOOL_CALL_LIMITS = {
+    "chief": 12,
+    "challenge": 8,
+    "execution": SUMMARY_UPDATE_TOOL_CALLS,
+}
 DEFAULT_MODEL_RESULT_CHARS = 12_000
+REQUEST_CONTEXT_SAFETY_TOKENS = 8_192
+REQUEST_PROMPT_CALIBRATION_INITIAL = 1.15
+TOOL_TOKEN_ESTIMATE_MULTIPLIER = 1.5
 
 
 def rough_token_count(value: Any) -> int:
@@ -38,6 +44,38 @@ def rough_token_count(value: Any) -> int:
 
 def message_token_count(messages: Sequence[Mapping[str, Any]]) -> int:
     return rough_token_count(list(messages))
+
+
+def request_token_count(
+    messages: Sequence[Mapping[str, Any]],
+    tool_definitions: Sequence[Mapping[str, Any]],
+) -> int:
+    """Estimate the provider's prompt size including the tool schema."""
+
+    return message_token_count(messages) + rough_token_count(tool_definitions)
+
+
+def request_message_budget(
+    *,
+    context_budget: ContextBudget,
+    tool_definitions: Sequence[Mapping[str, Any]],
+    role: str | None = None,
+    bootstrap: bool = False,
+    calibration_ratio: float = REQUEST_PROMPT_CALIBRATION_INITIAL,
+) -> int:
+    """Return a transcript budget below the provider's absolute input limit."""
+
+    estimated_tools = math.ceil(
+        rough_token_count(tool_definitions) * TOOL_TOKEN_ESTIMATE_MULTIPLIER
+    )
+    calibrated_capacity = math.floor(
+        context_budget.absolute_prompt_tokens(role, bootstrap=bootstrap)
+        / max(1.0, calibration_ratio * 1.05)
+    )
+    budget = calibrated_capacity - estimated_tools
+    if budget < 8_000:
+        raise ValueError("tool definitions leave insufficient model context")
+    return budget
 
 
 def prompt_tokens_from_response(payload: Mapping[str, Any]) -> int | None:
@@ -85,22 +123,32 @@ def tool_result_for_model(result: Any, max_chars: int = DEFAULT_MODEL_RESULT_CHA
     )
 
 
+def summary_tool_call_limit(role: str | None) -> int:
+    return ROLE_SUMMARY_TOOL_CALL_LIMITS.get(role or "execution", SUMMARY_UPDATE_TOOL_CALLS)
+
+
 def should_update_memory(
     *,
     current_tokens: int,
     last_summary_tokens: int,
     tool_calls_since_summary: int,
+    threshold_tokens: int,
+    tool_call_limit: int = SUMMARY_UPDATE_TOOL_CALLS,
 ) -> bool:
     if last_summary_tokens == 0:
-        return current_tokens >= SUMMARY_INIT_TOKENS
+        return current_tokens >= threshold_tokens
     return (
-        current_tokens - last_summary_tokens >= SUMMARY_UPDATE_TOKENS
-        or tool_calls_since_summary >= SUMMARY_UPDATE_TOOL_CALLS
+        current_tokens - last_summary_tokens >= threshold_tokens
+        or tool_calls_since_summary >= tool_call_limit
     )
 
 
-def should_autocompact(current_tokens: int, budget: ContextBudget) -> bool:
-    return current_tokens >= budget.autocompact_threshold
+def should_autocompact(
+    current_tokens: int,
+    *,
+    soft_prompt_tokens: int,
+) -> bool:
+    return current_tokens >= soft_prompt_tokens
 
 
 def normalize_session_memory(
@@ -135,6 +183,8 @@ def build_runtime_messages(
     checkpoint: Mapping[str, Any],
     session_memory: str,
     recent_messages: Sequence[Mapping[str, Any]],
+    max_tokens: int,
+    recent_message_tokens: int,
 ) -> list[dict[str, Any]]:
     """Rebuild a bounded message list after compaction or recovery."""
 
@@ -155,7 +205,28 @@ def build_runtime_messages(
         },
         dict(initial_user_message),
     ]
-    messages.extend(_safe_recent_messages(recent_messages))
+    messages.extend(
+        _safe_recent_messages(recent_messages, max_tokens=recent_message_tokens)
+    )
+    while len(messages) > 4 and message_token_count(messages) > max_tokens:
+        # Discard the oldest recovered interaction first.  Removing the tail
+        # would preserve stale history while dropping the newest model/tool
+        # exchange, which is the opposite of the role budget contract.
+        messages.pop(4)
+    # Trim reconstructable projections only.  The fixed system contract and
+    # current goal/Assignment are not historical context; silently clipping
+    # either would turn a capacity problem into an incorrect model request.
+    # If those immutable envelopes alone exceed the provider budget, the
+    # caller observes the oversize result and defers the session.
+    for index, minimum_chars in ((1, 200), (2, 1_000)):
+        current = message_token_count(messages)
+        if current <= max_tokens:
+            break
+        content = str(messages[index].get("content") or "")
+        excess_chars = max(1, (current - max_tokens) * 4)
+        messages[index]["content"] = truncate_text(
+            content, max(minimum_chars, len(content) - excess_chars)
+        )
     return messages
 
 
@@ -179,10 +250,35 @@ def _restore_required_headings(content: str) -> str:
     ) + "\n"
 
 
-def _safe_recent_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _safe_recent_messages(
+    messages: Sequence[Mapping[str, Any]], *, max_tokens: int
+) -> list[dict[str, Any]]:
     if not messages:
         return []
-    tail = [dict(message) for message in messages[-80:]]
+    tail: list[dict[str, Any]] = []
+    tokens = 0
+    for message in reversed(messages):
+        value = dict(message)
+        message_tokens = message_token_count([value])
+        if tokens + message_tokens > max_tokens:
+            break
+        tail.append(value)
+        tokens += message_tokens
+    tail.reverse()
     while tail and tail[0].get("role") == "tool":
         tail.pop(0)
     return tail
+
+
+def bounded_recent_messages(
+    messages: Sequence[Mapping[str, Any]], *, max_tokens: int
+) -> list[dict[str, Any]]:
+    """Return the most recent complete interaction within a role budget."""
+
+    return _safe_recent_messages(messages, max_tokens=max_tokens)
+
+
+def role_summary_threshold(profile: RoleContextProfile) -> int:
+    """Start background summarization before reaching the role soft target."""
+
+    return max(8_000, int(profile.soft_prompt_tokens * 0.75))
