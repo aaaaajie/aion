@@ -1,0 +1,58 @@
+id: binary.dsl_vm_reverse
+name: Dsl Vm Reverse
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Reverse JavaScript-based custom DSL/VM interpreters, non-standard WASM-like runtimes, and risk-control engines. Use when analyzing IIFE or switch-based opcode dispatchers, extracting instruction tables, recovering bytecode semantics, capturing VM state at runtime, or reconstructing execution flow.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - dsl
+  - reverse
+  - javascript
+  - based
+  - custom
+  - interpreters
+  - non
+  - standard
+  - wasm
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - ghidra
+  - ida
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - DSL_VM_REVERSE
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- dsl
+- reverse
+- javascript
+- based
+- custom
+- interpreters
+- non

@@ -1,0 +1,56 @@
+id: exploit.offensive_ai_security
+name: Offensive Ai Security
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: 'AI/LLM security offensive checklist: prompt injection, jailbreaking, model extraction, training data poisoning, adversarial inputs, LLM-assisted attack automation, and AI system reconnaissance. Use when assessing AI/ML systems, red-teaming LLMs, or researching AI attack vectors.'
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - security
+  - llm
+  - checklist
+  - prompt
+  - injection
+  - jailbreaking
+  - model
+  - extraction
+  - training
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - ida
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_AI_SECURITY
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- security
+- llm
+- checklist
+- prompt
+- injection
+- jailbreaking
+- model

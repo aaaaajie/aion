@@ -1,1152 +1,578 @@
-"""Offline tests for the SQLite/FastAPI authoritative run state."""
-
 from __future__ import annotations
 
-import asyncio
-import json
-import sqlite3
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import httpx
 import pytest
-from sqlalchemy import func, insert, select
 
-from agent.api import create_state_app
-from agent.state import (
-    CapabilityRegistry,
-    StateService,
-    container_capacity_summary,
-    container_slot_occupied,
-)
-from agent.state.errors import StateConflict, StateError
-from agent.state.models import AuditOutboxRecord, ReportRecord, RunRecord, StateEventRecord
-from agent.state.schemas import (
-    AgentReportInput,
-    AnalysisPlanInput,
-    CapabilityContext,
-    ChallengeImport,
-    CreateCycleInput,
-    FindingInput,
-    StagnationExtensionInput,
-    VerificationUpdateInput,
-)
-from agent.state.scheduling import ResourceController, StagnationManager
+from agent.state import CapabilityContext, ChallengeDispatchInput
+from agent.state.database import SCHEMA_VERSION, StateDatabase
+from agent.state.errors import StatePermission
+from agent.state.schemas import AgentReportInput, ChallengeImport
+from agent.state.service import StateService
+from agent.subagents.models import ExecutionReport
 
 
-async def _record_domain(
-    service: StateService,
-    run_id: str,
-    unique_code: str,
-    *,
-    domain: str = "web",
-) -> str:
-    profile = {
-        "web": "web_light",
-        "blockchain": "blockchain_light",
-        "ai": "ai_light",
-        "binary": "binary_light",
-        "other": "other_light",
-    }[domain]
-    result = await service.record_observation(
-        run_id,
-        unique_code,
-        category="domain_triage",
-        summary=f"Challenge domain classified as {domain}",
-        detail={
-            "domain": domain,
-            "confidence": 0.95,
-            "scanner_profile": profile,
-        },
-        source="test_domain_triage",
-        confidence=0.95,
-        mark_progress=False,
-        route_branches=False,
+async def build_state(tmp_path: Path) -> tuple[StateService, CapabilityContext, CapabilityContext]:
+    service = StateService(
+        StateDatabase(tmp_path / "state.sqlite3"),
+        run_root=tmp_path / "runs",
+        workspace_root=tmp_path / "workspace",
     )
-    return f"observation:{result['observation_id']}"
-
-
-def test_container_capacity_only_releases_explicit_terminal_states() -> None:
-    assert container_slot_occupied("stopped") is False
-    assert container_slot_occupied("closed") is False
-    assert container_slot_occupied("available") is True
-    assert container_slot_occupied("running") is True
-    assert container_slot_occupied("future-status") is True
-    assert container_slot_occupied("STOPPED") is True
-    assert container_slot_occupied(None) is True
-    assert container_capacity_summary(
-        [
-            {
-                "unique_code": "completed-live",
-                "is_completed": True,
-                "container_status": "available",
-            },
-            {
-                "unique_code": "running",
-                "is_completed": False,
-                "container_status": "running",
-            },
-            {
-                "unique_code": "released",
-                "is_completed": True,
-                "container_status": "stopped",
-            },
-        ]
-    ) == {
-        "limit": 3,
-        "occupied_count": 2,
-        "free_count": 1,
-        "occupied_codes": ["completed-live", "running"],
-        "completed_pending_release_codes": ["completed-live"],
-    }
+    await service.initialize()
+    await service.create_run(
+        "run",
+        challenges=[
+            ChallengeImport(
+                unique_code="challenge-a",
+                description="test target",
+                container_status="running",
+                container_addr=["http://127.0.0.1:8000"],
+            )
+        ],
+    )
+    await service.register_agent("run", agent_id="chief", role="chief", initial_prompt="chief")
+    await service.register_agent(
+        "run",
+        agent_id="challenge",
+        role="challenge",
+        parent_id="chief",
+        unique_code="challenge-a",
+        initial_prompt="challenge",
+    )
+    chief = CapabilityContext(run_id="run", agent_id="chief", role="chief")
+    challenge = CapabilityContext(
+        run_id="run",
+        agent_id="challenge",
+        role="challenge",
+        unique_code="challenge-a",
+    )
+    await service.start_challenge("run", "challenge-a", chief)
+    return service, chief, challenge
 
 
 @pytest.mark.asyncio
-async def test_api_cycle_report_cursor_and_plaintext_flag(tmp_path: Path) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run("run-1", challenges=[ChallengeImport(unique_code="web-1")])
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent("run-1", role="challenge", parent_id=chief["agent_id"], unique_code="web-1")
-    registry = CapabilityRegistry()
-    chief_cap = registry.issue("run-1", chief["agent_id"], "chief")
-    challenge_cap = registry.issue("run-1", challenge["agent_id"], "challenge", "web-1")
-    domain_ref = await _record_domain(service, "run-1", "web-1")
-    app = create_state_app(service, registry)
+async def test_schema_15_and_dispatch_is_append_only_and_idempotent(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    assert SCHEMA_VERSION == 15
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://state") as client:
-        headers = {"X-Aion-Capability": challenge_cap.token}
-        created = await client.post(
-            "/internal/v1/runs/run-1/challenges/web-1/cycles",
-            headers=headers,
-            json={"expected_challenge_version": 1},
-        )
-        assert created.status_code == 200
-        cycle = created.json()
-        planned = await client.put(
-            f"/internal/v1/runs/run-1/cycles/{cycle['cycle_id']}/analysis-plan",
-            headers=headers,
-            json={
-                "expected_version": cycle["version"],
-                "domain": "web",
-                "domain_confidence": 0.95,
-                "domain_evidence_refs": [domain_ref],
-                "scanner_profile": "web_light",
-                "analysis_summary": "map the current evidence",
-                "hypotheses": [
-                    {"key": "assigned-service", "statement": "the assigned service is reachable"}
+    first = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput.model_validate(
+            {
+                "summary": "baseline",
+                "tasks": [
+                    {
+                        "objective": "collect the HTTP baseline",
+                        "task_key": "baseline",
+                        "hypothesis_key": "http-baseline",
+                    }
                 ],
-                "tasks": [{
-                    "hypothesis_key": "assigned-service",
-                    "task_key": "assigned-service-recon-1",
-                        "objective": "inspect the assigned service",
-                        "kind": "recon",
-                        "task_stage": "discovery",
-                }],
+            }
+        ),
+    )
+    assert first["decision_number"] == 1
+    assert len(first["admissions"]) == 1
+
+    repeated = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput.model_validate(
+            {
+                "summary": "same task is already useful",
+                "tasks": [
+                    {
+                        "objective": "collect the HTTP baseline",
+                        "task_key": "baseline",
+                    }
+                ],
+            }
+        ),
+    )
+    assert repeated["admissions"] == []
+    assert repeated["idempotent_tasks"][0]["agent_id"] == first["admissions"][0]["agent_id"]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_derives_stable_keys_when_model_omits_them(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    payload = ChallengeDispatchInput.model_validate(
+        {"summary": "stable decision", "tasks": [{"objective": "collect baseline"}]}
+    )
+    first = await service.dispatch_challenge("run", "challenge-a", challenge, payload)
+    second = await service.dispatch_challenge("run", "challenge-a", challenge, payload)
+
+    assert len(first["admissions"]) == 1
+    assert second["admissions"] == []
+    assert second["idempotent_tasks"][0]["task_key"].startswith("task:")
+    overview = await service.get_overview("run")
+    execution_agents = [item for item in overview["agents"] if item["role"] == "execution"]
+    assert len(execution_agents) == 1
+    assert execution_agents[0]["hypothesis_key"].startswith("hypothesis:")
+    assert execution_agents[0]["branch_key"].endswith(":discovery")
+    await service.close()
+
+
+def test_controller_report_projection_is_reference_oriented_and_bounded() -> None:
+    projected = StateService._controller_report_projection(
+        {
+            "report_id": "report-1",
+            "report_ref": "report:report-1",
+            "sequence": 4,
+            "agent_id": "execution-1",
+            "status": "completed",
+            "payload": {
+                "summary": "s" * 5_000,
+                "evidence_refs": [f"evidence:evidence_{index:032d}" for index in range(20)],
+                "findings": [
+                    {
+                        "finding_ref": "finding:finding_" + "a" * 32,
+                        "category": "vulnerability",
+                        "summary": "f" * 5_000,
+                        "detail": {"must_not_be_injected": "x" * 5_000},
+                        "confidence": 0.9,
+                        "verification_status": "verified",
+                        "evidence_refs": [f"evidence:evidence_{index:032d}" for index in range(20)],
+                    }
+                ],
             },
-        )
-        assert planned.status_code == 200
-        execution_id = planned.json()["admissions"][0]["agent_id"]
+        }
+    )
 
-        execution_cap = registry.issue("run-1", execution_id, "execution", "web-1")
-        reported = await client.post(
-            f"/internal/v1/runs/run-1/agents/{execution_id}/reports",
-            headers={"X-Aion-Capability": execution_cap.token},
-            json={
-                "status": "completed",
-                "summary": "candidate found",
-                "candidate_flag": "flag{never-durable}",
-                "hypothesis_outcome": "inconclusive",
-            },
-        )
-        assert reported.status_code == 200
-
-        reports = await client.get(
-            "/internal/v1/runs/run-1/reports?after_sequence=0",
-            headers=headers,
-        )
-        assert reports.status_code == 200
-        assert reports.json()["reports"][0]["payload"]["candidate_flag"] == "flag{never-durable}"
-        async with service.db.sessions() as session:
-            stored = await session.scalar(
-                select(ReportRecord.payload).where(
-                    ReportRecord.run_id == "run-1",
-                    ReportRecord.report_id == reports.json()["reports"][0]["report_id"],
-                )
-            )
-        assert stored["candidate_flag"] == "flag{never-durable}"
-
-        stale = await client.put(
-            f"/internal/v1/runs/run-1/cycles/{cycle['cycle_id']}/analysis-plan",
-            headers=headers,
-            json={
-                "expected_version": 1,
-                "domain": "web",
-                "domain_confidence": 0.95,
-                "domain_evidence_refs": [domain_ref],
-                "scanner_profile": "web_light",
-                "analysis_summary": "stale",
-            },
-        )
-        assert stale.status_code == 409
-        assert stale.json()["code"] == "state_conflict"
-
-        unauthorized = await client.get(
-            "/internal/v1/runs/run-1/overview",
-            headers=headers,
-        )
-        assert unauthorized.status_code == 403
-
-    assert await service.db.pragma("journal_mode") == "wal"
-    assert await service.db.pragma("foreign_keys") == 1
-    await service.close()
+    assert len(projected["payload"]["summary"]) == 1_000
+    assert len(projected["payload"]["evidence_refs"]) == 10
+    finding = projected["payload"]["findings"][0]
+    assert len(finding["summary"]) == 1_000
+    assert len(finding["evidence_refs"]) == 10
+    assert "detail" not in finding
 
 
 @pytest.mark.asyncio
-async def test_concurrent_scheduler_and_runner_events_keep_one_sequence_stream(
-    tmp_path: Path,
-) -> None:
-    """Admission and Runner lifecycle events may commit from different sessions."""
-
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run("run-1", challenges=[ChallengeImport(unique_code="web-1")])
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
-    )
-    execution = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="event-order",
-        task_key="event-order-1",
-        task_stage="discovery",
-    )
-    await service.enqueue_agent("run-1", execution["agent_id"])
-    controller = ResourceController(service, "run-1")
-
-    admission, runner_event = await asyncio.gather(
-        controller.admit(
-            execution["agent_id"],
-            sample={"cpu_percent": 1.0, "memory_percent": 1.0},
-        ),
-        service.append_agent_event(
-            "run-1",
-            execution["agent_id"],
-            "agent_runner_started",
-            {"role": "execution"},
+async def test_late_report_keeps_original_cycle_and_is_consumed_once(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    first = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput.model_validate(
+            {"summary": "first", "tasks": [{"objective": "slow task"}]}
         ),
     )
-
-    assert admission["status"] == "starting"
-    assert isinstance(runner_event, int)
-    async with service.db.sessions() as session:
-        events = (
-            await session.scalars(
-                select(StateEventRecord)
-                .where(StateEventRecord.run_id == "run-1")
-                .order_by(StateEventRecord.sequence)
-            )
-        ).all()
-        outbox = (
-            await session.scalars(
-                select(AuditOutboxRecord)
-                .where(AuditOutboxRecord.run_id == "run-1")
-                .order_by(AuditOutboxRecord.sequence)
-            )
-        ).all()
-
-    event_sequences = [item.sequence for item in events]
-    outbox_sequences = [item.sequence for item in outbox]
-    assert len(event_sequences) == len(set(event_sequences))
-    assert event_sequences == outbox_sequences
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_execution_task_keys_and_terminal_report_are_transactionally_unique(
-    tmp_path: Path,
-) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run(
-        "run-1", challenges=[ChallengeImport(unique_code="web-1")]
-    )
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
-    )
-    first = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="auth-boundary",
-        task_key="auth-boundary-1",
-        task_stage="discovery",
-    )
-    await service.enqueue_agent("run-1", first["agent_id"])
-
-    duplicate = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="auth-boundary",
-        task_key="auth-boundary-1",
-        task_stage="discovery",
-    )
-    assert duplicate["duplicate"] is True
-    assert duplicate["agent_id"] == first["agent_id"]
-    with pytest.raises(StateConflict) as active_conflict:
-        await service.register_agent(
-            "run-1",
-            role="execution",
-            parent_id=challenge["agent_id"],
-            unique_code="web-1",
-            hypothesis_key="auth-boundary",
-            task_key="auth-boundary-2",
-            task_stage="discovery",
-        )
-    assert active_conflict.value.code == "hypothesis_already_active"
-
-    context = CapabilityContext(
-        run_id="run-1",
-        agent_id=first["agent_id"],
-        role="execution",
-        unique_code="web-1",
-    )
-    terminal = await service.finalize_execution_agent(
-        "run-1",
-        first["agent_id"],
-        context,
-        AgentReportInput(
-            status="completed",
-            summary="first experiment complete",
-            hypothesis_outcome="inconclusive",
-        ),
-    )
-    repeated = await service.finalize_execution_agent(
-        "run-1",
-        first["agent_id"],
-        context,
-        AgentReportInput(
-            status="failed",
-            summary="must not replace the first report",
-            hypothesis_outcome="inconclusive",
-        ),
-    )
-    assert repeated["idempotent"] is True
-    assert repeated["report_id"] == terminal["report_id"]
-    assert repeated["sequence"] == terminal["sequence"]
-
-    with pytest.raises(StateConflict) as missing_reference:
-        await service.register_agent(
-            "run-1",
-            role="execution",
-            parent_id=challenge["agent_id"],
-            unique_code="web-1",
-            hypothesis_key="auth-boundary",
-            task_key="auth-boundary-2",
-            task_stage="discovery",
-        )
-    assert missing_reference.value.code == "hypothesis_novelty_reference_required"
-    follow_up = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="auth-boundary",
-        task_key="auth-boundary-2",
-        task_stage="discovery",
-        context_refs=[f"report:{terminal['report_id']}"],
-    )
-    bypass = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="unrelated-check",
-        task_key="unrelated-check-1",
-        task_stage="discovery",
-    )
-    with pytest.raises(StateError) as direct_finish:
-        await service.finish_agent(
-            "run-1", bypass["agent_id"], status="failed"
-        )
-    assert direct_finish.value.code == "execution_finalizer_required"
-    interrupted = await service.interrupt_execution_agents(
-        "run-1", failure_code="runtime_paused"
-    )
-    assert set(interrupted) == {follow_up["agent_id"], bypass["agent_id"]}
-    assert await service.interrupt_execution_agents(
-        "run-1", failure_code="runtime_paused"
-    ) == []
-
-    async with service.db.sessions() as session:
-        report_count = await session.scalar(
-            select(func.count())
-            .select_from(ReportRecord)
-            .where(ReportRecord.agent_id == first["agent_id"])
-        )
-    assert report_count == 1
-    state = await service.get_challenge_context(
-        "run-1",
-        "web-1",
-        CapabilityContext(
-            run_id="run-1",
-            agent_id=challenge["agent_id"],
-            role="challenge",
-            unique_code="web-1",
-        ),
-    )
-    ledger = {item["task_key"]: item for item in state["task_ledger"]}
-    assert ledger["auth-boundary-1"]["terminal_report_id"] == terminal["report_id"]
-    assert ledger["auth-boundary-2"]["context_refs"] == [
-        f"report:{terminal['report_id']}"
-    ]
-    assert follow_up["agent_id"] == ledger["auth-boundary-2"]["agent_id"]
-    assert ledger["auth-boundary-2"]["status"] == "interrupted"
-    assert ledger["auth-boundary-2"]["report_summary"] == (
-        "Execution Agent was interrupted by the Runtime"
-    )
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_cycle_completed_does_not_mark_challenge_solved(tmp_path: Path) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run(
-        "run-1",
-        challenges=[ChallengeImport(unique_code="multi-flag", flag_count=2)],
-    )
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="multi-flag",
-    )
-    registry = CapabilityRegistry()
-    context = registry.issue(
-        "run-1", challenge["agent_id"], "challenge", "multi-flag"
-    ).context
-    domain_ref = await _record_domain(
-        service, "run-1", "multi-flag", domain="other"
-    )
-
-    cycle = await service.begin_cycle(
-        "run-1",
-        "multi-flag",
-        context,
-        CreateCycleInput(expected_challenge_version=1),
-    )
-    planned = await service.submit_analysis_plan(
-        "run-1",
-        cycle["cycle_id"],
-        context,
-        AnalysisPlanInput(
-            expected_version=cycle["version"],
-            domain="other",
-            domain_confidence=0.95,
-            domain_evidence_refs=[domain_ref],
-            scanner_profile="other_light",
-            analysis_summary="record the current evidence",
-        ),
-    )
-    await service.commit_cycle(
-        "run-1",
-        cycle["cycle_id"],
-        context,
-        VerificationUpdateInput(
-            expected_version=planned["version"],
-            summary="this cycle is complete, but more Flags may remain",
-            outcome="completed",
-        ),
-    )
-
-    overview = await service.get_overview("run-1")
-    challenge_state = overview["challenges"][0]
-    assert challenge_state["is_completed"] is False
-    assert challenge_state["work_status"] != "completed"
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_stagnation_thresholds_use_active_clock(tmp_path: Path) -> None:
-    class FakeClock:
-        def __init__(self) -> None:
-            self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        def __call__(self) -> datetime:
-            return self.value
-
-        def advance(self, seconds: int) -> None:
-            self.value += timedelta(seconds=seconds)
-
-    clock = FakeClock()
-    service = StateService(tmp_path / "state.sqlite3", clock=clock)
-    await service.create_run("run-1", challenges=[ChallengeImport(unique_code="web-1")], started_at=clock.value)
-    chief = await service.register_agent("run-1", role="chief")
-    challenge_agent = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
-    )
-    execution = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge_agent["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="stagnation",
-        task_key="stagnation-1",
-        task_stage="discovery",
-        mission="stagnation fixture",
-    )
-    await service.transition_agent("run-1", challenge_agent["agent_id"], "running")
-    await service.transition_agent("run-1", execution["agent_id"], "running")
-    await service.start_challenge("run-1", "web-1")
-    await service.import_challenges(
-        "run-1",
-        [ChallengeImport(unique_code="web-1", container_status="available")],
-    )
-    active = (await service.list_challenges("run-1"))[0]
-    assert active["container_status"] == "available"
-    assert active["slot_occupied"] is True
-    assert active["work_status"] == "active"
-    manager = StagnationManager(service, clock=clock)
-    clock.advance(480)
-    assert (await manager.evaluate("run-1", "web-1"))["level"] == 1
-    clock.advance(420)
-    result = await manager.evaluate("run-1", "web-1")
-    assert result["level"] == 2
-    assert result["action"] == "pause"
-    overview = await service.get_overview("run-1")
-    challenge = overview["challenges"][0]
-    assert challenge["work_status"] == "paused"
-    assert challenge["container_status"] == "available"
-    assert challenge["hint_eligible"] is False
-    assert next(
-        item for item in overview["agents"] if item["agent_id"] == challenge_agent["agent_id"]
-    )["status"] == "running"
-    assert all(
-        item["status"] == "running"
+    execution_id = first["admissions"][0]["agent_id"]
+    overview = await service.get_overview("run")
+    original_cycle_id = next(
+        item["cycle_id"]
         for item in overview["agents"]
-        if item["role"] == "execution"
+        if item["agent_id"] == execution_id
     )
+    await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="independent follow-up", tasks=[]),
+    )
+    execution = CapabilityContext(
+        run_id="run",
+        agent_id=execution_id,
+        role="execution",
+        unique_code="challenge-a",
+    )
+    await service.submit_report(
+        "run",
+        execution_id,
+        execution,
+        AgentReportInput(status="completed", summary="slow result arrived"),
+    )
+    observed = await service.observe_challenge(
+        "run", "challenge-a", challenge, max_reports=20
+    )
+    assert observed["report_count"] == 1
+    assert "cycle_id" not in observed["reports"][0]
+    overview = await service.get_overview("run")
+    assert next(
+        item["cycle_id"]
+        for item in overview["agents"]
+        if item["agent_id"] == execution_id
+    ) == original_cycle_id
+    again = await service.observe_challenge(
+        "run", "challenge-a", challenge, max_reports=20
+    )
+    assert again["report_count"] == 0
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_resource_admission_uses_strict_limits_priority_and_throttle(
+async def test_controller_snapshot_replays_after_model_failure_until_dispatch(
     tmp_path: Path,
 ) -> None:
-    class FakeClock:
-        def __init__(self) -> None:
-            self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        def __call__(self) -> datetime:
-            return self.value
-
-        def advance(self, seconds: int) -> None:
-            self.value += timedelta(seconds=seconds)
-
-    class Resources:
-        cpu = 10.0
-        memory = 20.0
-
-        @classmethod
-        def cpu_percent(cls, interval: object = None) -> float:
-            return cls.cpu
-
-        @classmethod
-        def virtual_memory(cls) -> object:
-            return type("Memory", (), {"percent": cls.memory})()
-
-    clock = FakeClock()
-    service = StateService(tmp_path / "state.sqlite3", clock=clock)
-    await service.create_run(
-        "run-1",
-        challenges=[ChallengeImport(unique_code="web-1")],
-        started_at=clock.value,
+    service, _chief, challenge = await build_state(tmp_path)
+    dispatched = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="first", tasks=[{"objective": "quick task"}]),
     )
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
+    execution_id = dispatched["admissions"][0]["agent_id"]
+    await service.submit_report(
+        "run",
+        execution_id,
+        CapabilityContext(
+            run_id="run",
+            agent_id=execution_id,
+            role="execution",
+            unique_code="challenge-a",
+        ),
+        AgentReportInput(status="completed", summary="useful result"),
     )
-    low = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="priority-low",
-        task_key="priority-low-1",
-        task_stage="discovery",
-        priority=10,
-        mission="low",
-    )
-    high = await service.register_agent(
-        "run-1",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="priority-high",
-        task_key="priority-high-1",
-        task_stage="discovery",
-        priority=90,
-        mission="high",
-    )
-    await service.enqueue_agent("run-1", low["agent_id"])
-    await service.enqueue_agent("run-1", high["agent_id"])
-    controller = ResourceController(
-        service,
-        "run-1",
-        psutil_module=Resources,
-        clock=clock,
-        start_interval_seconds=5,
-    )
-    assert await controller.next_queued_agent_id() == high["agent_id"]
 
-    Resources.cpu = 70.0
-    denied = await controller.admit(high["agent_id"])
-    assert denied["ok"] is False and denied["reason"] == "cpu_limit"
-    Resources.cpu = 10.0
-    first = await controller.admit(high["agent_id"])
-    assert first["status"] == "starting"
-    await controller.mark_started(high["agent_id"])
-    throttled = await controller.admit(low["agent_id"])
-    assert throttled["ok"] is False and throttled["reason"] == "start_interval"
-    clock.advance(5)
-    second = await controller.admit(low["agent_id"])
-    assert second["status"] == "starting"
+    first = await service.observe_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        replay_pending_snapshot=True,
+    )
+    assert first["report_count"] == 1
+    replayed = await service.observe_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        replay_pending_snapshot=True,
+    )
+    assert replayed["report_count"] == 1
+    assert replayed["snapshot_replayed"] is True
+
+    await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="acted on the report", tasks=[]),
+    )
+    acknowledged = await service.observe_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        replay_pending_snapshot=True,
+    )
+    assert acknowledged["report_count"] == 0
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_stagnation_pause_time_is_not_counted(tmp_path: Path) -> None:
-    class FakeClock:
-        def __init__(self) -> None:
-            self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        def __call__(self) -> datetime:
-            return self.value
-
-        def advance(self, seconds: int) -> None:
-            self.value += timedelta(seconds=seconds)
-
-    clock = FakeClock()
-    service = StateService(tmp_path / "state.sqlite3", clock=clock)
-    await service.create_run(
-        "run-1",
-        challenges=[ChallengeImport(unique_code="web-1")],
-        started_at=clock.value,
-    )
-    await service.start_challenge("run-1", "web-1")
-    clock.advance(300)
-    await service.close_challenge("run-1", "web-1")
-    clock.advance(3_600)
-    await service.start_challenge("run-1", "web-1")
-    clock.advance(299)
-    manager = StagnationManager(service, clock=clock)
-    before = await manager.evaluate("run-1", "web-1")
-    assert before["level"] == 1 and before["elapsed_seconds"] == 599
-    clock.advance(1)
-    warning = await manager.evaluate("run-1", "web-1")
-    assert warning["level"] == 1 and warning["status"] == "warning"
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_only_structured_valid_progress_resets_stagnation_clock(
+async def test_controller_cannot_wait_on_consumed_but_undecided_snapshot(
     tmp_path: Path,
 ) -> None:
-    class FakeClock:
-        def __init__(self) -> None:
-            self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        def __call__(self) -> datetime:
-            return self.value
-
-        def advance(self, seconds: int) -> None:
-            self.value += timedelta(seconds=seconds)
-
-    clock = FakeClock()
-    service = StateService(tmp_path / "state.sqlite3", clock=clock)
-    await service.create_run(
-        "run-1", challenges=[ChallengeImport(unique_code="web-1")], started_at=clock.value
+    service, _chief, challenge = await build_state(tmp_path)
+    dispatched = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="first", tasks=[{"objective": "quick task"}]),
     )
-    chief = await service.register_agent("run-1", role="chief")
-    challenge_agent = await service.register_agent(
-        "run-1", role="challenge", parent_id=chief["agent_id"], unique_code="web-1"
-    )
-    context = CapabilityContext(
-        run_id="run-1", agent_id=challenge_agent["agent_id"], role="challenge", unique_code="web-1"
-    )
-    domain_ref = await _record_domain(service, "run-1", "web-1")
-    await service.start_challenge("run-1", "web-1")
-    await service.import_challenges(
-        "run-1",
-        [ChallengeImport(unique_code="web-1", container_status="available")],
-    )
-    manager = StagnationManager(service, clock=clock)
-    clock.advance(479)
-    assert (await manager.evaluate("run-1", "web-1"))["level"] == 0
-    clock.advance(1)
-    assert (await manager.evaluate("run-1", "web-1"))["status"] == "warning"
-
-    challenge = (await service.list_challenges("run-1"))[0]
-    cycle = await service.begin_cycle(
-        "run-1",
-        "web-1",
-        context,
-        CreateCycleInput(expected_challenge_version=challenge["version"]),
-    )
-    with pytest.raises(StateConflict) as duplicate_cycle:
-        await service.begin_cycle(
-            "run-1",
-            "web-1",
-            context,
-            CreateCycleInput(expected_challenge_version=999_999),
-        )
-    assert duplicate_cycle.value.code == "cycle_already_in_progress"
-    await service.submit_analysis_plan(
-        "run-1",
-        cycle["cycle_id"],
-        context,
-        AnalysisPlanInput(
-            expected_version=cycle["version"],
-            domain="web",
-            domain_confidence=0.95,
-            domain_evidence_refs=[domain_ref],
-            scanner_profile="web_light",
-            analysis_summary="verify the current evidence",
+    execution_id = dispatched["admissions"][0]["agent_id"]
+    await service.submit_report(
+        "run",
+        execution_id,
+        CapabilityContext(
+            run_id="run",
+            agent_id=execution_id,
+            role="execution",
+            unique_code="challenge-a",
         ),
+        AgentReportInput(status="completed", summary="new result"),
     )
-    committed = await service.commit_cycle(
-        "run-1",
-        cycle["cycle_id"],
-        context,
-        VerificationUpdateInput(
-            expected_version=cycle["version"] + 1,
-            summary="verified evidence",
-            outcome="progress",
-            findings=[
-                FindingInput(
-                    category="vulnerability",
-                    summary="new verified fact",
-                    verification_status="verified",
-                    evidence_paths=["report://evidence-1"],
-                )
-            ],
-        ),
+    snapshot = await service.observe_challenge(
+        "run", "challenge-a", challenge, max_reports=20
     )
-    assert committed["valid_progress"] is False
-    progressed = (await service.list_challenges("run-1"))[0]
-    progress_at = progressed["last_progress_at"]
-    assert progressed["container_status"] == "available"
-    assert progressed["active_since"] == progress_at
-    clock.advance(479)
-    assert (await manager.evaluate("run-1", "web-1"))["level"] == 2
-    await service.close()
-    return
+    assert snapshot["report_count"] == 1
 
-    duplicate = await service.begin_cycle(
-        "run-1",
-        "web-1",
-        context,
-        CreateCycleInput(expected_challenge_version=(await service.list_challenges("run-1"))[0]["version"]),
+    ready = await service.record_controller_wait("run", "challenge", "too early")
+    assert ready["status"] == "ready"
+    assert ready["pending_snapshot"] is True
+
+    await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="no new independent work", tasks=[]),
     )
-    await service.submit_analysis_plan(
-        "run-1",
-        duplicate["cycle_id"],
-        context,
-        AnalysisPlanInput(
-            expected_version=duplicate["version"],
-            domain="web",
-            domain_confidence=0.95,
-            domain_evidence_refs=[domain_ref],
-            scanner_profile="web_light",
-            analysis_summary="repeat the same report",
-        ),
-    )
-    duplicate_result = await service.commit_cycle(
-        "run-1",
-        duplicate["cycle_id"],
-        context,
-        VerificationUpdateInput(
-            expected_version=duplicate["version"] + 1,
-            summary="duplicate report",
-            outcome="no_progress",
-            findings=[
-                FindingInput(
-                    category="vulnerability",
-                    summary="new verified fact",
-                    verification_status="verified",
-                    evidence_paths=["report://evidence-1"],
-                )
-            ],
-        ),
-    )
-    assert duplicate_result["valid_progress"] is False
-    assert (await service.list_challenges("run-1"))[0]["last_progress_at"] == progress_at
+    waiting = await service.record_controller_wait("run", "challenge", "done")
+    assert waiting["status"] == "waiting"
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_stagnation_extension_is_structured_and_hard_capped(tmp_path: Path) -> None:
-    class FakeClock:
-        def __init__(self) -> None:
-            self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        def __call__(self) -> datetime:
-            return self.value
-
-        def advance(self, seconds: int) -> None:
-            self.value += timedelta(seconds=seconds)
-
-    clock = FakeClock()
-    service = StateService(tmp_path / "state.sqlite3", clock=clock)
-    await service.create_run(
-        "run-1", challenges=[ChallengeImport(unique_code="web-1")], started_at=clock.value
+async def test_optional_report_items_warn_but_terminal_report_commits(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    dispatched = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test"}]),
     )
-    chief = await service.register_agent("run-1", role="chief")
-    context = CapabilityContext(run_id="run-1", agent_id=chief["agent_id"], role="chief")
-    await service.start_challenge("run-1", "web-1")
-    clock.advance(480)
-    operation_id = await service.mark_operation_started(
-        "run-1", "benchmark_wait_for_remote", unique_code="web-1"
+    execution_id = dispatched["admissions"][0]["agent_id"]
+    execution = CapabilityContext(
+        run_id="run",
+        agent_id=execution_id,
+        role="execution",
+        unique_code="challenge-a",
     )
-    granted = await service.grant_stagnation_extension(
-        "run-1",
-        "web-1",
-        context,
-        StagnationExtensionInput(
-            reason="waiting_remote", evidence_refs=[operation_id], note="remote polling"
+    result = await service.submit_report(
+        "run",
+        execution_id,
+        execution,
+        AgentReportInput.model_validate(
+            {
+                "status": "completed",
+                "summary": "top level is valid",
+                "hypothesis_outcome": "invented",
+                "findings": [{"not_a_finding": True}],
+                "evidence_refs": [123, "evidence:evidence_" + "f" * 32],
+            }
         ),
     )
-    assert granted["reason"] == "waiting_remote"
-    assert (await service.list_challenges("run-1"))[0]["extension_active"] is True
-    with pytest.raises(StateConflict) as duplicate:
-        await service.grant_stagnation_extension(
-            "run-1",
-            "web-1",
-            context,
-            StagnationExtensionInput(reason="waiting_remote", evidence_refs=[operation_id]),
-        )
-    assert duplicate.value.code == "stagnation_extension_used"
-
-    manager = StagnationManager(service, clock=clock)
-    clock.advance(420)
-    assert (await manager.evaluate("run-1", "web-1"))["action"] == "extension_active"
-    clock.advance(300)
-    capped = await manager.evaluate("run-1", "web-1")
-    assert capped["action"] == "pause"
-    assert capped["elapsed_seconds"] == 1_200
+    assert result["report_id"].startswith("report_")
+    assert {item["code"] for item in result["warnings"]} >= {
+        "invalid_hypothesis_outcome",
+        "invalid_finding_dropped",
+        "invalid_evidence_ref",
+        "evidence_not_accessible",
+    }
+    runtime = await service.get_agent_runtime("run", execution_id)
+    assert runtime["agent"]["status"] == "completed"
+    assert runtime["agent"]["terminal_report_id"] == result["report_id"]
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_typed_report_cursors_survive_out_of_order_consumption(
-    tmp_path: Path,
-) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run(
-        "run-1", challenges=[ChallengeImport(unique_code="web-1")]
+async def test_cloud_shaped_finding_is_normalized_and_persisted(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    dispatched = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test traversal"}]),
     )
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
-    )
-    execution = await service.register_agent(
-        "run-1",
+    execution_id = dispatched["admissions"][0]["agent_id"]
+    execution = CapabilityContext(
+        run_id="run",
+        agent_id=execution_id,
         role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="web-1",
-        hypothesis_key="report-cursor",
-        task_key="report-cursor-1",
-        task_stage="discovery",
-        mission="report",
+        unique_code="challenge-a",
     )
-    challenge_context = CapabilityContext(
-        run_id="run-1",
-        agent_id=challenge["agent_id"],
-        role="challenge",
-        unique_code="web-1",
+    evidence = await service.persist_evidence(
+        "run",
+        execution,
+        evidence_type="http",
+        source="system_http_response",
+        content="root:x:0:0",
     )
-    execution_context = CapabilityContext(
-        run_id="run-1",
-        agent_id=execution["agent_id"],
+    result = await service.submit_report(
+        "run",
+        execution_id,
+        execution,
+        AgentReportInput.model_validate(
+            {
+                "status": "completed",
+                "summary": "confirmed traversal",
+                "hypothesis_outcome": "confirmed",
+                "candidate_flag": "task-name-is-still-preserved-as-an-opaque-value",
+                "findings": [
+                    {
+                        "finding_id": "client-traversal-1",
+                        "title": "Traversal reads arbitrary files",
+                        "detail": "download.php accepted ../../../../etc/passwd",
+                        "severity": "high",
+                        "confidence": "high",
+                        "verification_status": "confirmed",
+                        "evidence_refs": [evidence["evidence_ref"]],
+                    }
+                ],
+            }
+        ),
+    )
+    assert result["hypothesis_outcome"] == "supported"
+    assert result["warnings"] == []
+    assert result["progress_kinds"] == ["finding_verified"]
+    assert result["findings"][0]["summary"] == "Traversal reads arbitrary files"
+    assert result["findings"][0]["confidence"] == 0.9
+    assert result["findings"][0]["detail"] == {
+        "description": "download.php accepted ../../../../etc/passwd",
+        "client_label": "client-traversal-1",
+        "severity": "high",
+        "evidence_refs": [evidence["evidence_ref"]],
+    }
+
+    events = await service.list_agent_events("run", execution_id)
+    report_event = next(item for item in events if item["event_type"] == "agent_report")
+    assert report_event["payload"] | {
+        "findings_received": 1,
+        "findings_persisted": 1,
+        "findings_dropped": 0,
+        "findings_normalized": 1,
+        "candidate_flag_present": True,
+    } == report_event["payload"]
+
+    observed = await service.observe_challenge(
+        "run", "challenge-a", challenge, max_reports=20
+    )
+    assert observed["candidate_flags"][0]["candidate_flag"].startswith("task-name")
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_only_assigned_candidate_finding_ref_is_updated(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    first_dispatch = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="discover", tasks=[{"objective": "discover"}]),
+    )
+    first_id = first_dispatch["admissions"][0]["agent_id"]
+    first_context = CapabilityContext(
+        run_id="run",
+        agent_id=first_id,
         role="execution",
-        unique_code="web-1",
+        unique_code="challenge-a",
     )
-    hint = await service.publish_control_report(
-        "run-1",
-        sender_id=chief["agent_id"],
-        recipient_id=challenge["agent_id"],
-        unique_code="web-1",
-        report_type="hint",
-        status="received",
-        payload={"type": "hint_received", "hint": "offline hint"},
-    )
-    report = await service.submit_report(
-        "run-1",
-        execution["agent_id"],
-        execution_context,
+    discovered = await service.submit_report(
+        "run",
+        first_id,
+        first_context,
         AgentReportInput(
             status="completed",
-            summary="done",
-            hypothesis_outcome="inconclusive",
+            summary="candidate found",
+            findings=[
+                {
+                    "summary": "Candidate traversal",
+                    "verification_status": "candidate",
+                }
+            ],
         ),
     )
-    execution_reports = await service.consume_reports(
-        "run-1", challenge_context, report_type="execution"
-    )
-    assert execution_reports["next_sequence"] == report["sequence"]
-    hints = await service.consume_reports(
-        "run-1", challenge_context, report_type="hint"
-    )
-    assert hints["reports"][0]["sequence"] == hint["sequence"]
-    runtime = await service.get_agent_runtime("run-1", challenge["agent_id"])
-    assert runtime["agent"]["report_cursors"] == {
-        "execution": report["sequence"],
-        "hint": hint["sequence"],
-    }
-    await service.close()
+    finding_ref = discovered["findings"][0]["finding_ref"]
 
-
-@pytest.mark.asyncio
-async def test_projection_failure_does_not_rollback_and_can_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = StateService(tmp_path / "state.sqlite3", run_root=tmp_path)
-    await service.create_run("run-1")
-    assert await service.project_pending_events(
-        "run-1", run_dir=tmp_path / "run-1"
-    ) == 1
-    await service.append_agent_event(
-        "run-1",
-        (await service.register_agent("run-1", role="chief"))["agent_id"],
-        "projection_fixture",
-    )
-    original = service._write_checkpoint
-
-    async def fail_once(session: object, run_id: str, target_dir: Path) -> None:
-        raise OSError("projection fixture failure")
-
-    monkeypatch.setattr(service, "_write_checkpoint", fail_once)
-    with pytest.raises(OSError):
-        await service.project_pending_events("run-1", run_dir=tmp_path / "run-1")
-    assert (await service.get_overview("run-1"))["run"]["last_sequence"] == 3
-    async with service.db.sessions() as session:
-        pending = (
-            await session.scalars(
-                select(AuditOutboxRecord).where(
-                    AuditOutboxRecord.run_id == "run-1"
-                )
-            )
-        ).all()
-    assert {item.attempts for item in pending} == {1}
-    assert {item.last_error for item in pending} == {"projection_failed"}
-
-    monkeypatch.setattr(service, "_write_checkpoint", original)
-    assert await service.project_pending_events(
-        "run-1", run_dir=tmp_path / "run-1"
-    ) == 2
-    lines = (tmp_path / "run-1" / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert [json.loads(line)["sequence"] for line in lines] == [1, 2, 3]
-    async with service.db.sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(AuditOutboxRecord)) == 0
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_catalog_sync_is_material_and_idempotent(tmp_path: Path) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    initial = ChallengeImport(unique_code="web-1", total_score=10)
-    await service.create_run("run-1", challenges=[initial])
-    chief = await service.register_agent("run-1", role="chief")
-    challenge = await service.register_agent(
-        "run-1",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="web-1",
-    )
-    before = await service.get_overview("run-1")
-    version = before["challenges"][0]["version"]
-    sequence = before["run"]["last_sequence"]
-    chief_key = service.agent_signal_key("run-1", chief["agent_id"])
-    challenge_key = service.agent_signal_key("run-1", challenge["agent_id"])
-    chief_signal = await service.notifier.current(chief_key)
-    challenge_signal = await service.notifier.current(challenge_key)
-
-    unchanged = await service.import_challenges("run-1", [initial])
-    unchanged_overview = await service.get_overview("run-1")
-    assert unchanged.changed_codes == []
-    assert unchanged.event_sequence is None
-    assert unchanged_overview["run"]["last_sequence"] == sequence
-    assert unchanged_overview["challenges"][0]["version"] == version
-    assert await service.notifier.current(chief_key) == chief_signal
-    assert await service.notifier.current(challenge_key) == challenge_signal
-
-    changed = await service.import_challenges(
-        "run-1", [initial.model_copy(update={"total_score": 20})]
-    )
-    changed_overview = await service.get_overview("run-1")
-    assert changed.changed_codes == ["web-1"]
-    assert changed.event_sequence == sequence + 1
-    assert changed_overview["run"]["last_sequence"] == sequence + 1
-    assert changed_overview["challenges"][0]["version"] == version + 1
-    assert await service.notifier.current(chief_key) == sequence + 1
-    assert await service.notifier.current(challenge_key) == sequence + 1
-    async with service.db.sessions() as session:
-        events = (
-            await session.scalars(
-                select(StateEventRecord).where(StateEventRecord.run_id == "run-1")
-            )
-        ).all()
-    assert [item.event_type for item in events].count(
-        "challenge_catalog_changed"
-    ) == 1
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_updates_timestamp_without_version_or_event(tmp_path: Path) -> None:
-    service = StateService(tmp_path / "state.sqlite3")
-    await service.create_run("run-1")
-    chief = await service.register_agent("run-1", role="chief")
-    context = CapabilityContext(
-        run_id="run-1", agent_id=chief["agent_id"], role="chief"
-    )
-    before = await service.get_overview("run-1")
-    version = before["agents"][0]["version"]
-    updated_at = before["agents"][0]["updated_at"]
-    sequence = before["run"]["last_sequence"]
-
-    first = await service.heartbeat("run-1", chief["agent_id"], context)
-    second = await service.heartbeat("run-1", chief["agent_id"], context)
-    after = await service.get_overview("run-1")
-    assert first["last_heartbeat_at"] is not None
-    assert second["version"] == version
-    assert second["updated_at"] == updated_at
-    assert after["run"]["last_sequence"] == sequence
-
-    sampled = await service.heartbeat(
-        "run-1", chief["agent_id"], context, sample_event=True
-    )
-    assert sampled["version"] == version
-    events = await service.list_agent_events("run-1", chief["agent_id"], limit=100)
-    assert [item["event_type"] for item in events].count("agent_heartbeat") == 1
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_projection_database_confirmation_retry_has_no_duplicate_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    run_dir = tmp_path / "run-1"
-    service = StateService(tmp_path / "state.sqlite3", run_root=tmp_path)
-    await service.create_run("run-1")
-    await service.project_pending_events("run-1", run_dir=run_dir)
-    chief = await service.register_agent("run-1", role="chief")
-    original = service._confirm_projection
-
-    async def fail_confirmation(run_id: str, sequence: int) -> None:
-        raise OSError("database confirmation fixture failure")
-
-    monkeypatch.setattr(service, "_confirm_projection", fail_confirmation)
-    with pytest.raises(OSError):
-        await service.project_pending_events("run-1", run_dir=run_dir)
-    monkeypatch.setattr(service, "_confirm_projection", original)
-
-    assert await service.project_pending_events("run-1", run_dir=run_dir) == 1
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert [json.loads(line)["sequence"] for line in lines] == [1, 2]
-    async with service.db.sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(AuditOutboxRecord)) == 0
-    assert chief["role"] == "chief"
-    await service.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("schema_version", [2, 5, 6, 8, 9])
-async def test_old_database_is_rejected_without_mutation(
-    tmp_path: Path, schema_version: int
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        connection.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-            (str(schema_version),),
-        )
-    before = database_path.read_bytes()
-    service = StateService(database_path)
-    with pytest.raises(RuntimeError, match="unsupported state database schema version"):
-        await service.initialize()
-    assert database_path.read_bytes() == before
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_projection_handles_twenty_thousand_events_incrementally(
-    tmp_path: Path,
-) -> None:
-    run_dir = tmp_path / "run-load"
-    service = StateService(tmp_path / "state.sqlite3", run_root=tmp_path)
-    await service.create_run("run-load")
-    await service.project_pending_events("run-load", run_dir=run_dir, limit=1_000)
-
-    event_count = 20_000
-    async with service.db.sessions.begin() as session:
-        run = await session.get(RunRecord, "run-load")
-        assert run is not None
-        await session.execute(
-            insert(StateEventRecord),
-            [
+    second_dispatch = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(
+            summary="validate",
+            tasks=[
                 {
-                    "event_id": f"event-load-{sequence}",
-                    "run_id": "run-load",
-                    "sequence": sequence,
-                    "event_type": "load_fixture",
-                    "payload": {"index": sequence - 2},
+                    "objective": "validate traversal",
+                    "context_refs": [finding_ref],
                 }
-                for sequence in range(2, event_count + 2)
             ],
-        )
-        await session.execute(
-            insert(AuditOutboxRecord),
-            [
-                {"run_id": "run-load", "sequence": sequence}
-                for sequence in range(2, event_count + 2)
+        ),
+    )
+    second_id = second_dispatch["admissions"][0]["agent_id"]
+    second_context = CapabilityContext(
+        run_id="run",
+        agent_id=second_id,
+        role="execution",
+        unique_code="challenge-a",
+    )
+    evidence = await service.persist_evidence(
+        "run",
+        second_context,
+        evidence_type="http",
+        source="system_http_response",
+        content="root:x:0:0",
+    )
+    verified = await service.submit_report(
+        "run",
+        second_id,
+        second_context,
+        AgentReportInput(
+            status="completed",
+            summary="candidate verified",
+            hypothesis_outcome="supported",
+            findings=[
+                {
+                    "finding_ref": finding_ref,
+                    "summary": "Candidate traversal",
+                    "verification_status": "verified",
+                    "evidence_refs": [evidence["evidence_ref"]],
+                }
             ],
-        )
-        run.last_sequence = event_count + 1
+        ),
+    )
+    assert verified["warnings"] == []
+    assert verified["findings"][0]["finding_ref"] == finding_ref
+    assert verified["findings"][0]["verification_status"] == "verified"
+    assert verified["progress_kinds"] == ["finding_verified"]
+    await service.close()
 
-    projected = 0
-    while batch := await service.project_pending_events(
-        "run-load", run_dir=run_dir, limit=1_000
-    ):
-        projected += batch
-    assert projected == event_count
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(lines) == event_count + 1
-    assert json.loads(lines[-1])["sequence"] == event_count + 1
-    assert "payload" not in AuditOutboxRecord.__table__.columns
-    async with service.db.sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(AuditOutboxRecord)) == 0
+
+def test_execution_report_schema_is_typed_but_optional_items_remain_best_effort() -> None:
+    schema = ExecutionReport.model_json_schema()
+    outcome = schema["properties"]["hypothesis_outcome"]
+    assert outcome["enum"] == ["supported", "rejected", "inconclusive"]
+    finding_ref = schema["properties"]["findings"]["items"]["$ref"]
+    assert finding_ref.endswith("/ReportFindingInput")
+    parsed = ExecutionReport.model_validate(
+        {
+            "status": "completed",
+            "summary": "terminal report survives",
+            "hypothesis_outcome": "provider-specific-value",
+            "findings": [{"title": "cloud-shaped"}, "malformed"],
+        }
+    )
+    assert parsed.hypothesis_outcome == "provider-specific-value"
+    assert parsed.findings[-1] == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_evidence_scope_and_paging(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    dispatched = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test"}]),
+    )
+    execution_id = dispatched["admissions"][0]["agent_id"]
+    execution = CapabilityContext(
+        run_id="run",
+        agent_id=execution_id,
+        role="execution",
+        unique_code="challenge-a",
+    )
+    saved = await service.persist_evidence(
+        "run",
+        execution,
+        evidence_type="http",
+        source="system_http_response",
+        content="0123456789",
+    )
+    first = await service.read_evidence(
+        "run", execution, saved["evidence_ref"], offset=0, limit_chars=4
+    )
+    second = await service.read_evidence(
+        "run", challenge, saved["evidence_ref"], offset=first["next_offset"], limit_chars=8
+    )
+    assert first["content"] + second["content"] == "0123456789"
+
+    await service.register_agent(
+        "run",
+        agent_id="other-execution",
+        role="execution",
+        parent_id="challenge",
+        unique_code="challenge-a",
+        mission="other",
+        initial_prompt="other",
+    )
+    other = CapabilityContext(
+        run_id="run",
+        agent_id="other-execution",
+        role="execution",
+        unique_code="challenge-a",
+    )
+    with pytest.raises(StatePermission) as error:
+        await service.read_evidence("run", other, saved["evidence_ref"])
+    assert error.value.code == "evidence_not_accessible"
     await service.close()

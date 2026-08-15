@@ -1,156 +1,103 @@
-"""Agent-facing tools for progressive skill discovery and reading."""
+"""Tool Specs for activating Skills and reading active Skill resources."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
-from .catalog import MAX_READ_LINES, SkillCatalog, SkillCatalogError, SkillRole
+from agent.tooling import AccessClaim, ToolSpec
+
+from .catalog import MAX_READ_LINES, MAX_SEARCH_RESULTS
+from .session import SkillSessionContext
 
 
 class _Arguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class SkillListArguments(_Arguments):
-    query: str | None = Field(default=None, max_length=1_000)
-    max_results: int = Field(default=50, ge=1, le=50)
-
-
-class SkillReadArguments(_Arguments):
+class SkillInvokeArguments(_Arguments):
     skill_id: str = Field(min_length=1, max_length=160)
-    resource: str = Field(default="SKILL.md", min_length=1, max_length=1_000)
+
+
+class SkillSearchArguments(_Arguments):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=MAX_SEARCH_RESULTS, ge=1, le=MAX_SEARCH_RESULTS)
+
+
+class SkillResourceReadArguments(_Arguments):
+    skill_id: str = Field(min_length=1, max_length=160)
+    resource: str = Field(min_length=1, max_length=1_000)
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=400, ge=1, le=MAX_READ_LINES)
 
 
-def _definition(name: str, description: str, model: type[BaseModel]) -> dict[str, Any]:
-    schema = model.model_json_schema()
-    schema.setdefault("additionalProperties", False)
-    return {
-        "type": "function",
-        "function": {"name": name, "description": description, "parameters": schema},
-    }
-
-
 class SkillTools:
-    """Expose one role-filtered view of the immutable skill catalog."""
+    """Expose one Agent-owned view of the immutable Skill catalog."""
 
-    _ROUTES: ClassVar[dict[str, tuple[type[_Arguments], str]]] = {
-        "skill_list": (SkillListArguments, "list_skills"),
-        "skill_read": (SkillReadArguments, "read_skill"),
-    }
-    _DEFINITIONS: ClassVar[list[dict[str, Any]]] = [
-        _definition(
-            "skill_list",
-            "Search the skills available to this Agent role. Returns only compact metadata and resource names. Use a concise task, vulnerability, or technology query; then call skill_read only for relevant skills.",
-            SkillListArguments,
-        ),
-        _definition(
-            "skill_read",
-            "Read SKILL.md or one named text resource from an available skill. Read the instructions before using bundled scripts. Use offset and limit to continue large resources; scripts execute through system_shell, not this tool.",
-            SkillReadArguments,
-        ),
-    ]
+    def __init__(self, context: SkillSessionContext) -> None:
+        self.context = context
 
-    def __init__(self, catalog: SkillCatalog, *, role: SkillRole) -> None:
-        if role not in {"challenge", "execution"}:
-            raise ValueError("only Challenge and Execution Agents can use skills")
-        self.catalog = catalog
-        self.role = role
+    def tool_specs(self) -> list[ToolSpec]:
+        async def invoke_skill(arguments: BaseModel) -> dict[str, Any]:
+            assert isinstance(arguments, SkillInvokeArguments)
+            return await self.context.invoke(arguments.skill_id)
 
-    @classmethod
-    def tool_definitions(cls) -> list[dict[str, Any]]:
-        return deepcopy(cls._DEFINITIONS)
-
-    async def dispatch(
-        self, name: str, arguments: Mapping[str, Any] | None = None
-    ) -> dict[str, Any]:
-        route = self._ROUTES.get(name)
-        if route is None:
-            return self._error("unknown_tool", "Unknown skill tool")
-        if arguments is None:
-            arguments = {}
-        if not isinstance(arguments, Mapping):
-            return self._error("invalid_arguments", "Tool arguments must be an object")
-        model, operation_name = route
-        try:
-            validated = model.model_validate(arguments)
-            operation = getattr(self, operation_name)
-            return await operation(**validated.model_dump())
-        except ValidationError as exc:
+        async def search_skills(arguments: BaseModel) -> dict[str, Any]:
+            assert isinstance(arguments, SkillSearchArguments)
+            results = self.context.search(arguments.query, limit=arguments.limit)
             return {
-                "ok": False,
-                "error": {
-                    "type": "validation",
-                    "code": "invalid_arguments",
-                    "message": "Invalid skill-tool arguments",
-                    "status_code": None,
-                    "detail": [
-                        {key: item[key] for key in ("loc", "msg", "type") if key in item}
-                        for item in exc.errors()
-                    ],
-                },
-            }
-        except SkillCatalogError as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "type": exc.error_type,
-                    "code": exc.code,
-                    "message": exc.message,
-                    "status_code": None,
-                    "detail": exc.detail,
-                },
+                "query": arguments.query,
+                "count": len(results),
+                "skills": results,
             }
 
-    async def list_skills(
-        self, query: str | None = None, max_results: int = 50
-    ) -> dict[str, Any]:
-        skills = self.catalog.list(self.role, query=query, max_results=max_results)
-        return {
-            "ok": True,
-            "data": {
-                "skills": skills,
-                "count": len(skills),
-                "query": query,
-                "role": self.role,
-            },
-        }
+        async def read_resource(arguments: BaseModel) -> dict[str, Any]:
+            assert isinstance(arguments, SkillResourceReadArguments)
+            return self.context.read_resource(
+                arguments.skill_id,
+                resource=arguments.resource,
+                offset=arguments.offset,
+                limit=arguments.limit,
+            )
 
-    async def read_skill(
-        self,
-        skill_id: str,
-        resource: str = "SKILL.md",
-        offset: int = 0,
-        limit: int = 400,
-    ) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "data": self.catalog.read(
-                self.role,
-                skill_id,
-                resource=resource,
-                offset=offset,
-                limit=limit,
+        return [
+            ToolSpec(
+                "skill_search",
+                "Search role-visible long-tail Skills by a specific task description. "
+                "This does not activate a Skill.",
+                SkillSearchArguments,
+                search_skills,
+                access_claims=lambda _arguments: (
+                    AccessClaim("read", f"agent:{self.context.agent_id}:skills"),
+                    AccessClaim("read", "skill:catalog"),
+                ),
             ),
-        }
+            ToolSpec(
+                "skill_invoke",
+                "Activate one available Skill and load its bounded activation instructions. "
+                "This must be the only tool call in the model response.",
+                SkillInvokeArguments,
+                invoke_skill,
+                access_claims=lambda _arguments: (
+                    AccessClaim("write", f"agent:{self.context.agent_id}:skills"),
+                ),
+                requires_solo=True,
+            ),
+            ToolSpec(
+                "skill_resource_read",
+                "Read one UTF-8 supporting or virtual instructions/manifest resource "
+                "from an already active Skill.",
+                SkillResourceReadArguments,
+                read_resource,
+                access_claims=lambda arguments: (
+                    AccessClaim("read", f"agent:{self.context.agent_id}:skills"),
+                    AccessClaim(
+                        "read", f"skill:{arguments.skill_id}:{arguments.resource}"
+                    ),
+                ),
+            ),
+        ]
 
     async def close(self) -> None:
         return None
-
-    @staticmethod
-    def _error(code: str, message: str) -> dict[str, Any]:
-        return {
-            "ok": False,
-            "error": {
-                "type": "validation",
-                "code": code,
-                "message": message,
-                "status_code": None,
-                "detail": {},
-            },
-        }

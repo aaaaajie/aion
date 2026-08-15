@@ -23,14 +23,16 @@ def test_all_production_prompt_resources_are_available() -> None:
         "exploration_mission.txt",
     )
     assert all(load_prompt(name).strip() for name in names)
-    assert "long-running" in system_prompt("challenge")
+    assert "timed challenge" in system_prompt("challenge")
 
 
 def test_default_chief_prompt_is_centrally_managed() -> None:
     prompt = default_chief_prompt()
     assert prompt == load_prompt("chief_agent.txt")
-    assert "benchmark_list_challenges" in prompt
-    assert "multiple Flags" in prompt
+    assert "chief_launch_challenges" in prompt
+    assert "chief_wait" in prompt
+    assert "restart_required" in prompt
+    assert "stagnation_paused" in prompt
 
 
 @pytest.mark.parametrize("role", ["chief", "challenge", "execution"])
@@ -42,64 +44,48 @@ def test_role_system_prompts_include_shared_base_prompt(role: str) -> None:
     assert role_prompt.startswith(load_prompt(f"{role}_system.txt"))
 
 
-def test_challenge_prompt_requires_a_persistent_report_loop() -> None:
+def test_challenge_prompt_requires_a_lightweight_report_loop() -> None:
     prompt = render_prompt(
         "challenge_agent.txt",
         challenge_data=json.dumps({"unique_code": "web-1"}),
     )
-    assert "one-shot task" in prompt
-    assert "consume every" in prompt.lower()
-    assert "challenge_wait_for_state" in prompt
-    assert "challenge_create_domain_probes" in prompt
-    assert "failure_criteria" in prompt
-    assert "currently-ready batch" in prompt
-    assert "first_round_tasks" in prompt
-    assert "skill_id" in prompt
-    assert "skill_instructions" in prompt
-    assert "Other" in prompt
-    assert "exact tool names" in prompt
-    assert "dimension x target_scope" in prompt
-    assert "题目方向：DOMAIN" in prompt
-    assert "timeout_seconds at or below 480" in prompt
-    assert "Persist accepted evidence before deriving the next batch" in prompt
-    assert "cross-domain signals" in prompt
+    assert "challenge_dispatch" in prompt
+    assert "challenge_wait" in prompt
+    assert "lightweight" in prompt
     assert "challenge_data" in prompt
     system = system_prompt("challenge")
-    assert "recognize-challenge-direction" in system
-    assert "skill_list" in system
-    assert "common/" in system
-    assert "Never preload" in system
+    assert "direction Skill is already active" in system
+    assert "challenge/challenge-threat-modeling Skill is available" in system
+    assert "do not invoke it merely to restate state" in system
+    assert "skill_invoke" in system
+    assert "skill_resource_read" in system
+    assert "Copy report" in system
+    assert "untrusted data" in system
 
 
-def test_challenge_prompt_prefers_breadth_first_parallel_decomposition() -> None:
+def test_challenge_prompt_prefers_parallel_independent_work() -> None:
     prompt = load_prompt("challenge_agent.txt")
     system = system_prompt("challenge")
 
-    assert "breadth-first" in prompt
-    assert "In every planning cycle" in prompt
-    assert "Do not impose an arbitrary minimum or" in prompt
-    assert "resulting task set" in prompt
-    assert "Resources are intentionally abundant" in system
-    assert "limits only one discovery pivot" in system
-    assert "validation/exploitation concurrency" in system
+    assert "useful independent work" in prompt
+    assert "stable task_key" in prompt
+    assert "ENTRY_UNREACHABLE" in prompt
+    assert "BRANCH_EXHAUSTED" in system
+    assert "Similar work is" not in prompt
+    assert "low-yield" in prompt
+    assert "episode" in prompt
+    assert "kind=exploration" in prompt
+    assert "second exploration" in prompt
+    assert "slow Execution never blocks" in system
+    assert "low_yield=true" in system
 
 
-def test_execution_prompt_explains_http_tool_selection_and_lifecycle() -> None:
+def test_execution_prompt_starts_work_without_management_rounds() -> None:
     prompt = system_prompt("execution")
-    assert "system_http_request" in prompt
-    assert "system_http_probe" in prompt
-    assert "system_http_output" in prompt
-    assert "Never call" in prompt
-    assert "Session" in prompt
-    assert "system_http_cleanup" in prompt
-    assert "run_in_background=true" in prompt
-    assert "system_task_output(wait_seconds=...)" in prompt
-    assert "nohup" in prompt
-    assert "for + curl" in prompt
-    assert "skill_list" in prompt
-    assert "skill_read" in prompt
-    assert "$AION_SKILLS_ROOT" in prompt
-    assert "$AION_PYTHON" in prompt
+    assert "first request already contains" in prompt
+    assert "Start useful technical work immediately" in prompt
+    assert "execution_report" in prompt
+    assert "evidence_refs" in prompt
 
 
 def test_prompt_loader_rejects_missing_templates() -> None:

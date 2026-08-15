@@ -1,0 +1,55 @@
+id: exploit.llm_prompt_injection
+name: Llm Prompt Injection
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: LLM prompt injection playbook. Use when testing AI/LLM applications for direct injection, indirect injection via RAG/browsing, tool abuse, data exfiltration, MCP security risks, and defense bypass techniques.
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - llm
+  - prompt
+  - injection
+  - playbook.
+  - use
+  - when
+  - applications
+  - direct
+  - indirect
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - LLM_PROMPT_INJECTION
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- llm
+- prompt
+- injection
+- playbook.
+- use
+- when
+- applications

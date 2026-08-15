@@ -15,6 +15,7 @@ import pytest
 
 from agent.state import StateService
 from agent.state.clock import utc_now
+from agent.tooling import ToolExecutor, ToolRegistry
 from tools.system import ShellTaskManager, SystemTools
 from tools.system.policy import SystemToolError
 from tools.system.policy import WorkspacePolicy
@@ -30,6 +31,62 @@ class _MutableClock:
 
     def advance(self, **kwargs: float) -> None:
         self.current += timedelta(**kwargs)
+
+
+class _SystemToolClient:
+    """Test adapter that sends every convenience call through ToolExecutor."""
+
+    def __init__(self, provider: SystemTools) -> None:
+        self.provider = provider
+
+    def __getattr__(self, name: str):
+        return getattr(self.provider, name)
+
+    async def _call(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        calls = await ToolExecutor(ToolRegistry([self.provider])).execute(
+            [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments)}}]
+        )
+        assert calls[0].result is not None
+        return calls[0].result
+
+    async def read_file(self, file_path: str, **kwargs: object):
+        return await self._call("system_read_file", {"file_path": file_path, **kwargs})
+
+    async def write_file(self, file_path: str, content: str):
+        return await self._call("system_write_file", {"file_path": file_path, "content": content})
+
+    async def edit_file(self, file_path: str, old_text: str, new_text: str, **kwargs: object):
+        return await self._call("system_edit_file", {"file_path": file_path, "old_string": old_text, "new_string": new_text, **kwargs})
+
+    async def create_directory(self, path: str, **kwargs: object):
+        return await self._call("system_create_directory", {"path": path, **kwargs})
+
+    async def delete_path(self, path: str, **kwargs: object):
+        return await self._call("system_delete_path", {"path": path, **kwargs})
+
+    async def list_directory(self, path: str = ".", **kwargs: object):
+        return await self._call("system_list_directory", {"path": path, **kwargs})
+
+    async def glob(self, pattern: str, path: str = "."):
+        return await self._call("system_glob", {"pattern": pattern, "path": path})
+
+    async def grep(self, pattern: str, path: str = ".", **kwargs: object):
+        return await self._call("system_grep", {"pattern": pattern, "path": path, **kwargs})
+
+    async def shell(self, command: str, **kwargs: object):
+        return await self._call("system_shell", {"command": command, **kwargs})
+
+    async def task_output(self, task_id: str, **kwargs: object):
+        return await self._call("system_task_output", {"task_id": task_id, **kwargs})
+
+    async def task_stop(self, task_id: str):
+        return await self._call("system_task_stop", {"task_id": task_id})
+
+    async def task_cleanup(self, task_id: str):
+        return await self._call("system_task_cleanup", {"task_id": task_id})
+
+    async def close(self) -> None:
+        await self.provider.close()
 
 
 class _ToolHarness:
@@ -54,7 +111,7 @@ class _ToolHarness:
         self.service: StateService | None = None
         self.manager: ShellTaskManager | None = None
 
-    async def __aenter__(self) -> SystemTools:
+    async def __aenter__(self) -> _SystemToolClient:
         run_root = self.root / "runs"
         self.service = StateService(
             run_root / self.run_id / "state.sqlite3",
@@ -83,9 +140,8 @@ class _ToolHarness:
             environment=self.environment,
         )
         await self.manager.initialize()
-        return SystemTools(
-            root=self.root,
-            shell=self.manager.bind(self.agent_id),
+        return _SystemToolClient(
+            SystemTools(root=self.root, shell=self.manager.bind(self.agent_id))
         )
 
     async def __aexit__(self, *_args: object) -> None:
@@ -111,6 +167,9 @@ async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> No
         read_result = await tools.read_file("notes.txt")
         assert read_result["ok"] is True
         assert read_result["data"]["content"] == "alpha\nbeta\nbeta\n"
+        page = await tools.read_file("notes.txt", offset=6, limit_chars=4)
+        assert page["ok"] is True
+        assert page["data"]["content"] == "beta"
 
         multiple = await tools.edit_file("notes.txt", "beta", "gamma")
         assert multiple["error"]["code"] == "multiple_matches"
@@ -137,10 +196,8 @@ async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> No
 
 
 @pytest.mark.asyncio
-async def test_create_list_glob_grep_and_delete(make_tools) -> None:
+async def test_write_auto_creates_parents_then_list_glob_and_grep(make_tools) -> None:
     async with make_tools() as tools:
-        directory = await tools.create_directory("src/pkg", parents=True)
-        assert directory["data"]["created"] is True
         await tools.write_file("src/pkg/a.py", "needle = 1\n")
         await tools.write_file("src/pkg/b.txt", "nothing\n")
 
@@ -161,11 +218,35 @@ async def test_create_list_glob_grep_and_delete(make_tools) -> None:
             }
         ]
 
-        non_recursive = await tools.delete_path("src")
-        assert non_recursive["error"]["code"] == "directory_not_empty"
-        deleted = await tools.delete_path("src", recursive=True)
-        assert deleted["data"]["deleted"] is True
-        assert not (tools._filesystem.policy.root / "src").exists()
+        assert (tools._filesystem.policy.root / "src/pkg").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_file_evidence_snapshot_is_exact_and_never_leaks_to_model(
+    make_tools,
+) -> None:
+    async with make_tools() as tools:
+        calls = await ToolExecutor(ToolRegistry([tools.provider])).execute(
+            [
+                {
+                    "id": "write-evidence",
+                    "function": {
+                        "name": "system_write_file",
+                        "arguments": json.dumps(
+                            {"file_path": "proof.txt", "content": "exact\nproof\n"}
+                        ),
+                    },
+                }
+            ]
+        )
+        call = calls[0]
+        assert call.result is not None
+        assert "_aion_evidence" not in json.dumps(call.result)
+        assert call.evidence_payload == {
+            "evidence_type": "file",
+            "content": "exact\nproof\n",
+            "metadata": {"file_path": "proof.txt"},
+        }
 
 
 @pytest.mark.asyncio
@@ -181,7 +262,7 @@ async def test_path_traversal_symlink_escape_and_root_delete_are_rejected(make_t
         assert symlink["error"]["code"] == "path_outside_workspace"
 
         root_delete = await tools.delete_path(".", recursive=True)
-        assert root_delete["error"]["code"] == "workspace_root_protected"
+        assert root_delete["error"]["code"] == "unknown_tool"
 
 
 @pytest.mark.asyncio
@@ -286,13 +367,9 @@ async def test_background_tasks_can_be_read_and_stopped(make_tools) -> None:
 
         long_task = await tools.shell("sleep 10", run_in_background=True)
         active_cleanup = await tools.task_cleanup(long_task["data"]["task_id"])
-        assert active_cleanup["error"]["code"] == "task_still_running"
+        assert active_cleanup["error"]["code"] == "unknown_tool"
         stopped = await tools.task_stop(long_task["data"]["task_id"])
         assert stopped["data"]["status"] == "stopped"
-        cleaned = await tools.task_cleanup(long_task["data"]["task_id"])
-        assert cleaned["data"]["cleaned"] is True
-        cleaned_again = await tools.task_cleanup(long_task["data"]["task_id"])
-        assert cleaned_again["data"]["already_cleaned"] is True
 
         missing = await tools.task_output("task-does-not-exist")
         assert missing["error"]["code"] == "task_not_found"
@@ -311,9 +388,11 @@ async def test_shell_client_close_keeps_task_for_same_agent(make_tools) -> None:
 
         assert harness.manager is not None
         assert harness.agent_id is not None
-        rebound = SystemTools(
-            root=harness.root,
-            shell=harness.manager.bind(harness.agent_id),
+        rebound = _SystemToolClient(
+            SystemTools(
+                root=harness.root,
+                shell=harness.manager.bind(harness.agent_id),
+            )
         )
         output = await rebound.task_output(task_id, wait_seconds=1)
         assert output["data"]["status"] == "completed"
@@ -331,9 +410,11 @@ async def test_agent_ownership_and_persistent_temp_are_isolated(make_tools) -> N
             role="chief",
             initial_prompt="second owner",
         )
-        second = SystemTools(
-            root=harness.root,
-            shell=harness.manager.bind(second_agent["agent_id"]),
+        second = _SystemToolClient(
+            SystemTools(
+                root=harness.root,
+                shell=harness.manager.bind(second_agent["agent_id"]),
+            )
         )
 
         created = await first.shell(
@@ -403,9 +484,8 @@ async def test_pause_and_resume_marks_running_task_interrupted(make_tools) -> No
             reap_interval_seconds=0,
         )
         await resumed.initialize(resume=True)
-        rebound = SystemTools(
-            root=harness.root,
-            shell=resumed.bind(harness.agent_id),
+        rebound = _SystemToolClient(
+            SystemTools(root=harness.root, shell=resumed.bind(harness.agent_id))
         )
         output = await rebound.task_output(task_id)
         assert output["data"]["status"] == "interrupted"
@@ -439,60 +519,82 @@ async def test_agent_and_run_terminal_cleanup_remove_runtime_files(make_tools) -
 
 
 @pytest.mark.asyncio
+async def test_shell_agent_and_run_cleanup_are_concurrently_idempotent(make_tools) -> None:
+    harness = make_tools(reap_interval_seconds=0)
+    tools = await harness.__aenter__()
+    try:
+        completed = await tools.shell("printf concurrent-cleanup")
+        assert completed["ok"] is True
+        assert harness.manager is not None
+        assert harness.agent_id is not None
+        await asyncio.gather(
+            *(harness.manager.finish_agent(harness.agent_id) for _ in range(20)),
+            *(harness.manager.finish_run() for _ in range(5)),
+        )
+        assert not harness.manager.runtime_root.exists()
+        rows = await harness.service.list_shell_tasks(
+            harness.run_id, agent_id=harness.agent_id
+        )
+        assert rows and all(row["output_cleaned_at"] is not None for row in rows)
+    finally:
+        await harness.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_sandbox_unavailable_is_reported_without_running_shell(make_tools) -> None:
     async with make_tools(
         sandbox_executable="/does/not/exist/sandbox-exec"
     ) as tools:
         result = await tools.shell("printf should-not-run")
 
-    assert result == {
-        "ok": False,
-        "error": {
-            "type": "execution",
-            "code": "sandbox_unavailable",
-            "message": "No supported OS sandbox backend is available",
-            "status_code": None,
-            "detail": {},
-        },
-    }
+    assert result["ok"] is False
+    assert result["error"]["stage"] == "execution"
+    assert result["error"]["code"] == "sandbox_unavailable"
+    assert result["error"]["retry"]["allowed"] is False
 
 
 @pytest.mark.asyncio
-async def test_dispatch_validation_and_json_serialization(make_tools) -> None:
+async def test_executor_validation_and_json_serialization(make_tools) -> None:
     async with make_tools() as tools:
-        unknown = await tools.dispatch("system_unknown", {})
-        invalid = await tools.dispatch("system_read_file", {"unexpected": True})
-        result = await tools.dispatch("system_list_directory", {})
+        async def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+            calls = await ToolExecutor(ToolRegistry([tools])).execute(
+                [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments)}}]
+            )
+            assert calls[0].result is not None
+            return calls[0].result
+
+        unknown = await call("system_unknown", {})
+        invalid = await call("system_read_file", {"unexpected": True})
+        result = await call("system_list_directory", {})
 
     assert unknown["error"]["code"] == "unknown_tool"
-    assert invalid["error"]["type"] == "validation"
+    assert invalid["error"]["stage"] == "schema"
     assert result["ok"] is True
     json.dumps(result)
 
 
-def test_system_tool_definitions_are_complete_and_copy_safe() -> None:
-    from tools.system import SystemTools
-
-    definitions = SystemTools.tool_definitions()
+@pytest.mark.asyncio
+async def test_system_tool_definitions_are_generated_from_specs(make_tools) -> None:
+    async with make_tools() as tools:
+        definitions = ToolRegistry([tools]).definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == 12
+    assert len(names) == 9
     assert names == [
         "system_read_file",
         "system_write_file",
         "system_edit_file",
-        "system_create_directory",
-        "system_delete_path",
         "system_list_directory",
         "system_glob",
         "system_grep",
         "system_shell",
         "system_task_output",
         "system_task_stop",
-        "system_task_cleanup",
     ]
     assert all(item["function"]["parameters"]["additionalProperties"] is False for item in definitions)
-    definitions[0]["function"]["name"] = "mutated"
-    assert SystemTools.tool_definitions()[0]["function"]["name"] == "system_read_file"
+    read_schema = definitions[0]["function"]["parameters"]
+    assert "limit_chars" in read_schema["properties"]
+    assert "limit" not in read_schema["properties"]
+    assert not hasattr(SystemTools, "tool_definitions")
 
 
 def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path) -> None:

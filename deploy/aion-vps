@@ -155,7 +155,16 @@ def _release_id(source_digest: str) -> str:
 
 
 def _requirements_digest() -> str:
-    return hashlib.sha256((PROJECT_ROOT / "requirements.lock").read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    for path in (
+        PROJECT_ROOT / "requirements.lock",
+        PROJECT_ROOT / "tools" / "binaries" / "offline-requirements.lock",
+    ):
+        if not path.is_file():
+            raise OperatorError(f"missing runtime dependency lock: {path}")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _local_verify() -> None:
@@ -234,7 +243,7 @@ def _remote_doctor() -> None:
         "set -euo pipefail; "
         "python3 -c 'import sys; raise SystemExit(sys.version_info[:2] != (3,11))'; "
         "command -v openvpn >/dev/null; command -v bwrap >/dev/null; "
-        "command -v nginx >/dev/null; ! command -v nmap >/dev/null; "
+        "command -v nginx >/dev/null; "
         "test -d /etc/aion; test -d /var/lib/aion/workspace; "
         "test -d /var/lib/aion/runs; nginx -t >/dev/null"
     )

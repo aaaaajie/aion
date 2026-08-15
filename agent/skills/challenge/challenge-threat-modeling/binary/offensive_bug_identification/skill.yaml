@@ -1,0 +1,65 @@
+id: exploit.offensive_bug_identification
+name: Offensive Bug Identification
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: 'Systematic bug identification methodology: source code review patterns, black-box testing strategies, taint analysis, dangerous function hunting, data flow tracing, and automated scanning setup. Use for code audits, bug bounty triage, or building vulnerability identification pipelines.'
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - bug
+  - identification
+  - systematic
+  - methodology
+  - source
+  - code
+  - review
+  - patterns
+  - black
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - semgrep
+  - codeql
+  - burpsuite
+  - nuclei
+  - ghidra
+  - ida
+  - radare2
+  - gdb
+  - angr
+  - aflplusplus
+  - frida
+  - objection
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_BUG_IDENTIFICATION
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- bug
+- identification
+- systematic
+- methodology
+- source
+- code
+- review

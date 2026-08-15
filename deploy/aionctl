@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.request import urlopen
 
 
 SERVICE_NAME = "aion-online.service"
@@ -40,12 +41,14 @@ def _run(
     check: bool = True,
     capture_output: bool = False,
     text: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     return subprocess.run(
         command,
         check=check,
         capture_output=capture_output,
         text=text,
+        env=env,
     )
 
 
@@ -99,6 +102,14 @@ def _run_record(run_id: str) -> dict[str, Any]:
                 "FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
+            recovery = connection.execute(
+                "SELECT event_type FROM state_events "
+                "WHERE run_id = ? AND event_type IN "
+                "('controller_session_recovery_scheduled', "
+                "'controller_session_recovered') "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
     except sqlite3.Error as exc:
         raise ControlError(f"run database could not be read: {run_id}") from exc
     if row is None:
@@ -109,6 +120,7 @@ def _run_record(run_id: str) -> dict[str, Any]:
         "started_at": row[2],
         "deadline_at": row[3],
         "last_sequence": row[4],
+        "controller_recovery_event": recovery[0] if recovery else None,
     }
 
 
@@ -226,6 +238,17 @@ def _monitor_reachable() -> bool:
         return False
 
 
+def _monitor_snapshot() -> dict[str, Any] | None:
+    try:
+        with urlopen(
+            "http://127.0.0.1:8765/api/health", timeout=0.5
+        ) as response:
+            value = json.loads(response.read(1_000_000))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _status(as_json: bool) -> None:
     run_id: str | None
     record: dict[str, Any] | None
@@ -251,11 +274,25 @@ def _status(as_json: bool) -> None:
         for line in properties.splitlines()
         if "=" in line
     )
+    monitor_snapshot = _monitor_snapshot()
+    monitor_state = monitor_snapshot
+    active = systemd.get("ActiveState") == "active"
+    if record and record["status"] == "failed":
+        runtime_state = "failed"
+    elif isinstance(monitor_state, dict) and monitor_state.get("mode") == "frozen":
+        runtime_state = "frozen"
+    elif record and record.get("controller_recovery_event") == "controller_session_recovery_scheduled":
+        runtime_state = "controller_recovering"
+    elif active and monitor_snapshot is not None:
+        runtime_state = "running"
+    else:
+        runtime_state = "stopped"
     data = {
         "release_id": _release_id(),
         "service": systemd,
         "run": record,
         "monitor_backend_reachable": _monitor_reachable(),
+        "runtime_state": runtime_state,
         "vpn_processes": _run(
             ["pgrep", "-a", "openvpn"], check=False, capture_output=True
         ).stdout.splitlines(),
@@ -269,6 +306,7 @@ def _status(as_json: bool) -> None:
         f"{systemd.get('ActiveState', 'unknown')}/{systemd.get('SubState', 'unknown')} "
         f"pid={systemd.get('MainPID', '0')}"
     )
+    print(f"runtime_state: {runtime_state}")
     if record:
         print(
             f"run: {record['run_id']} status={record['status']} "
@@ -317,6 +355,47 @@ def _bundle(run_id_value: str, include_workspace: bool) -> None:
 def _doctor(as_json: bool) -> None:
     checks: dict[str, dict[str, Any]] = {}
 
+    def tool_chain() -> None:
+        runtime_python = APP_ROOT / "current-venv" / "bin" / "python"
+        if not runtime_python.is_file():
+            checks["tool_chain"] = {
+                "ok": False,
+                "error": f"runtime Python is missing: {runtime_python}",
+            }
+            return
+        try:
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(APP_ROOT / "current")
+            result = _run(
+                [
+                    str(runtime_python),
+                    "-c",
+                    (
+                        "import json; from tools.binaries.validation import check_tool_chain; "
+                        "print(json.dumps(check_tool_chain(), ensure_ascii=False))"
+                    ),
+                ],
+                check=False,
+                capture_output=True,
+                env=environment,
+            )
+            if result.returncode != 0:
+                raise ControlError(result.stderr[-2_000:] or "tool-chain check failed")
+            report = json.loads(result.stdout)
+        except Exception as exc:
+            checks["tool_chain"] = {
+                "ok": False,
+                "error": f"tool manifest check failed: {exc}",
+            }
+            return
+        checks["tool_chain"] = {
+            "ok": bool(report["ok"]),
+            "missing": report["missing"],
+            "blocked_capabilities": report.get("blocked_capabilities", {}),
+            "present_count": len(report["present"]),
+            "target": report.get("target", {}),
+        }
+
     def binary(name: str, command: list[str]) -> None:
         path = shutil.which(name)
         result = _run(command, check=False, capture_output=True) if path else None
@@ -330,10 +409,10 @@ def _doctor(as_json: bool) -> None:
     binary("openvpn", ["openvpn", "--version"])
     binary("bwrap", ["bwrap", "--version"])
     binary("nginx", ["nginx", "-t"])
+    tool_chain()
     checks["python3"]["ok"] = checks["python3"]["ok"] and checks["python3"][
         "version"
     ].startswith("Python 3.11.")
-    checks["nmap_absent"] = {"ok": shutil.which("nmap") is None}
     for path in (
         APP_ROOT,
         Path("/etc/aion"),

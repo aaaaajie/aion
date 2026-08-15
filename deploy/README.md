@@ -18,7 +18,35 @@
 - OpenVPN：`/etc/aion/vpn/benchmark.ovpn`
 - 持久配置：`/etc/aion/aion.env`，不含 `BENCHMARK_TOKEN`
 
+`/etc/aion/aion.env` 必须同时提供 `LLM_BASE_URL`、`LLM_MODEL`、
+`LLM_API_KEY` 和 `AION_SKILL_DISCOVERY_MODEL`。Skill Discovery 模型使用同一
+Base URL 与 API Key；该项应配置为支持普通 OpenAI-compatible Chat Completions
+的轻量模型。缺失或调用失败时 Runtime 会记录降级事件并使用本地候选，不会阻塞
+Execution。
+
+可选配置 `AION_BOOTSTRAP_ENABLED=false` 可关闭每个 Challenge 的自动 Bootstrap；未配置时默认启用。
+
 私钥始终留在本机。Monitor 使用自签名证书，浏览器第一次访问需要接受证书警告。
+
+## 固定版本工具链（离线）
+
+比赛环境不联网，所有执行环境必须随 release 自包含：
+
+- Python 运行时和二进制分析依赖统一放在 Linux x86_64 wheelhouse；完整锁定清单是
+  `tools/binaries/offline-requirements.lock`，发布包同时带上
+  `tools/binaries/wheelhouse.sha256`。release manager 只执行带
+  `--no-index` 的本地安装，运行期不执行 pip、apt 或其他联网安装。
+- 系统工具必须放在 `tools/binaries/bin/`，版本、启动参数和 SHA-256 记录在
+  `tools/binaries/manifest.json`。联网构建机准备好精确版本后，在 Linux x86_64 上执行
+  `python scripts/package_linux_toolchain.py --source /absolute/path/to/bin`，再执行
+  `python scripts/package_linux_toolchain.py --check`。
+- `aionctl doctor` 和 release prepare 都会校验目标平台、wheelhouse 完整性、每个工具的
+  可执行权限、版本输出和 SHA-256；任何必需项缺失都会拒绝启动执行代理。运行时 PATH
+  只把 release 自带的 `bin/` 放在最前面，不接受宿主机上同名的其他版本。
+- pwntools 的联网更新检查在 Agent 沙箱 HOME 预置 `never` 标记，离线运行不产生外联。
+
+构建完成后的本地校验：`python tools/binaries/offline_tools.py checksums` 更新 wheel
+清单，然后执行 `python scripts/package_linux_toolchain.py --check`。
 
 ## 远程服务器登录信息（供 AI/运维读取）
 
@@ -57,7 +85,7 @@ ssh \
 - 不得读取、输出、复制或上传私钥内容；只允许把上述本机路径交给 SSH 客户端。
 - 不使用密码登录，不把私钥上传到服务器。
 - SSH 登录只用于诊断或本地 CLI 内部操作；日常运维仍优先使用 `deploy/aion-vps`。
-- 不安装 `nmap` 或 AI 临时提出的其他系统工具，不执行未经当前任务授权的包管理操作。
+- 不通过包管理器安装临时工具；执行工具必须由 release 的离线 toolchain 提供。
 
 ## 最常用操作
 
@@ -215,8 +243,9 @@ VPN。第一次从旧平铺目录迁移时只保证恢复旧文件并保持停�
 ## 安全边界
 
 - 日常部署绝不执行 `dnf`，也不安装或升级任何系统包。
-- 固定依赖仅为服务器已有的 OpenVPN、bubblewrap、Python 3.11 和 Nginx。
-- `doctor` 会确认 `nmap` 不存在；部署前后 RPM 包清单摘要必须一致。
+- 固定宿主依赖仅为 OpenVPN、bubblewrap、Python 3.11 和 Nginx；执行工具从 release
+  自带的 `tools/binaries/bin/` 提供。
+- `doctor` 会校验 release 内工具链和版本；部署前后 RPM 包清单摘要必须一致。
 - 只上传 `agent/`、`tools/`、`challenges_sdk/`、`third_party/`、`scripts/`、`deploy/`、
   `pyproject.toml` 和 `requirements.lock`。
 - 不上传 `.env`、`.venv`、`.aion`、证据目录、recon、work 或本机临时文件。
@@ -227,7 +256,7 @@ VPN。第一次从旧平铺目录迁移时只保证恢复旧文件并保持停�
 
 1. 先运行 `deploy/aion-vps status`，确认 service、run、VPN 和 Monitor 状态。
 2. 使用 `deploy/aion-vps logs tail` 查看启动错误。
-3. 使用 `deploy/aion-vps doctor` 检查固定依赖、Nginx、磁盘和 `nmap` 状态。
+3. 使用 `deploy/aion-vps doctor` 检查固定依赖、Nginx、磁盘和 release toolchain 状态。
 4. 需要离线分析时执行 `deploy/aion-vps logs pull --run-id latest`。
 5. 新版本故障时执行 `deploy/aion-vps rollback --benchmark-token '<TOKEN>'`。
 6. 不要手工删除 `/var/lib/aion/runs`、SQLite WAL、release 或 credential 目录。

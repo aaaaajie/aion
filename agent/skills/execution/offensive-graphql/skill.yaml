@@ -1,0 +1,58 @@
+id: web.offensive_graphql
+name: Offensive Graphql
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: 'GraphQL security testing checklist: introspection abuse, batching attacks, query depth/complexity DoS, field suggestion enumeration, IDOR via GraphQL, injection through arguments, authorization bypass. Use when assessing GraphQL endpoints in web app tests or bug bounty.'
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - graphql
+  - security
+  - checklist
+  - introspection
+  - abuse
+  - batching
+  - attacks
+  - query
+  - depth
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - nuclei
+  - ida
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_GRAPHQL
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- graphql
+- security
+- checklist
+- introspection
+- abuse
+- batching
+- attacks

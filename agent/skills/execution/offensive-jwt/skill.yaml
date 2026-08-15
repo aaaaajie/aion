@@ -1,0 +1,59 @@
+id: web.offensive_jwt
+name: Offensive Jwt
+version: 1.0.0
+category:
+- web
+- vulnerability
+stage:
+- reconnaissance
+- initial_access
+description: JWT attack methodology for penetration testers. Covers algorithm confusion (alg:none, RS256→HS256), weak HMAC secret brute force, kid parameter injection (SQLi, path traversal), jku/x5u/jwk header injection, JWKS cache poisoning, JWS/JWE confusion, timing attacks, and mobile JWT storage extraction. Use when testing JWT-based authentication, hunting auth bypass via token manipulation, or evaluating JWT implementation security in web or mobile apps.
+risk_level: medium
+trigger:
+  keywords:
+  - web
+  - jwt
+  - attack
+  - methodology
+  - penetration
+  - testers.
+  - covers
+  - algorithm
+  - confusion
+  - alg
+  evidence:
+  - request_response
+  - reproduction_steps
+requires:
+  tools:
+  - burpsuite
+  - ida
+  - frida
+  - objection
+  - http_request
+  - response_compare
+  permissions:
+  - execution
+workflow:
+- detect
+- confirm
+- exploit
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_JWT
+  evidence:
+  - request_response
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- web
+- jwt
+- attack
+- methodology
+- penetration
+- testers.
+- covers
+- algorithm

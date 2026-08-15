@@ -1,0 +1,56 @@
+id: exploit.orchestrating_llm_attacks_with_pyrit
+name: Orchestrating Llm Attacks With Pyrit
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: Build multi-turn, Crescendo, and Tree-of-Attacks-with-Pruning (TAP) automated attack chains against conversational LLM agents using Microsoft PyRIT, with adversarial chat and scorer feedback loops.
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - orchestrating
+  - llm
+  - attacks
+  - pyrit
+  - build
+  - multi
+  - turn
+  - crescendo
+  - tree
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - ida
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - ORCHESTRATING_LLM_ATTACKS_WITH_PYRIT
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- orchestrating
+- llm
+- attacks
+- pyrit
+- build
+- multi
+- turn

@@ -1,0 +1,57 @@
+id: exploit.offensive_mitigations
+name: Offensive Mitigations
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: 'Security mitigation reference and bypass catalog: ASLR, DEP/NX, RELRO, stack canaries, CFI, sandboxing, seccomp. Covers both detection of enabled mitigations and known bypass techniques. Use when assessing target hardening or planning exploit mitigation bypasses.'
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - mitigations
+  - security
+  - mitigation
+  - reference
+  - bypass
+  - catalog
+  - aslr
+  - dep
+  - relro
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - ida
+  - nmap
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - OFFENSIVE_MITIGATIONS
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- mitigations
+- security
+- mitigation
+- reference
+- bypass
+- catalog
+- aslr

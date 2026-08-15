@@ -1,0 +1,56 @@
+id: exploit.defi_attack_patterns
+name: Defi Attack Patterns
+version: 1.0.0
+category:
+- exploit
+- vulnerability
+stage:
+- exploitation
+- privilege_escalation
+description: DeFi attack pattern playbook. Use when analyzing flash loan attacks, price oracle manipulation, MEV sandwich attacks, governance exploits, bridge vulnerabilities, and token standard edge cases in decentralized finance protocols.
+risk_level: high
+trigger:
+  keywords:
+  - exploit
+  - defi
+  - attack
+  - patterns
+  - pattern
+  - playbook.
+  - use
+  - when
+  - flash
+  - loan
+  evidence:
+  - poc_output
+  - reproduction_steps
+requires:
+  tools:
+  - ida
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- identify_primitive
+- build_poc
+- stabilize
+- validate
+outputs:
+  findings:
+  - DEFI_ATTACK_PATTERNS
+  evidence:
+  - poc_output
+  - reproduction_steps
+  - verified_impact
+  credentials:
+    optional: false
+tags:
+- exploit
+- defi
+- attack
+- patterns
+- pattern
+- playbook.
+- use
+- when

@@ -23,6 +23,18 @@ CONNECT_TIMEOUT_SECONDS = 1.5
 TOTAL_TIMEOUT_SECONDS = 5.0
 HTTP_PORTS = {80, 443, 3000, 5000, 8000, 8080, 8443, 8545, 9545}
 RPC_PORTS = {8545, 9545}
+_DIRECTION_ALIASES = {"ai": "evasion", "blockchain": "cloud"}
+
+
+def _normalize_candidates(candidates: list[str]) -> list[str]:
+    """Map legacy probe directions into the six-dimension space."""
+
+    seen: list[str] = []
+    for item in candidates:
+        normalized = _DIRECTION_ALIASES.get(item, item)
+        if normalized not in seen:
+            seen.append(normalized)
+    return seen
 
 
 class ProbeInputError(ValueError):
@@ -134,6 +146,54 @@ def _body_markers(
             ("format string", "format-string"),
             ("gdb", "debugger"),
         ),
+        "exploit": (
+            ("buffer overflow", "buffer-overflow"),
+            ("stack overflow", "stack-overflow"),
+            ("heap exploitation", "heap"),
+            ("uaf", "uaf"),
+            ("format string", "format-string"),
+            ("shellcode", "shellcode"),
+            ("ret2libc", "ret2libc"),
+            ("kernel pwn", "kernel-pwn"),
+            ("sandbox escape", "sandbox-escape"),
+            ("pwn", "pwn"),
+        ),
+        "pentest": (
+            ("nmap", "nmap"),
+            ("port scan", "port-scan"),
+            ("weak password", "weak-password"),
+            ("brute force", "brute-force"),
+            ("hydra", "hydra"),
+            ("privesc", "privesc"),
+            ("privilege escalation", "privesc"),
+            ("lateral movement", "lateral"),
+            ("intranet", "intranet"),
+        ),
+        "cloud": (
+            ("aws", "aws"),
+            ("gcp", "gcp"),
+            ("azure", "azure"),
+            ("s3", "s3"),
+            ("bucket", "bucket"),
+            ("kubernetes", "k8s"),
+            ("k8s", "k8s"),
+            ("docker", "docker"),
+            ("container", "container"),
+            ("jenkins", "jenkins"),
+            ("gitlab", "gitlab"),
+            ("metadata", "metadata"),
+            ("supply chain", "supply-chain"),
+        ),
+        "evasion": (
+            ("waf", "waf"),
+            ("bypass", "bypass"),
+            ("evasion", "evasion"),
+            ("obfuscation", "obfuscation"),
+            ("prompt injection", "prompt-injection"),
+            ("jailbreak", "jailbreak"),
+            ("rag poisoning", "rag-poisoning"),
+            ("llm", "llm"),
+        ),
         "web": (
             ("sql injection", "sqli"),
             ("cross-site scripting", "xss"),
@@ -150,7 +210,12 @@ def _body_markers(
     for direction, signals in groups.items():
         for token, marker in signals:
             if token in haystack:
-                scores[direction] += 3 if direction in {"ai", "blockchain", "binary"} else 2
+                scores[direction] += 3 if direction in {
+                    "ai",
+                    "blockchain",
+                    "binary",
+                    "exploit",
+                } else 2
                 evidence.append({"direction": direction, "signal": marker, "source": "probe"})
     ranked = sorted(scores, key=lambda item: (-scores[item], item))
     ranked = [item for item in ranked if scores[item] > 0]
@@ -246,7 +311,7 @@ def _record_http_result(
     markers, evidence, candidates = _body_markers(combined, headers, description)
     result["markers"] = list(dict.fromkeys([*result["markers"], *markers]))
     result["evidence"] = [*result["evidence"], *evidence]
-    result["direction_candidates"] = candidates
+    result["direction_candidates"] = _normalize_candidates(candidates)
     if port not in RPC_PORTS and not any(
         token in combined.casefold() for token in ("json-rpc", "eth_chainid", "ethereum")
     ):
@@ -277,10 +342,9 @@ def _record_http_result(
             dict.fromkeys([*result["markers"], *markers, "evm-rpc"])
         )
         result["evidence"] = [*result["evidence"], *evidence]
-        result["direction_candidates"] = [
-            "blockchain",
-            *[item for item in candidates if item != "blockchain"],
-        ]
+        result["direction_candidates"] = _normalize_candidates(
+            ["cloud", *[item for item in candidates if item != "blockchain"]]
+        )
     result["access_surface"] = "evm_rpc"
     result["protocol"] = "json-rpc"
 
@@ -316,7 +380,7 @@ def probe(value: dict[str, Any]) -> dict[str, Any]:
             )
             result["markers"] = markers
             result["evidence"] = evidence
-            result["direction_candidates"] = candidates
+            result["direction_candidates"] = _normalize_candidates(candidates)
             if port in RPC_PORTS:
                 result["access_surface"] = "evm_rpc"
             return result

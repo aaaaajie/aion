@@ -1,4 +1,4 @@
-"""Focused tests for the transactional Hint admission policy."""
+"""Competition-mode tests for stagnation signaling and pause control."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 from agent.state import StateService
+from agent.state.models import ChallengeRecord
+from agent.state.scheduling import ChallengeScheduler, StagnationManager
 from agent.state.schemas import CapabilityContext, ChallengeImport
-from agent.state.models import AgentRecord, ChallengeRecord, RunRecord
 
 
 class _Clock:
@@ -19,165 +20,151 @@ class _Clock:
     def __call__(self) -> datetime:
         return self.value
 
-    def advance(self, seconds: int) -> None:
-        self.value += timedelta(seconds=seconds)
 
-
-async def _hint_fixture(tmp_path: Path) -> tuple[StateService, _Clock, CapabilityContext, str, str]:
+@pytest.mark.asyncio
+async def test_low_yield_is_a_soft_signal_and_reports_to_chief(
+    tmp_path: Path,
+) -> None:
     clock = _Clock()
     service = StateService(tmp_path / "state.sqlite3", clock=clock)
     await service.create_run(
-        "run-hint-policy",
-        duration_minutes=120,
-        challenges=[ChallengeImport(unique_code="target"), ChallengeImport(unique_code="other")],
+        "run-low-yield",
+        challenges=[ChallengeImport(unique_code="target")],
     )
-    chief = await service.register_agent("run-hint-policy", role="chief")
-    challenge_agent = await service.register_agent(
-        "run-hint-policy",
+    chief = await service.register_agent("run-low-yield", role="chief")
+    controller = await service.register_agent(
+        "run-low-yield",
         role="challenge",
         parent_id=chief["agent_id"],
         unique_code="target",
     )
-    await service.start_challenge("run-hint-policy", "target")
-    clock.advance(480)
+    await service.start_challenge("run-low-yield", "target")
     async with service.db.sessions.begin() as session:
-        challenge = await session.get(ChallengeRecord, ("run-hint-policy", "target"))
+        challenge = await session.get(
+            ChallengeRecord, ("run-low-yield", "target")
+        )
         assert challenge is not None
-        challenge.work_status = "warning"
-        challenge.stagnation_level = 1
-        challenge.hint_eligible = True
-        challenge.control_since = clock.value
+        challenge.last_progress_at = clock.value - timedelta(minutes=9)
 
-    prior = await service.publish_control_report(
-        "run-hint-policy",
-        sender_id=challenge_agent["agent_id"],
-        recipient_id=chief["agent_id"],
-        unique_code="target",
-        report_type="challenge_status",
-        status="analyzing",
-        payload={"summary": "prior evidence"},
+    result = await StagnationManager(service, clock=clock).evaluate(
+        "run-low-yield", "target"
     )
-    await service.publish_control_report(
-        "run-hint-policy",
-        sender_id=challenge_agent["agent_id"],
-        recipient_id=chief["agent_id"],
-        unique_code="target",
-        report_type="challenge_status",
-        status="ready_for_hint",
-        payload={
-            "summary": "complete convergence proof",
-            "hint_recommended": True,
-            "blocker": "one concrete path remains unverified",
-            "evidence_refs": [f"report:{prior['report_id']}"],
-        },
-    )
-    return (
-        service,
-        clock,
+
+    assert result["action"] == "low_yield"
+    overview = await service.get_overview("run-low-yield")
+    challenge = overview["challenges"][0]
+    assert challenge["work_status"] == "active"
+    assert challenge["low_yield"] is True
+
+    reports = await service.consume_reports(
+        "run-low-yield",
         CapabilityContext(
-            run_id="run-hint-policy", agent_id=chief["agent_id"], role="chief"
+            run_id="run-low-yield",
+            agent_id=chief["agent_id"],
+            role="chief",
         ),
-        chief["agent_id"],
-        f"report:{prior['report_id']}",
+        report_type="challenge_status",
     )
-
-
-@pytest.mark.asyncio
-async def test_hint_requires_warning_level_and_structured_basis(tmp_path: Path) -> None:
-    service, clock, context, _, evidence_ref = await _hint_fixture(tmp_path)
-
-    rejected = await service.evaluate_hint_admission(
-        "run-hint-policy",
-        "target",
-        context,
-        basis="second_pass_convergence",
-        evidence_refs=[evidence_ref],
+    assert reports["count"] == 1
+    assert reports["reports"][0]["status"] == "low_yield"
+    assert reports["reports"][0]["agent_id"] == controller["agent_id"]
+    repeated = await StagnationManager(service, clock=clock).evaluate(
+        "run-low-yield", "target"
     )
-    assert rejected["eligible"] is False
-    assert rejected["rejection_code"] == "second_pass_required"
-
-    async with service.db.sessions.begin() as session:
-        challenge = await session.get(ChallengeRecord, ("run-hint-policy", "target"))
-        assert challenge is not None
-        challenge.stagnation_level = 0
-    level_zero = await service.evaluate_hint_admission(
-        "run-hint-policy",
-        "target",
-        context,
-        basis="high_probability_path",
-        evidence_refs=[evidence_ref],
-    )
-    assert level_zero["rejection_code"] == "stagnation_level_required"
-
-    async with service.db.sessions.begin() as session:
-        challenge = await session.get(ChallengeRecord, ("run-hint-policy", "target"))
-        assert challenge is not None
-        challenge.stagnation_level = 1
-    allowed = await service.evaluate_hint_admission(
-        "run-hint-policy",
-        "target",
-        context,
-        basis="high_probability_path",
-        evidence_refs=[evidence_ref],
-    )
-    assert allowed["eligible"] is True
-    assert allowed["remaining_stagnation_seconds"] >= 300
+    assert repeated["action"] == "none"
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_hint_rejects_active_execution_and_late_stagnation_window(
+async def test_prolonged_low_yield_pauses_challenge_and_reports_to_chief(
     tmp_path: Path,
 ) -> None:
-    service, clock, context, _, evidence_ref = await _hint_fixture(tmp_path)
-    challenge = await service.get_overview("run-hint-policy")
-    challenge_id = next(
-        item["agent_id"]
-        for item in challenge["agents"]
-        if item["role"] == "challenge"
+    clock = _Clock()
+    service = StateService(tmp_path / "state.sqlite3", clock=clock)
+    await service.create_run(
+        "run-stagnation-pause",
+        challenges=[ChallengeImport(unique_code="target")],
     )
-    execution = await service.register_agent(
-        "run-hint-policy",
-        role="execution",
-        parent_id=challenge_id,
+    chief = await service.register_agent("run-stagnation-pause", role="chief")
+    controller = await service.register_agent(
+        "run-stagnation-pause",
+        role="challenge",
+        parent_id=chief["agent_id"],
         unique_code="target",
-        hypothesis_key="late-path",
-        task_key="late-path-1",
-        task_stage="validation",
-        context_refs=[evidence_ref],
-        mission="verify the blocker",
     )
-    active = await service.evaluate_hint_admission(
-        "run-hint-policy",
-        "target",
-        context,
-        basis="high_probability_path",
-        evidence_refs=[evidence_ref],
-    )
-    assert active["rejection_code"] == "execution_active"
-
-    # The fixture is now converged.  Move the run close to its deadline and
-    # keep the challenge's active clock at eight minutes so the five-minute
-    # action window remains available.
+    await service.start_challenge("run-stagnation-pause", "target")
     async with service.db.sessions.begin() as session:
-        agent = await session.get(AgentRecord, execution["agent_id"])
-        assert agent is not None
-        agent.status = "completed"
-        run = await session.get(RunRecord, "run-hint-policy")
-        assert run is not None
-        run.deadline_at = clock.value + timedelta(minutes=20)
-        row = await session.get(ChallengeRecord, ("run-hint-policy", "target"))
-        assert row is not None
-        row.active_since = clock.value - timedelta(seconds=480)
-    await service.close_challenge("run-hint-policy", "other")
+        challenge = await session.get(
+            ChallengeRecord, ("run-stagnation-pause", "target")
+        )
+        assert challenge is not None
+        challenge.last_progress_at = clock.value - timedelta(minutes=16)
 
-    near_deadline = await service.evaluate_hint_admission(
-        "run-hint-policy",
-        "target",
-        context,
-        basis="near_deadline",
-        evidence_refs=[evidence_ref],
+    result = await StagnationManager(service, clock=clock).evaluate(
+        "run-stagnation-pause", "target"
     )
-    assert near_deadline["eligible"] is True
-    assert near_deadline["remaining_run_seconds"] <= 30 * 60
+
+    assert result["action"] == "pause_stagnation"
+    assert result["pause_reason"] == "stagnation_timeout"
+    overview = await service.get_overview("run-stagnation-pause")
+    challenge = overview["challenges"][0]
+    assert challenge["work_status"] == "paused"
+    assert challenge["pause_reason"] == "stagnation_timeout"
+    assert challenge["low_yield"] is True
+
+    reports = await service.consume_reports(
+        "run-stagnation-pause",
+        CapabilityContext(
+            run_id="run-stagnation-pause",
+            agent_id=chief["agent_id"],
+            role="chief",
+        ),
+        report_type="challenge_status",
+    )
+    assert reports["count"] == 1
+    assert reports["reports"][0]["status"] == "stagnation_paused"
+    assert reports["reports"][0]["agent_id"] == controller["agent_id"]
+
+    repeated = await StagnationManager(service, clock=clock).evaluate(
+        "run-stagnation-pause", "target"
+    )
+    assert repeated["action"] == "none"
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_marks_paused_unfinished_challenges_for_next_round(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    service = StateService(tmp_path / "state.sqlite3", clock=clock)
+    await service.create_run(
+        "run-next-round",
+        challenges=[
+            ChallengeImport(unique_code="first", container_status="running"),
+            ChallengeImport(unique_code="second", container_status="running"),
+        ],
+    )
+    await service.start_challenge("run-next-round", "first")
+    await service.start_challenge("run-next-round", "second")
+    async with service.db.sessions.begin() as session:
+        for code in ("first", "second"):
+            challenge = await session.get(ChallengeRecord, ("run-next-round", code))
+            assert challenge is not None
+            challenge.work_status = "paused"
+            challenge.stagnation_level = 2
+            challenge.active_since = None
+
+    scheduled = await ChallengeScheduler(service, clock=clock).select(
+        "run-next-round"
+    )
+
+    assert {item["unique_code"] for item in scheduled} == {"first", "second"}
+    assert all(item["restart_required"] is True for item in scheduled)
+
+    await service.start_challenge("run-next-round", "first")
+    resumed = await service.list_challenges("run-next-round")
+    first = next(item for item in resumed if item["unique_code"] == "first")
+    assert first["work_status"] == "active"
+    assert first["low_yield"] is False
     await service.close()

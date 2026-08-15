@@ -1,0 +1,59 @@
+id: binary.macos_reverse
+name: Macos Reverse
+version: 1.0.0
+category:
+- binary
+- vulnerability
+stage:
+- discovery
+- exploitation
+description: Use for authorized macOS and Mach-O reverse engineering including codesign, Objective-C/Swift recovery, endpoint security surfaces, and Apple platform malware analysis.
+risk_level: high
+trigger:
+  keywords:
+  - binary
+  - macos
+  - reverse
+  - use
+  - authorized
+  - mach
+  - engineering
+  - including
+  - codesign
+  - objective
+  evidence:
+  - artifact_hash
+  - analysis_trace
+requires:
+  tools:
+  - ghidra
+  - ida
+  - frida
+  - file_inspect
+  - debugger
+  - process_execute
+  permissions:
+  - execution
+workflow:
+- inspect
+- analyze
+- confirm
+- validate
+outputs:
+  findings:
+  - MACOS_REVERSE
+  evidence:
+  - artifact_hash
+  - analysis_trace
+  - reproduction_steps
+  credentials:
+    optional: false
+tags:
+- binary
+- macos
+- reverse
+- use
+- authorized
+- mach
+- engineering
+- including

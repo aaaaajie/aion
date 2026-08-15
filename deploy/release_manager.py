@@ -70,14 +70,6 @@ def _validate_venv_id(value: str) -> str:
     return value
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -113,10 +105,17 @@ def _service_active() -> bool:
     )
 
 
-def _legacy_venv_matches(venv_id: str) -> bool:
-    lock = APP_ROOT / "requirements.lock"
-    python = APP_ROOT / ".venv" / "bin" / "python"
-    return lock.is_file() and python.is_file() and _sha256(lock) == venv_id
+def _requirements_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in (
+        root / "requirements.lock",
+        root / "tools" / "binaries" / "offline-requirements.lock",
+    ):
+        if not path.is_file():
+            raise ReleaseError(f"release is missing {path.relative_to(root)}")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _make_read_only(root: Path) -> None:
@@ -141,8 +140,8 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
     for name in SOURCE_NAMES:
         if not (source / name).exists():
             raise ReleaseError(f"incoming release is missing {name}")
-    if _sha256(source / "requirements.lock") != venv_id:
-        raise ReleaseError("requirements.lock hash does not match the venv id")
+    if _requirements_digest(source) != venv_id:
+        raise ReleaseError("runtime dependency lock hash does not match the venv id")
     if sys.version_info[:2] != (3, 11):
         raise ReleaseError("release preparation requires Python 3.11")
 
@@ -151,26 +150,28 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
     incoming_venv = VENVS / f".incoming-{venv_id}"
     if (venv / "bin" / "python").is_file():
         validation_python = venv / "bin" / "python"
-    elif _legacy_venv_matches(venv_id):
-        validation_python = APP_ROOT / ".venv" / "bin" / "python"
     else:
         if incoming_venv.exists():
             shutil.rmtree(incoming_venv)
         _run(["python3", "-m", "venv", str(incoming_venv)])
-        _run(
-            [
-                str(incoming_venv / "bin" / "python"),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--no-cache-dir",
-                "-r",
-                str(source / "requirements.lock"),
-            ]
-        )
         os.replace(incoming_venv, venv)
         validation_python = venv / "bin" / "python"
+
+    tool_result = _run(
+        [
+            str(validation_python),
+            str(source / "tools" / "binaries" / "offline_tools.py"),
+            "install",
+        ],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(source)},
+    )
+    if tool_result.returncode != 0:
+        raise ReleaseError(
+            "offline runtime/tool-chain install failed: "
+            + tool_result.stdout[-2_000:]
+        )
 
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(source)
@@ -178,7 +179,12 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
         [
             str(validation_python),
             "-c",
-            "import agent, challenges_sdk, scripts.online_runtime, tools",
+            (
+                "import json; import agent, challenges_sdk, scripts.online_runtime, tools;"
+                "from tools.binaries.validation import check_tool_chain;"
+                "report=check_tool_chain();"
+                "assert report['ok'], json.dumps(report, ensure_ascii=False)"
+            ),
         ],
         env=environment,
     )
@@ -238,9 +244,6 @@ def _restore_file(backup: Path, destination: Path) -> None:
 def _ensure_venv(venv_id: str) -> Path:
     venv = VENVS / venv_id
     if (venv / "bin" / "python").is_file():
-        return venv
-    if _legacy_venv_matches(venv_id):
-        os.replace(APP_ROOT / ".venv", venv)
         return venv
     raise ReleaseError("prepared virtual environment is unavailable")
 

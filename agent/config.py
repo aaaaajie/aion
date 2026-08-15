@@ -12,6 +12,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
 MIN_CONTEXT_WINDOW_TOKENS = 32_000
+MODEL_CONTEXT_SAFETY_TOKENS = 8_192
+
+
+@dataclass(frozen=True)
+class RoleContextProfile:
+    """Fixed competition context policy for one Agent role."""
+
+    soft_prompt_tokens: int
+    recent_message_tokens: int
+    recovered_event_chars: int
+    max_output_tokens: int
+
+
+ROLE_CONTEXT_PROFILES: dict[str, RoleContextProfile] = {
+    "chief": RoleContextProfile(128_000, 32_000, 48_000, 32_768),
+    "challenge": RoleContextProfile(96_000, 24_000, 36_000, 32_768),
+    "execution": RoleContextProfile(64_000, 8_000, 24_000, 16_384),
+}
 
 
 @dataclass(frozen=True)
@@ -19,18 +37,56 @@ class ContextBudget:
     """Token budget used by the Agent loop and compaction layer."""
 
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
-    summary_reserved_tokens: int = 20_000
-    autocompact_buffer_tokens: int = 13_000
-    max_output_tokens: int = 8_192
     session_memory_max_tokens: int = 12_000
 
-    @property
-    def effective_context_window(self) -> int:
-        return self.context_window_tokens - self.summary_reserved_tokens
+    def profile(self, role: str | None) -> RoleContextProfile:
+        return ROLE_CONTEXT_PROFILES.get(
+            role or "execution", ROLE_CONTEXT_PROFILES["execution"]
+        )
+
+    def max_output_tokens(self, role: str | None, *, bootstrap: bool = False) -> int:
+        if bootstrap:
+            return 32_768
+        return self.profile(role).max_output_tokens
+
+    def absolute_prompt_tokens(
+        self, role: str | None = None, *, bootstrap: bool = False
+    ) -> int:
+        return max(
+            1,
+            self.context_window_tokens
+            - self.max_output_tokens(role, bootstrap=bootstrap)
+            - MODEL_CONTEXT_SAFETY_TOKENS,
+        )
 
     @property
-    def autocompact_threshold(self) -> int:
-        return self.effective_context_window - self.autocompact_buffer_tokens
+    def summary_max_output_tokens(self) -> int:
+        return 8_192
+
+
+def deepseek_agent_request_options(
+    *,
+    role: str | None,
+    bootstrap: bool = False,
+    context_budget: ContextBudget | None = None,
+) -> dict[str, object]:
+    """Return the fixed DeepSeek policy for a primary Agent request."""
+
+    budget = context_budget or ContextBudget()
+    return {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+        "max_tokens": budget.max_output_tokens(role, bootstrap=bootstrap),
+    }
+
+
+def deepseek_auxiliary_request_options() -> dict[str, object]:
+    """Return deterministic, non-thinking options for maintenance requests."""
+
+    return {
+        "thinking": {"type": "disabled"},
+        "temperature": 0,
+    }
 
 
 class AgentSettings(BaseSettings):
@@ -42,6 +98,10 @@ class AgentSettings(BaseSettings):
 
     llm_base_url: AnyHttpUrl = Field(validation_alias="LLM_BASE_URL")
     llm_model: str = Field(min_length=1, validation_alias="LLM_MODEL")
+    skill_discovery_model: str | None = Field(
+        default=None,
+        validation_alias="AION_SKILL_DISCOVERY_MODEL",
+    )
     llm_api_key: SecretStr = Field(
         min_length=1,
         validation_alias="LLM_API_KEY",
@@ -73,11 +133,6 @@ class AgentSettings(BaseSettings):
             "AION_MEMORY_LIMIT_PERCENT",
         ),
     )
-    agent_start_interval_seconds: float = Field(
-        default=5.0,
-        ge=0,
-        validation_alias="AION_AGENT_START_INTERVAL_SECONDS",
-    )
     disk_reserve_bytes: int = Field(
         default=1_073_741_824,
         ge=0,
@@ -88,6 +143,11 @@ class AgentSettings(BaseSettings):
         ge=0,
         le=100,
         validation_alias="AION_DISK_RESERVE_PERCENT",
+    )
+    bootstrap_enabled: bool = Field(
+        default=True,
+        validation_alias="AION_BOOTSTRAP_ENABLED",
+        description="Start one autonomous Bootstrap Execution for each new Challenge.",
     )
 
     model_config = SettingsConfigDict(
@@ -105,6 +165,14 @@ class AgentSettings(BaseSettings):
                 f"AION_CONTEXT_WINDOW_TOKENS must be at least {MIN_CONTEXT_WINDOW_TOKENS}"
             )
         return value
+
+    @field_validator("skill_discovery_model")
+    @classmethod
+    def normalize_skill_discovery_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
     @property
     def context_budget(self) -> ContextBudget:

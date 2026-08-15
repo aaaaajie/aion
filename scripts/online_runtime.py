@@ -242,6 +242,26 @@ async def run_online(
         print(f"[online] paused: {exc.reason}", flush=True)
     except Exception as exc:
         result_message = f"online Runtime failed: {type(exc).__name__}: {exc}"
+        try:
+            if runtime.state_service is not None and runtime.run_id is not None:
+                await runtime.state_service.append_run_event(
+                    runtime.run_id,
+                    "runtime_fatal_error",
+                    {
+                        "code": "runtime_fatal",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                await runtime.state_service.finish_run(
+                    runtime.run_id,
+                    "failed",
+                    report={
+                        "type": "runtime_fatal_error",
+                        "summary": "The online Runtime encountered an unrecoverable failure",
+                    },
+                )
+        except Exception:
+            pass
         print(f"[online] failed: {type(exc).__name__}: {exc}", flush=True)
     finally:
         pause_requested = (
