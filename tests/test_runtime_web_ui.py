@@ -114,6 +114,10 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert ".agent-icon-challenge" in css
     assert ".agent-icon-execution" in css
     assert ".agent-icon-chief" in css
+    assert ".agent-icon-bootstrap" in css
+    assert ".agent-icon-exploration" in css
+    assert '/assets/gongji.svg' in css
+    assert '/assets/yewutansuo.svg' in css
     assert ".agent-icon.status-active" in css
     assert ".agent-icon.status-completed" in css
     assert ".agent-icon.status-error" in css
@@ -275,6 +279,7 @@ def test_workbench_sidebar_can_collapse_selected_challenge_and_logs_transitions(
     assert 'uiLog("debug", "agent_detail_request"' in app
     assert 'uiLog("warn", "snapshot_poll_failed"' in app
     assert 'uiLog("error", "unhandled_rejection"' in app
+    assert '"已停止 · 只读"' in app
     assert '"monitor_started run_id=%s database=%s address=%s"' in server
     assert 'LOGGER.info(\n                    "http_request' in server
     assert 'LOGGER.warning(\n                    "monitor_refresh_failed' in server

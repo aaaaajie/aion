@@ -73,7 +73,14 @@ class AgentRuntime:
         self.benchmark = benchmark
         self.network_manager = network_manager
         self.project_root = project_root.resolve()
-        self.run_root = (run_root or settings.run_root).resolve()
+        # Keep state and the shared Agent workspace under the same project
+        # root by default.  A caller may still provide an explicit isolated
+        # state root (for example, a benchmark harness), but the default must
+        # not silently point back at the repository when ``project_root`` is
+        # customized.
+        self.run_root = (
+            run_root or self.project_root / ".aion" / "runs"
+        ).resolve()
         self.runner_factory = runner_factory
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.psutil_module = psutil_module
@@ -104,7 +111,7 @@ class AgentRuntime:
         settings = kwargs.pop("settings", None) or AgentSettings()
         benchmark = kwargs.pop("benchmark", None)
         if benchmark is None:
-            benchmark = BenchmarkTools.from_env()
+            benchmark = BenchmarkTools.from_env(agent_settings=settings)
         return cls(settings, benchmark=benchmark, **kwargs)
 
     async def start(
@@ -398,16 +405,62 @@ class AgentRuntime:
         challenges = await self.state_service.list_challenges(self._run_id())
         results: list[dict[str, Any]] = []
         for challenge in challenges:
+            hint_available = (
+                self.supervisor is None
+                or self.supervisor.benchmark_capability_available("get_hint")
+            )
+            hint_result = (
+                await self.state_service.evaluate_hint_eligibility(
+                    self._run_id(), challenge["unique_code"]
+                )
+                if hint_available
+                else {
+                    "hint_signal": {
+                        "eligible": False,
+                        "reason": "hint_unavailable",
+                        "no_progress_seconds": 0,
+                        "run_elapsed_seconds": 0,
+                        "remaining_seconds": 0,
+                    },
+                    "newly_eligible": False,
+                    "event_sequence": None,
+                }
+            )
+            if hint_result.get("event_sequence") is not None:
+                await self.state_service.signal_challenge_changes(
+                    self._run_id(),
+                    [challenge["unique_code"]],
+                    int(hint_result["event_sequence"]),
+                )
+            if (
+                challenge.get("work_status") == "paused"
+                and challenge.get("slot_occupied")
+                and self.supervisor is not None
+            ):
+                release = await self.supervisor.release_paused_container(
+                    challenge["unique_code"],
+                    reason=str(challenge.get("pause_reason") or "stagnation_timeout"),
+                    caller_id=self.chief_agent_id,
+                )
+                results.append({"unique_code": challenge["unique_code"], "hint": hint_result, "release": release})
+                continue
             if not challenge_work_active(challenge):
+                results.append({"unique_code": challenge["unique_code"], "hint": hint_result, "action": "none"})
                 continue
             result = await self.stagnation_manager.evaluate(
                 self._run_id(), challenge["unique_code"]
             )
+            result["hint"] = hint_result
             results.append(result)
             if result.get("action") == "pause_stagnation" and self.supervisor is not None:
                 await self.supervisor.stop_challenge_work(
                     challenge["unique_code"],
                     reason=str(result.get("pause_reason") or "stagnation_timeout"),
+                )
+                result["release"] = await self.supervisor.release_paused_container(
+                    challenge["unique_code"],
+                    reason=str(result.get("pause_reason") or "stagnation_timeout"),
+                    caller_id=self.chief_agent_id,
                 )
             if result.get("event_sequence") is not None:
                 await self.state_service.signal_challenge_changes(
@@ -416,6 +469,8 @@ class AgentRuntime:
                     int(result["event_sequence"]),
                 )
         await self._restart_exhausted_challenges()
+        if self.supervisor is not None:
+            results.extend(await self.supervisor.scale_bootstraps())
         return results
 
     async def _restart_exhausted_challenges(self) -> None:

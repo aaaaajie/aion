@@ -310,7 +310,8 @@ class SkillCatalog:
         skills = [
             skill
             for skill in self.available(role)
-            if role not in skill.auto_activate_for and skill.skill_id not in excluded
+            if role not in skill.auto_activate_for
+            and skill.skill_id not in excluded
         ]
         ranked = self._rank(skills, selection_text, include_unmatched=True)
         return self._build_listing([skill for _, skill in ranked[:MAX_LISTING_SKILLS]])
@@ -321,6 +322,7 @@ class SkillCatalog:
         *,
         limit: int = MAX_DISCOVERY_CANDIDATES,
         excluded_ids: Sequence[str] = (),
+        direction: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return bounded Execution candidates without activating a Skill."""
 
@@ -330,15 +332,52 @@ class SkillCatalog:
                 f"Skill discovery limit must be between 1 and {MAX_DISCOVERY_CANDIDATES}",
             )
         excluded = set(excluded_ids)
-        skills = [
-            skill
-            for skill in self.available("execution")
-            if "execution" not in skill.auto_activate_for
-            and skill.skill_id not in excluded
-            and not self._violates_routing_boundary(skill, selection_text)
-        ]
+        allowed_ids: set[str] | None = None
+        if direction is not None:
+            from .capability_packs import (
+                normalize_direction,
+                pack_for_direction,
+            )
+
+            normalized_direction = normalize_direction(direction)
+            if normalized_direction != "unknown":
+                allowed_ids = {
+                    f"execution/{skill_id}"
+                    for skill_id in pack_for_direction(normalized_direction).skills
+                }
+        skills: list[SkillRecord] = []
+        for skill in self.available("execution"):
+            if "execution" in skill.auto_activate_for or skill.skill_id in excluded:
+                continue
+            if self._violates_routing_boundary(skill, selection_text):
+                continue
+            if skill.category == "execution":
+                if allowed_ids is not None and skill.skill_id not in allowed_ids:
+                    continue
+            elif self._term_overlap(skill, selection_text) < 2:
+                # Common Skills are shared support capabilities. Surface one
+                # only when the task has at least two meaningful terms that
+                # match its routing text; never add all common Skills to every
+                # Execution candidate list.
+                continue
+            skills.append(skill)
         ranked = self._rank(skills, selection_text, include_unmatched=False)
-        return [skill.public() for _, skill in ranked[:limit]]
+        top_score = ranked[0][0] if ranked else 0
+        top_unique = bool(ranked) and (len(ranked) == 1 or top_score > ranked[1][0])
+        candidates: list[dict[str, Any]] = []
+        for score, skill in ranked[:limit]:
+            item = skill.public()
+            explicit = self._explicit_match(skill, selection_text)
+            overlap = self._term_overlap(skill, selection_text)
+            strength = "strong" if explicit or (
+                top_unique and score == top_score and overlap >= 2
+            ) else ("weak" if overlap else "none")
+            item["match_strength"] = strength
+            item["recommended"] = (
+                strength == "strong" and score == top_score and top_unique
+            )
+            candidates.append(item)
+        return candidates
 
     def search(
         self,
@@ -366,7 +405,9 @@ class SkillCatalog:
         skills = [
             skill
             for skill in self.available(role)
-            if role not in skill.auto_activate_for and skill.skill_id not in excluded
+            if role not in skill.auto_activate_for
+            and skill.skill_id not in excluded
+            and not self._violates_routing_boundary(skill, normalized_query)
         ]
         ranked = self._rank(skills, normalized_query, include_unmatched=False)
         return [skill.public() for _, skill in ranked[:limit]]
@@ -858,6 +899,43 @@ class SkillCatalog:
                 ranked.append((score, skill))
         ranked.sort(key=lambda item: (-item[0], item[1].skill_id))
         return ranked
+
+    @classmethod
+    def _match_strength(cls, skill: SkillRecord, query: str) -> str:
+        if cls._explicit_match(skill, query):
+            return "strong"
+        overlap = cls._term_overlap(skill, query)
+        if overlap >= 2:
+            return "strong"
+        if overlap:
+            return "weak"
+        return "none"
+
+    @classmethod
+    def _explicit_match(cls, skill: SkillRecord, query: str) -> bool:
+        normalized_query = " ".join(query.casefold().split())
+        phrases = {
+            skill.name.casefold(),
+            skill.skill_id.casefold(),
+            skill.name.casefold().replace("-", " "),
+            skill.skill_id.casefold().replace("-", " "),
+        }
+        return any(phrase and phrase in normalized_query for phrase in phrases)
+
+    @classmethod
+    def _term_overlap(cls, skill: SkillRecord, query: str) -> int:
+        query_terms = cls._search_terms(query.casefold())
+        name = skill.name.casefold()
+        skill_id = skill.skill_id.casefold()
+        haystack = " ".join(
+            (
+                skill_id,
+                name,
+                cls._positive_routing_text(skill.description),
+                cls._positive_routing_text(skill.when_to_use),
+            )
+        ).casefold()
+        return len(query_terms & cls._search_terms(haystack))
 
     @staticmethod
     def _positive_routing_text(value: str) -> str:

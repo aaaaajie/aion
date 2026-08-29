@@ -11,6 +11,8 @@ from tools.binary import BinaryTools
 from tools.binaries.layout import ToolchainError, toolchain_for
 from tools.binaries.offline_tools import verify_checksums
 from tools.pentest import PentestTools
+from tools.pentest.models import SqlmapArguments
+import tools.pentest.wrapper as pentest_wrapper
 from tools.system.shell import _OFFLINE_INSTALL_PATTERN
 
 
@@ -84,3 +86,90 @@ def test_external_tool_failures_are_structured(tmp_path: Path) -> None:
     assert debug_result["error"]["code"] == "bundled_tool_unavailable"
     assert sqlmap_result["ok"] is False
     assert sqlmap_result["error"]["code"] == "bundled_tool_unavailable"
+
+
+def test_tool_wrappers_resolve_toolchain_independently_of_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace_toolchain = workspace / "tools" / "binaries"
+    workspace_toolchain.mkdir(parents=True)
+    configured_toolchain = tmp_path / "image" / "tools" / "binaries"
+    configured_toolchain.mkdir(parents=True)
+    monkeypatch.setenv("AION_TOOLCHAIN_ROOT", str(configured_toolchain))
+
+    binary = BinaryTools(workspace)
+    pentest = PentestTools(root=workspace)
+
+    assert binary._toolchain.root == configured_toolchain.resolve()
+    assert pentest._toolchain.root == configured_toolchain.resolve()
+
+
+def test_sqlmap_login_request_contract_is_strict_and_bounded() -> None:
+    arguments = SqlmapArguments.model_validate(
+        {
+            "url": "http://target.local/login",
+            "data": "username=admin&password=probe",
+            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            "cookies": {"session": "bounded"},
+            "ignore_status_codes": [500],
+            "level": 2,
+            "risk": 1,
+        }
+    )
+    assert arguments.ignore_status_codes == [500]
+
+    with pytest.raises(Exception):
+        SqlmapArguments.model_validate(
+            {"url": "http://target.local/login", "headers": {"X-Test": 1}}
+        )
+    with pytest.raises(Exception):
+        SqlmapArguments.model_validate(
+            {"url": "http://target.local/login", "ignore_status_codes": [600]}
+        )
+
+
+def test_sqlmap_login_request_builds_bounded_metadata_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"sqlmap bounded output", b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        captured["command"] = command
+        return Process()
+
+    monkeypatch.setattr(pentest_wrapper.asyncio, "create_subprocess_exec", create_process)
+    provider = PentestTools(toolchain_root=tmp_path)
+    provider._toolchain = type(
+        "FakeToolchain", (), {"command": lambda _self, _name: "/bundle/sqlmap"}
+    )()
+    spec = next(item for item in provider.tool_specs() if item.name == "pentest_sqlmap")
+
+    result = asyncio.run(
+        spec.handler(
+            spec.input_model.model_validate(
+                {
+                    "url": "http://target.local/login",
+                    "data": "username=admin&password=probe",
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                    "cookies": {"session": "bounded"},
+                    "ignore_status_codes": [500],
+                }
+            )
+        )
+    )
+
+    command = list(captured["command"])
+    assert "--data" in command
+    assert "--headers" in command
+    assert "Content-Type: application/x-www-form-urlencoded" in command
+    assert "--cookie" in command
+    assert "session=bounded" in command
+    assert command[command.index("--ignore-code") + 1] == "500"
+    assert result["_aion_evidence"]["metadata"]["cookie_names"] == ["session"]

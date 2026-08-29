@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator
@@ -83,15 +84,33 @@ class SimpleHintArguments(UniqueCodeArguments):
     reason: str = Field(min_length=1, max_length=1_000)
 
 
+class SecondaryBootstrapArguments(_Arguments):
+    route_a: str = Field(min_length=1, max_length=800)
+    route_b: str = Field(min_length=1, max_length=800)
+    reason: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("route_a", "route_b", "reason")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+
 class ChallengeDispatchArguments(_Arguments):
     summary: str = Field(
+        default="runtime state update",
         min_length=1,
         max_length=8_000,
-        description="Decision summary at the top level; do not wrap arguments in another object.",
+        description=(
+            "Optional decision summary at the top level; use an empty JSON object "
+            "when Runtime should derive a deterministic checkpoint follow-up."
+        ),
     )
     outcome: Literal["continue", "blocked", "completed", "failed"] = "continue"
     direction: ChallengeDirection | None = None
-    tasks: SkipValidation[list[ExecutionTaskInput]] = Field(
+    tasks: SkipValidation[Any] = Field(
         default_factory=list,
         description=(
             "Independent tasks. Each task requires only objective; optional malformed "
@@ -120,6 +139,91 @@ class EvidenceReadArguments(_Arguments):
     )
     offset: int = Field(default=0, ge=0)
     limit_chars: int = Field(default=8_000, ge=1, le=8_000)
+
+
+class BootstrapCheckpointArguments(_Arguments):
+    route_key: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$",
+        description="Stable lowercase route identifier used for Challenge deduplication.",
+    )
+    summary: str = Field(min_length=1, max_length=2_000)
+    next_step: str = Field(min_length=1, max_length=2_000)
+    task_stage: Literal["validation", "exploitation"]
+    evidence_refs: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("summary", "next_step")
+    @classmethod
+    def non_blank_text(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("checkpoint text must not be blank")
+        return normalized
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def complete_evidence_refs(cls, values: list[str]) -> list[str]:
+        pattern = r"^evidence:evidence_[0-9a-f]{32}$"
+        if any(
+            not isinstance(value, str) or not re.fullmatch(pattern, value)
+            for value in values
+        ):
+            raise ValueError(
+                "checkpoint evidence_refs must be complete Evidence references"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("checkpoint evidence_refs must be unique")
+        return values
+
+
+class BootstrapCycleYieldArguments(_Arguments):
+    """A non-terminal boundary used to resume the persistent Bootstrap lane."""
+
+    summary: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("summary")
+    @classmethod
+    def non_blank_summary(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("cycle yield summary must not be blank")
+        return normalized
+
+
+class ExecutionCheckpointArguments(_Arguments):
+    """A bounded, non-terminal handoff from a parallel Execution Agent."""
+
+    summary: str = Field(min_length=1, max_length=2_000)
+    next_step: str = Field(min_length=1, max_length=2_000)
+    task_stage: Literal[
+        "discovery", "validation", "exploitation", "post_exploitation"
+    ]
+    urgency: Literal["interrupt", "inform"] = "inform"
+    evidence_refs: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("summary", "next_step")
+    @classmethod
+    def non_blank_text(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("checkpoint text must not be blank")
+        return normalized
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def complete_evidence_refs(cls, values: list[str]) -> list[str]:
+        pattern = r"^evidence:evidence_[0-9a-f]{32}$"
+        if any(
+            not isinstance(value, str) or not re.fullmatch(pattern, value)
+            for value in values
+        ):
+            raise ValueError(
+                "checkpoint evidence_refs must be complete Evidence references"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("checkpoint evidence_refs must be unique")
+        return values
 
 
 ExecutionReportStatus = Literal["completed", "blocked", "failed", "cancelled"]

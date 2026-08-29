@@ -233,7 +233,7 @@ class AgentStateStore:
                     "report_cursor": int(cursors.get("bootstrap_shared", 0) or 0),
                     "hint_cursor": int(cursors.get("bootstrap_hint", 0) or 0),
                     "pending_sequence": int(
-                        cursors.get("bootstrap_shared_pending", 0) or 0
+                        cursors.get("bootstrap_shared_pending_through", 0) or 0
                     ),
                 }
         else:

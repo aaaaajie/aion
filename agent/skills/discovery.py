@@ -25,6 +25,10 @@ from .catalog import MAX_DISCOVERY_CANDIDATES, SkillCatalog
 
 
 LOGGER = logging.getLogger("aion.skill_discovery")
+
+_LOCAL_DISCOVERY_MODEL_VALUES = frozenset(
+    {"", "local", "disabled", "none", "off", "false", "0"}
+)
 MAX_PRESENTED_CANDIDATES = 5
 MAX_REASON_CHARS = 160
 DISCOVERY_TIMEOUT_SECONDS = 5.0
@@ -40,6 +44,8 @@ class SkillCandidate:
     when_to_use: str
     relevance_reason: str
     confidence: float | None = None
+    match_strength: str = "none"
+    recommended: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -47,6 +53,8 @@ class SkillCandidate:
             "description": self.description,
             "when_to_use": self.when_to_use,
             "relevance_reason": self.relevance_reason,
+            "match_strength": self.match_strength,
+            "recommended": self.recommended,
         }
 
 
@@ -94,6 +102,7 @@ class SkillDiscovery:
         objective: str,
         task_stage: str | None,
         hypothesis: str | None,
+        direction: str | None = None,
         excluded_ids: tuple[str, ...] = (),
     ) -> asyncio.Task[SkillDiscoveryResult]:
         existing = self._tasks.get(agent_id)
@@ -105,6 +114,7 @@ class SkillDiscovery:
                 objective=objective,
                 task_stage=task_stage,
                 hypothesis=hypothesis,
+                direction=direction,
                 excluded_ids=excluded_ids,
             ),
             name=f"skill-discovery-{agent_id}",
@@ -119,6 +129,7 @@ class SkillDiscovery:
         objective: str,
         task_stage: str | None,
         hypothesis: str | None,
+        direction: str | None = None,
         excluded_ids: tuple[str, ...] = (),
     ) -> SkillDiscoveryResult:
         return await self.prefetch(
@@ -126,6 +137,7 @@ class SkillDiscovery:
             objective=objective,
             task_stage=task_stage,
             hypothesis=hypothesis,
+            direction=direction,
             excluded_ids=excluded_ids,
         )
 
@@ -149,6 +161,7 @@ class SkillDiscovery:
         objective: str,
         task_stage: str | None,
         hypothesis: str | None,
+        direction: str | None,
         excluded_ids: tuple[str, ...],
     ) -> SkillDiscoveryResult:
         started = monotonic()
@@ -159,10 +172,11 @@ class SkillDiscovery:
         if recovered is not None:
             return recovered
 
-        task_text = self._task_text(objective, task_stage, hypothesis)
+        task_text = self._task_text(objective, task_stage, hypothesis, direction)
         local = self.catalog.discovery_candidates(
             task_text,
             limit=MAX_DISCOVERY_CANDIDATES,
+            direction=direction,
         )
         cache_key = sha256(
             f"{self.catalog.content_sha256}\n{task_text}".encode("utf-8")
@@ -192,7 +206,7 @@ class SkillDiscovery:
                 "local_candidate_count": len(local),
             },
         )
-        if not self.settings.skill_discovery_model:
+        if self._configured_model() is None:
             cached_result = SkillDiscoveryResult(
                 candidates=tuple(
                     SkillCandidate(
@@ -203,6 +217,8 @@ class SkillDiscovery:
                             "Deterministic capability-pack routing; confirm "
                             "applicability before invoking."
                         ),
+                        match_strength=str(item.get("match_strength") or "none"),
+                        recommended=bool(item.get("recommended")),
                     )
                     for item in local[:MAX_PRESENTED_CANDIDATES]
                 ),
@@ -213,11 +229,6 @@ class SkillDiscovery:
             )
             self._remember(cache_key, cached_result)
             result = self._without_excluded(cached_result, excluded_ids)
-            await self._emit(
-                agent_id,
-                "skill_discovery_fallback",
-                self._event_payload(result, failure_code="local_capability_pack"),
-            )
             await self._emit_completed(agent_id, result)
             return result
 
@@ -325,6 +336,8 @@ class SkillDiscovery:
                 description=str(item["description"]),
                 when_to_use=str(item["when_to_use"]),
                 relevance_reason="Local catalog match; confirm applicability before invoking.",
+                match_strength=str(item.get("match_strength") or "none"),
+                recommended=bool(item.get("recommended")),
             )
             for item in local[:MAX_PRESENTED_CANDIDATES]
         )
@@ -372,6 +385,11 @@ class SkillDiscovery:
         ids = payload.get("candidate_ids")
         if not isinstance(ids, list) or len(ids) > MAX_PRESENTED_CANDIDATES:
             return None
+        candidate_metadata = {
+            str(item.get("skill_id")): item
+            for item in list(payload.get("candidates") or [])
+            if isinstance(item, Mapping) and item.get("skill_id")
+        }
         candidates: list[SkillCandidate] = []
         try:
             for skill_id in ids:
@@ -382,6 +400,16 @@ class SkillDiscovery:
                         description=record.description,
                         when_to_use=record.when_to_use,
                         relevance_reason="Recovered completed Skill discovery candidate.",
+                        match_strength=str(
+                            candidate_metadata.get(record.skill_id, {}).get(
+                                "match_strength", "none"
+                            )
+                        ),
+                        recommended=bool(
+                            candidate_metadata.get(record.skill_id, {}).get(
+                                "recommended"
+                            )
+                        ),
                     )
                 )
         except Exception:
@@ -443,6 +471,8 @@ class SkillDiscovery:
                     when_to_use=str(source["when_to_use"]),
                     relevance_reason=normalized_reason,
                     confidence=float(confidence),
+                    match_strength=str(source.get("match_strength") or "none"),
+                    recommended=bool(source.get("recommended")),
                 )
             )
         return result
@@ -450,8 +480,14 @@ class SkillDiscovery:
     def _request_payload(
         self, task_text: str, local: list[dict[str, Any]]
     ) -> dict[str, Any]:
+        model = self._configured_model()
+        if model is None:
+            raise SkillDiscoveryError(
+                "model_not_configured",
+                "Skill discovery model is disabled; use local catalog routing",
+            )
         return {
-            "model": self.settings.skill_discovery_model,
+            "model": model,
             **deepseek_auxiliary_request_options(),
             "max_tokens": DISCOVERY_MAX_TOKENS,
             "messages": [
@@ -476,15 +512,34 @@ class SkillDiscovery:
             ],
         }
 
+    def _configured_model(self) -> str | None:
+        """Return an explicitly enabled discovery model.
+
+        Skill discovery is an optional prefilter.  Empty or local/disabled
+        markers deliberately use the deterministic Catalog path and must not
+        be recorded as provider failures.  Only an explicit model name may
+        issue an auxiliary model request.
+        """
+
+        raw = getattr(self.settings, "skill_discovery_model", None)
+        model = str(raw or "").strip()
+        if model.lower() in _LOCAL_DISCOVERY_MODEL_VALUES:
+            return None
+        return model
+
     @staticmethod
     def _task_text(
-        objective: str, task_stage: str | None, hypothesis: str | None
+        objective: str,
+        task_stage: str | None,
+        hypothesis: str | None,
+        direction: str | None,
     ) -> str:
         return "\n".join(
             (
                 f"objective: {' '.join(objective.split())}",
                 f"task_stage: {' '.join((task_stage or '').split())}",
                 f"hypothesis: {' '.join((hypothesis or '').split())}",
+                f"direction: {' '.join((direction or '').split())}",
             )
         )[:8_000]
 
@@ -544,6 +599,7 @@ class SkillDiscovery:
             "discovery_call_id": result.discovery_call_id,
             "catalog_sha256": self.catalog.content_sha256,
             "candidate_ids": [item.skill_id for item in result.candidates],
+            "candidates": [item.public() for item in result.candidates],
             "candidate_count": len(result.candidates),
             "source": result.source,
             "latency_ms": result.latency_ms,

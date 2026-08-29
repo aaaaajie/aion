@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ _probe_module = import_module(
 
 def _skill(root: Path, category: str, name: str) -> Path:
     directory = root / category / name
-    directory.mkdir(parents=True)
+    directory.mkdir(parents=True, exist_ok=True)
     description = " ".join(name.replace("-", " ").split())
     (directory / "SKILL.md").write_text(
         "---\n"
@@ -89,7 +90,7 @@ def test_catalog_mounts_only_manifest_skills(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path)
     execution_mounted = {
         "execution/sqli-sql-injection",
-        "execution/ctf-pwn",
+        "execution/binary-exploit-and-variant-analysis",
         "execution/cloud-k8s",
         "execution/offensive-waf-bypass",
     }
@@ -108,6 +109,13 @@ def test_execution_listing_stays_within_context_limit(tmp_path: Path) -> None:
     assert len(catalog.listing("execution")) <= MAX_LISTING_CHARS
 
 
+def test_high_signal_query_recommends_one_specialist() -> None:
+    query = "login form stable 500 SQL injection blind sqlmap"
+    candidates = SkillCatalog().discovery_candidates(query, limit=5, direction="web")
+    assert candidates[0]["skill_id"] == "execution/sqli-sql-injection"
+    assert candidates[0]["recommended"] is True
+
+
 def test_discovery_routes_each_dimension_to_its_pack(tmp_path: Path) -> None:
     catalog = SkillCatalog()
     cases = {
@@ -119,7 +127,7 @@ def test_discovery_routes_each_dimension_to_its_pack(tmp_path: Path) -> None:
         "evasion": "waf bypass payload obfuscation prompt injection",
     }
     for direction, text in cases.items():
-        candidates = catalog.discovery_candidates(text, limit=12)
+        candidates = catalog.discovery_candidates(text, direction=direction, limit=12)
         ids = [item["skill_id"] for item in candidates]
         expected = {
             f"execution/{skill}"
@@ -127,6 +135,18 @@ def test_discovery_routes_each_dimension_to_its_pack(tmp_path: Path) -> None:
         }
         assert ids, direction
         assert any(item["skill_id"] in expected for item in candidates), direction
+
+
+def test_web_routing_is_strict_and_ssrf_is_a_strong_recommendation() -> None:
+    candidates = SkillCatalog().discovery_candidates(
+        "SSRF request to internal metadata",
+        direction="web",
+        limit=12,
+    )
+    assert candidates[0]["skill_id"] == "execution/offensive-ssrf"
+    assert candidates[0]["match_strength"] == "strong"
+    assert candidates[0]["recommended"] is True
+    assert all("binary" not in item["skill_id"] for item in candidates)
 
 
 class _EventService:
@@ -160,8 +180,35 @@ def test_discovery_without_model_returns_local_pack_and_never_raises(
     assert result.candidates
     assert all(item.skill_id.startswith("execution/") for item in result.candidates)
     types = {event[1] for event in service.events}
-    assert "skill_discovery_fallback" in types
+    assert "skill_discovery_fallback" not in types
     assert "skill_discovery_completed" in types
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model", ["", "local", "disabled", "none", "off", "false", "0"]
+)
+async def test_discovery_local_mode_markers_skip_auxiliary_model(
+    tmp_path: Path, model: str
+) -> None:
+    class Settings:
+        skill_discovery_model = model
+
+    catalog = _catalog(tmp_path)
+    service = _EventService()
+    discovery = SkillDiscovery(Settings(), catalog, service, "run", client=None)
+    result = await discovery.candidates_for(
+        "exec-1",
+        objective="Validate SQL injection",
+        task_stage="validation",
+        hypothesis="sql",
+    )
+    assert result.source == "local_capability_pack"
+    assert [event[1] for event in service.events] == [
+        "skill_discovery_started",
+        "skill_discovery_completed",
+    ]
+    await discovery.close()
 
 
 def test_binary_tools_are_strict_and_return_evidence(tmp_path: Path) -> None:
@@ -249,3 +296,15 @@ def test_tool_manifest_declares_offline_requirements() -> None:
     assert "wheelhouse" in manifest.get("note", "")
     assert manifest["python_packages"]["unicorn"]["version"] == "2.1.4"
     assert manifest["python_packages"]["angr"]["required"] is False
+
+
+def test_required_system_tools_are_present_and_hashed() -> None:
+    root = Path(__file__).resolve().parents[1] / "tools" / "binaries"
+    manifest = load_tool_manifest(root)
+    for name, entry in manifest["system_binaries"].items():
+        if not entry.get("required", True):
+            continue
+        path = root / entry["path"]
+        assert path.is_file() and path.stat().st_mode & 0o111, name
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert digest == entry["sha256"], name

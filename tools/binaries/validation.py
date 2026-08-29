@@ -114,6 +114,15 @@ def _check_bundled_binary(layout: Any, name: str, entry: dict[str, Any]) -> dict
     args = entry.get("version_args", ["--version"])
     if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
         return {"ok": False, "code": "invalid_version_args", "path": str(path)}
+    probe_env = {
+        "PATH": os.pathsep.join((str(layout.bin_dir), "/usr/local/bin", "/usr/bin", "/bin")),
+        "LC_ALL": "C",
+        "LANG": "C",
+    }
+    for name in ("LD_LIBRARY_PATH", "R2_PREFIX"):
+        value = os.environ.get(name)
+        if value:
+            probe_env[name] = value
     try:
         result = subprocess.run(
             [str(path), *args],
@@ -121,11 +130,7 @@ def _check_bundled_binary(layout: Any, name: str, entry: dict[str, Any]) -> dict
             capture_output=True,
             text=True,
             timeout=5,
-            env={
-                "PATH": os.pathsep.join((str(layout.bin_dir), "/usr/local/bin", "/usr/bin", "/bin")),
-                "LC_ALL": "C",
-                "LANG": "C",
-            },
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "code": "version_probe_failed", "path": str(path), "error": str(exc)}
@@ -193,6 +198,8 @@ _PYTHON_PACKAGE_DISTRIBUTIONS = {
     "capstone": "capstone",
     "ropper": "ropper",
     "unicorn": "unicorn",
+    "paramiko": "paramiko",
+    "pyelftools": "pyelftools",
 }
 
 _TOOL_TO_BINARY = {

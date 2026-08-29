@@ -176,7 +176,11 @@ class HttpRange(HttpModel):
 
 class HttpVariableSource(HttpModel):
     values: list[Any] | None = Field(
-        default=None, description="Inline finite values for one template variable."
+        default=None,
+        description=(
+            "Inline finite JSON values for one template variable. Keep strings "
+            "JSON-escaped; do not include comments or trailing commas."
+        ),
     )
     range: HttpRange | None = Field(
         default=None, description="Finite integer range; use only one source per variable."
@@ -187,7 +191,10 @@ class HttpVariableSource(HttpModel):
     )
     encoding: Literal["path", "query", "form", "none"] = Field(
         default="none",
-        description="Encoding applied at substitution: path, query, form, or none.",
+        description=(
+            "Encoding applied at substitution: path preserves '/' separators and "
+            "encodes each path segment; query, form, or none."
+        ),
     )
     trim: bool = True
     skip_empty: bool = True
@@ -307,7 +314,11 @@ class HttpProbeArguments(HttpModel):
     cases: list[HttpProbeInputCase] = Field(
         min_length=1,
         max_length=32,
-        description="A list of flat request cases. Each case owns variables and combine. Shared controls stay at the top level. Probe never accepts request, top-level variables/combine, or session_id. Use exact {{name}} placeholders.",
+        description=(
+            "A JSON array of flat request cases. Each case owns variables and "
+            "combine; shared controls stay at the top level. Use exact {{name}} "
+            "placeholders. Do not pass a string, request wrapper, or session_id."
+        ),
     )
     concurrency: int = Field(
         default=8,
@@ -315,7 +326,14 @@ class HttpProbeArguments(HttpModel):
         le=32,
         description="Maximum parallel HTTP requests in this probe (1-32).",
     )
-    rate_limit_per_second: float | None = Field(default=None, gt=0, le=1_000)
+    # Keep this finite and explicit: a Probe is a bounded matrix, not a
+    # background session.  Long-running work is polled with system_http_output.
+    rate_limit_per_second: float | None = Field(
+        default=None,
+        gt=0,
+        le=1_000,
+        description="Optional aggregate request rate limit; omit for no extra throttling.",
+    )
     wait_seconds: float = Field(
         default=20.0,
         ge=0,

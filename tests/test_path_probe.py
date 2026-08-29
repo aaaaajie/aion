@@ -170,6 +170,40 @@ async def test_concurrent_run_and_agent_cleanup_tolerate_missing_plan(
     await service.close()
 
 
+@pytest.mark.asyncio
+async def test_agent_cleanup_treats_worker_file_race_as_already_cleaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    service, manager, agent_id = await _manager(
+        tmp_path, handler, start_runtime=False
+    )
+    result = await manager.start_path_probe(
+        agent_id,
+        url="https://target.test/",
+        profile="quick",
+        wordlist_paths=(),
+        wait_seconds=0,
+    )
+
+    original_stop = manager._stop_interaction
+
+    async def missing_worker_files(_agent_id: str, _interaction_id: str) -> None:
+        await original_stop(_agent_id, _interaction_id)
+        raise FileNotFoundError("worker removed its private directory")
+
+    monkeypatch.setattr(manager, "_stop_interaction", missing_worker_files)
+    await manager.finish_agent(agent_id)
+    row = await service.get_http_interaction(
+        "run-1", agent_id, result["interaction_id"]
+    )
+    assert row["output_cleaned_at"] is not None
+    await service.close()
+
+
 def test_vendored_filter_and_diff_algorithms() -> None:
     ranges = parse_numeric_ranges("100-200,404")
     assert matches_numeric_ranges(150, ranges)

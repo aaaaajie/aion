@@ -138,7 +138,7 @@ class AgentRecord(Base):
     final_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     last_summarized_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     report_cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    report_cursors: Mapped[dict[str, int]] = mapped_column(JSON, default=dict, nullable=False)
+    report_cursors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     success_criteria: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     context_refs: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     hypothesis_key: Mapped[str | None] = mapped_column(String(128))

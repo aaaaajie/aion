@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Mapping
 import os
 import re
 import struct
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from agent.tooling import AccessClaim, ToolSpec
 from tools.binaries import ToolchainError, toolchain_for
+from tools.workspace import is_runtime_control_plane_path
 
 from .elf import ElfError, executable_segments, parse_elf_header
 from .models import (
@@ -23,11 +24,16 @@ from .models import (
     LibcOffsetsArguments,
     PackArguments,
     PatchElfArguments,
+    PwnProcessOpenArguments,
     RopSearchArguments,
     SeccompArguments,
+    PwnSessionCloseArguments,
+    PwnSessionIoArguments,
+    PwnTcpOpenArguments,
     StringsArguments,
     SymbolsArguments,
 )
+from .session import BinarySessionError, BinarySessionManager
 
 
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -43,14 +49,11 @@ class BinaryTools:
         root: str | os.PathLike[str],
         *,
         toolchain_root: str | os.PathLike[str] | None = None,
+        session_manager: BinarySessionManager | None = None,
     ) -> None:
         self.root = Path(root).resolve()
-        candidate = (
-            Path(toolchain_root)
-            if toolchain_root is not None
-            else self.root / "tools" / "binaries"
-        )
-        self._toolchain = toolchain_for(candidate if candidate.is_dir() else None)
+        self._toolchain = toolchain_for(toolchain_root)
+        self._sessions = session_manager or BinarySessionManager(self.root)
 
     def tool_specs(self) -> list[ToolSpec]:
         def identify(arguments: BaseModel) -> Any:
@@ -183,17 +186,23 @@ class BinaryTools:
                 f"{arguments.offset + index:08x}: {byte:02x}"
                 for index, byte in enumerate(chunk)
             ]
+            instructions = _capstone_disassemble(path, chunk, arguments.offset)
             return {
                 "data": {
                     "file_path": str(path),
                     "offset": arguments.offset,
                     "length": len(chunk),
                     "hexdump": lines,
+                    "instructions": instructions,
                 },
                 "_aion_evidence": {
                     "evidence_type": "binary",
-                    "content": {"offset": arguments.offset, "length": len(chunk)},
-                    "metadata": {"file_path": str(path)},
+                    "content": {
+                        "offset": arguments.offset,
+                        "length": len(chunk),
+                        "instruction_count": len(instructions),
+                    },
+                    "metadata": {"file_path": str(path), "decoder": "capstone"},
                 },
             }
 
@@ -445,6 +454,67 @@ class BinaryTools:
                 },
             }
 
+        async def pwn_process_open(arguments: BaseModel) -> Any:
+            assert isinstance(arguments, PwnProcessOpenArguments)
+            try:
+                result = await self._sessions.open_process(arguments)
+            except BinarySessionError as exc:
+                return _tool_error("pwn_process_open", exc.code, str(exc), details=exc.details)
+            return {
+                "data": result,
+                "_aion_evidence": {
+                    "evidence_type": "binary_session",
+                    "content": {
+                        "session_id": result["session_id"],
+                        "kind": result["kind"],
+                        "pid": result.get("pid"),
+                    },
+                    "metadata": {"file_path": arguments.file_path},
+                },
+            }
+
+        async def pwn_tcp_open(arguments: BaseModel) -> Any:
+            assert isinstance(arguments, PwnTcpOpenArguments)
+            try:
+                result = await self._sessions.open_tcp(arguments)
+            except BinarySessionError as exc:
+                return _tool_error("pwn_tcp_open", exc.code, str(exc), details=exc.details)
+            return {
+                "data": result,
+                "_aion_evidence": {
+                    "evidence_type": "network_session",
+                    "content": {"session_id": result["session_id"], "kind": result["kind"]},
+                    "metadata": {"host": arguments.host, "port": arguments.port},
+                },
+            }
+
+        async def pwn_session_io(arguments: BaseModel) -> Any:
+            assert isinstance(arguments, PwnSessionIoArguments)
+            try:
+                result = await self._sessions.io(arguments)
+            except BinarySessionError as exc:
+                return _tool_error("pwn_session_io", exc.code, str(exc), details=exc.details)
+            return {
+                "data": result,
+                "_aion_evidence": {
+                    "evidence_type": "binary_session",
+                    "content": {
+                        "session_id": arguments.session_id,
+                        "received_bytes": result["received_bytes"],
+                        "timed_out": result["timed_out"],
+                    },
+                    "metadata": {"session_id": arguments.session_id},
+                },
+            }
+
+        async def pwn_session_close(arguments: BaseModel) -> Any:
+            assert isinstance(arguments, PwnSessionCloseArguments)
+            try:
+                result = await self._sessions.close(arguments.session_id)
+            except BinarySessionError as exc:
+                return _tool_error("pwn_session_close", exc.code, str(exc), details=exc.details)
+            return {"data": result}
+
         return [
             ToolSpec(
                 "bin_identify",
@@ -523,10 +593,38 @@ class BinaryTools:
                 debug,
                 lambda _arguments: (AccessClaim("read", "tool:gdb"),),
             ),
+            ToolSpec(
+                "pwn_process_open",
+                "Start one ELF target through the Linux OS sandbox and return a stateful binary session. Linux runner and matching host architecture are required.",
+                PwnProcessOpenArguments,
+                pwn_process_open,
+                self._path_write,
+            ),
+            ToolSpec(
+                "pwn_tcp_open",
+                "Open one bounded TCP/TLS session for an assigned binary protocol target.",
+                PwnTcpOpenArguments,
+                pwn_tcp_open,
+                lambda arguments: (AccessClaim("write", f"network:{arguments.host}:{arguments.port}"),),
+            ),
+            ToolSpec(
+                "pwn_session_io",
+                "Exchange bounded binary-safe bytes with an owned process or TCP session; use base64 for non-text data and optional receive markers for framed protocols.",
+                PwnSessionIoArguments,
+                pwn_session_io,
+                lambda arguments: (AccessClaim("write", f"binary-session:{arguments.session_id}"),),
+            ),
+            ToolSpec(
+                "pwn_session_close",
+                "Close one owned process or TCP binary session.",
+                PwnSessionCloseArguments,
+                pwn_session_close,
+                lambda arguments: (AccessClaim("write", f"binary-session:{arguments.session_id}"),),
+            ),
         ]
 
     async def close(self) -> None:
-        return None
+        await self._sessions.close_all()
 
     def _resolve(self, value: str) -> Path:
         path = (self.root / value).resolve(strict=False)
@@ -534,6 +632,8 @@ class BinaryTools:
             path.relative_to(self.root)
         except ValueError as exc:
             raise ElfError("path escapes the workspace") from exc
+        if is_runtime_control_plane_path(self.root, path):
+            raise ElfError("Runtime control-plane paths are unavailable")
         return path
 
     @staticmethod
@@ -556,7 +656,13 @@ def _has_canary(path: Path) -> bool:
     )
 
 
-def _tool_error(tool: str, code: str, message: str) -> dict[str, Any]:
+def _tool_error(
+    tool: str,
+    code: str,
+    message: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "ok": False,
         "error": {
@@ -564,7 +670,7 @@ def _tool_error(tool: str, code: str, message: str) -> dict[str, Any]:
             "code": code,
             "message": message,
             "retry": {"allowed": False, "action": "none", "tool": tool},
-            "details": {"tool": tool},
+            "details": {"tool": tool, **dict(details or {})},
         },
     }
 
@@ -588,6 +694,32 @@ def _has_fortify(path: Path) -> bool:
     except OSError:
         return False
     return "_chk" in text
+
+
+def _capstone_disassemble(path: Path, chunk: bytes, offset: int) -> list[dict[str, Any]]:
+    """Decode a bounded ELF chunk when the pinned Capstone wheel is available."""
+
+    try:
+        from capstone import CS_ARCH_X86, CS_MODE_32, CS_MODE_64, Cs
+    except ImportError:
+        return []
+    try:
+        header = parse_elf_header(path)
+    except ElfError:
+        return []
+    if header["machine"] not in {"amd64", "x86"}:
+        return []
+    mode = CS_MODE_64 if header["format"] == "ELF64" else CS_MODE_32
+    decoder = Cs(CS_ARCH_X86, mode)
+    return [
+        {
+            "address": hex(instruction.address),
+            "mnemonic": instruction.mnemonic,
+            "op_str": instruction.op_str,
+            "bytes": instruction.bytes.hex(),
+        }
+        for instruction in decoder.disasm(chunk, offset)
+    ][:512]
 
 
 def _extract_symbols(path: Path) -> list[dict[str, Any]]:

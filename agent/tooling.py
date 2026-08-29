@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic
@@ -26,7 +29,7 @@ from challenges_sdk import (
 from agent.state.errors import StateError
 
 
-ToolHandler = Callable[[BaseModel], Awaitable[Any]]
+ToolHandler = Callable[[BaseModel], Awaitable[Any] | Any]
 ClaimResolver = Callable[[BaseModel], Sequence["AccessClaim"]]
 ResultProjector = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 LOGGER = logging.getLogger(__name__)
@@ -94,6 +97,68 @@ def _compact_schema(value: Any) -> Any:
     return value
 
 
+def serialize_tool_arguments(
+    value: Any,
+    *,
+    exclude_unset: bool = False,
+    exclude_none: bool = False,
+) -> Any:
+    """Serialize tool arguments without invoking Pydantic's typed serializer.
+
+    A few intentionally best-effort tool inputs use ``SkipValidation`` so that
+    malformed optional items can be downgraded to warnings.  Calling
+    ``BaseModel.model_dump()`` on those models makes Pydantic emit
+    ``PydanticSerializationUnexpectedValue`` warnings when the raw value is a
+    dict.  Tool audit events only need a JSON-safe projection, so walk the
+    already-parsed values directly and avoid re-validating or re-serializing
+    them through Pydantic.
+    """
+
+    if isinstance(value, BaseModel):
+        # Read field metadata from the class.  Accessing ``model_fields`` on
+        # an instance is deprecated in Pydantic 2.11 and also needlessly
+        # routes SkipValidation values through its typed serializer.
+        fields = getattr(type(value), "model_fields", {})
+        fields_set = getattr(value, "model_fields_set", set())
+        projected: dict[str, Any] = {}
+        for name in fields:
+            if exclude_unset and name not in fields_set:
+                continue
+            item = getattr(value, name, None)
+            if exclude_none and item is None:
+                continue
+            projected[name] = serialize_tool_arguments(
+                item,
+                exclude_unset=exclude_unset,
+                exclude_none=exclude_none,
+            )
+        return projected
+    if isinstance(value, Mapping):
+        return {
+            str(key): serialize_tool_arguments(
+                item,
+                exclude_unset=exclude_unset,
+                exclude_none=exclude_none,
+            )
+            for key, item in value.items()
+            if not (exclude_none and item is None)
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            serialize_tool_arguments(
+                item,
+                exclude_unset=exclude_unset,
+                exclude_none=exclude_none,
+            )
+            for item in value
+        ]
+    if isinstance(value, Enum):
+        return value.value
+    if hasattr(value, "get_secret_value"):
+        return value.get_secret_value()
+    return value
+
+
 @dataclass(frozen=True)
 class ToolDispatchOutcome:
     """Tool result carrying Runner control outside the model payload."""
@@ -108,6 +173,7 @@ class PreparedToolCall:
     tool_call_id: str
     name: str
     raw_arguments_length: int
+    raw_arguments_digest: str | None = None
     spec: ToolSpec | None = None
     arguments: BaseModel | None = None
     claims: tuple[AccessClaim, ...] = ()
@@ -119,6 +185,7 @@ class PreparedToolCall:
     execution_latency_ms: int = 0
     total_latency_ms: int = 0
     concurrency_wave: int = 0
+    replayed: bool = False
 
 
 class ToolRegistry:
@@ -251,7 +318,17 @@ class ToolExecutor:
         raw = function.get("arguments", "{}")
         raw_length = len(raw) if isinstance(raw, str) else 0
         spec = self.registry.get(name)
-        item = PreparedToolCall(index, tool_call_id, name, raw_length, spec=spec)
+        raw_digest = hashlib.sha256(
+            (raw if isinstance(raw, str) else repr(raw)).encode("utf-8")
+        ).hexdigest()
+        item = PreparedToolCall(
+            index,
+            tool_call_id,
+            name,
+            raw_length,
+            raw_arguments_digest=raw_digest,
+            spec=spec,
+        )
         if spec is None:
             item.result = tool_error(
                 "permission" if self.registry.allowed_tools is not None else "schema",
@@ -277,6 +354,7 @@ class ToolExecutor:
                 "Tool arguments are not valid JSON",
                 retry_allowed=True, retry_action="rewrite_arguments",
                 details={
+                    "json_error": exc.msg,
                     "line": exc.lineno,
                     "column": exc.colno,
                     "position": exc.pos,
@@ -367,6 +445,7 @@ class ToolExecutor:
             error_message,
             retry_allowed=retry_allowed,
             retry_action=retry_action,
+            retry_tool=name,
             details=details,
         )
 
@@ -376,7 +455,9 @@ class ToolExecutor:
         item.queue_latency_ms = int((started - batch_started) * 1_000)
         item.concurrency_wave = wave
         try:
-            value = await item.spec.handler(item.arguments)
+            value = item.spec.handler(item.arguments)
+            if inspect.isawaitable(value):
+                value = await value
             if isinstance(value, Mapping) and isinstance(
                 value.get("_aion_evidence"), Mapping
             ):
@@ -689,23 +770,37 @@ def map_exception(
             details=exc.detail,
         )
     if isinstance(exc, ChallengesAPIError):
+        benchmark_events = getattr(exc, "_benchmark_events", [])
         return tool_error(
             "execution",
             str(exc.code or "benchmark_api_error"),
             "The benchmark service rejected the operation",
-            details={"status_code": exc.status_code},
+            details={
+                "status_code": exc.status_code,
+                "benchmark_events": benchmark_events,
+            },
         )
     if isinstance(exc, ChallengesTransportError):
+        benchmark_events = getattr(exc, "_benchmark_events", [])
         return tool_error(
             "execution",
             "transport_error",
             "Unable to reach the benchmark service",
+            details={"benchmark_events": benchmark_events},
         )
     if isinstance(exc, ChallengesResponseError):
+        benchmark_events = getattr(exc, "_benchmark_events", [])
         return tool_error(
             "execution",
             "invalid_response",
             "The benchmark service returned an invalid response",
+            details={
+                "status_code": exc.status_code,
+                "response_size": exc.response_size,
+                "recovery_attempted": exc.recovery_attempted,
+                "requires_reconciliation": exc.requires_reconciliation,
+                "benchmark_events": benchmark_events,
+            },
         )
     if isinstance(exc, ChallengesSDKError):
         return tool_error(

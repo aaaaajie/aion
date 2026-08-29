@@ -11,14 +11,21 @@ import pytest
 from scripts import online_runtime as online
 
 
-def test_online_launcher_uses_unbounded_default_and_monitor() -> None:
+def test_online_launcher_uses_unbounded_default_without_embedded_monitor() -> None:
     parser = online._build_parser()
     args = parser.parse_args(["--benchmark-token-file", "/run/credentials/token"])
 
     assert args.wait_seconds == online.DEFAULT_WAIT_SECONDS
-    assert args.no_monitor is False
-    assert args.monitor_port == online.DEFAULT_MONITOR_PORT
     assert args.workspace_root == online.PROJECT_ROOT
+
+
+def test_hosted_launcher_uses_environment_and_disables_vpn() -> None:
+    parser = online._build_parser()
+    args = parser.parse_args(["--hosted"])
+
+    assert args.hosted is True
+    assert args.benchmark_token_file is None
+    assert args.vpn_config is None
 
 
 def test_online_launcher_requires_explicit_token_file() -> None:
@@ -26,6 +33,36 @@ def test_online_launcher_requires_explicit_token_file() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args([])
+
+
+@pytest.mark.asyncio
+async def test_hosted_launcher_rejects_vpn_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        online.sys,
+        "argv",
+        [
+            "online_runtime.py",
+            "--hosted",
+            "--vpn-config",
+            "/tmp/benchmark.ovpn",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        await online.async_main()
+
+
+def test_benchmark_token_environment_requires_one_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCHMARK_TOKEN", "environment-secret")
+    assert online._read_benchmark_token_from_environment() == "environment-secret"
+
+    monkeypatch.setenv("BENCHMARK_TOKEN", "first\nsecond")
+    with pytest.raises(ValueError, match="exactly one"):
+        online._read_benchmark_token_from_environment()
 
 
 @pytest.mark.asyncio
@@ -125,3 +162,8 @@ async def test_wait_for_operation_handles_completion_stop_and_timeout() -> None:
         timeout=0.001,
     )
     assert (phase, result) == ("timeout", None)
+
+
+@pytest.mark.asyncio
+async def test_bounded_shutdown_returns_when_cleanup_hangs() -> None:
+    await online._bounded_shutdown(asyncio.sleep(1), "fixture", 0.001)

@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -31,6 +32,7 @@ from agent.tooling import ToolDispatchOutcome, ToolRegistry, ToolSpec
 from agent.state import AgentStateStore, StateService
 from agent.state.models import DEFAULT_SESSION_MEMORY
 from agent.state.schemas import ChallengeImport
+from agent.subagents.models import ExecutionReport
 
 
 def _settings(**overrides: Any) -> AgentSettings:
@@ -123,11 +125,149 @@ def test_live_context_replaces_previous_runtime_update() -> None:
     assert '"through_sequence": 2' in messages[-1]["content"]
 
 
+def test_bootstrap_tool_surface_converges_by_round_budget() -> None:
+    runner = object.__new__(AgentRunner)
+    runner.bootstrap_mode = True
+    runner._report_recovery_used = False
+    runner._disabled_tool_names = set()
+    definitions = [
+        {"function": {"name": name}}
+        for name in (
+            "system_http_probe",
+            "system_http_request",
+            "system_http_response",
+            "system_http_output",
+            "system_web_path_probe",
+            "system_network_discovery",
+            "skill_search",
+            "execution_report",
+            "bootstrap_checkpoint",
+            "bootstrap_cycle_yield",
+            "evidence_read",
+        )
+    ]
+
+    runner._current_round_number = 1
+    assert len(runner._active_tool_definitions(definitions)) == len(definitions)
+
+    runner._current_round_number = 9
+    targeted = {
+        item["function"]["name"]
+        for item in runner._active_tool_definitions(definitions)
+    }
+    assert targeted == {
+        "system_http_request",
+        "system_http_response",
+        "system_http_output",
+        "execution_report",
+        "bootstrap_checkpoint",
+        "bootstrap_cycle_yield",
+        "evidence_read",
+    }
+
+    runner._current_round_number = 20
+    report_only = {
+        item["function"]["name"]
+        for item in runner._active_tool_definitions(definitions)
+    }
+    assert report_only == {
+        "execution_report",
+        "bootstrap_checkpoint",
+        "bootstrap_cycle_yield",
+        "evidence_read",
+        "system_http_request",
+        "system_http_response",
+        "system_http_output",
+    }
+
+
+def test_exact_http_call_reuses_successful_result() -> None:
+    runner = object.__new__(AgentRunner)
+    runner._http_result_cache = {}
+    item = SimpleNamespace(
+        name="system_http_request",
+        arguments={"method": "GET", "url": "http://target/"},
+        result=None,
+        replayed=False,
+    )
+    key = runner._http_replay_key(item)
+    assert key is not None
+    runner._http_result_cache[key] = {"ok": True, "data": {"status": 200}}
+
+    runner._apply_http_replay_cache([item])
+
+    assert item.replayed is True
+    assert item.result == {"ok": True, "data": {"status": 200}}
+
+
+@pytest.mark.asyncio
+async def test_sqlmap_request_dedup_is_enforced_across_execution_agents(
+    tmp_path: Path,
+) -> None:
+    service = StateService(tmp_path / "state.sqlite3", run_root=tmp_path / "runs")
+    await service.initialize()
+    await service.create_run(
+        "run",
+        challenges=[ChallengeImport(unique_code="target")],
+    )
+    chief = await service.register_agent("run", role="chief")
+    controller = await service.register_agent(
+        "run",
+        role="challenge",
+        parent_id=chief["agent_id"],
+        unique_code="target",
+    )
+    execution = await service.register_agent(
+        "run",
+        role="execution",
+        parent_id=controller["agent_id"],
+        unique_code="target",
+        mission="sql injection check",
+    )
+    runner = AgentRunner(
+        _settings(),
+        ToolRegistry([]),
+        role="execution",
+        agent_id=execution["agent_id"],
+        state_service=service,
+    )
+    runner._unique_code = "target"
+    runner._claimed_challenge_tool_digests = {}
+    arguments = {
+        "url": "http://target/item?id=1",
+        "level": 1,
+        "risk": 1,
+        "timeout_seconds": 120,
+    }
+    first = SimpleNamespace(
+        name="pentest_sqlmap",
+        arguments=arguments,
+        result=None,
+        tool_call_id="sqlmap-1",
+    )
+    await runner._apply_challenge_expensive_tool_dedup([first], run_id="run")
+    assert first.result is None
+    first.result = {"ok": True, "data": {"status": "completed"}}
+    await runner._complete_challenge_expensive_tool_dedup([first], run_id="run")
+
+    second = SimpleNamespace(
+        name="pentest_sqlmap",
+        arguments=dict(arguments),
+        result=None,
+        tool_call_id="sqlmap-2",
+    )
+    await runner._apply_challenge_expensive_tool_dedup([second], run_id="run")
+    assert second.result is not None
+    assert second.result["error"]["code"] == "duplicate_expensive_request"
+    await runner.close()
+    await service.close()
+
+
 def test_challenge_dispatch_has_one_argument_recovery() -> None:
     runner = object.__new__(AgentRunner)
     runner.role = "challenge"
     runner._challenge_dispatch_argument_failure_streak = 0
-    runner._challenge_dispatch_recovery_exhausted = False
+    runner._challenge_dispatch_correction_pending = False
     item = SimpleNamespace(
         name="challenge_dispatch",
         arguments=None,
@@ -141,7 +281,7 @@ def test_challenge_dispatch_has_one_argument_recovery() -> None:
     )
 
     runner._apply_challenge_dispatch_recovery_budget([item])
-    assert item.result["error"]["code"] == "invalid_arguments"
+    assert item.result["error"]["code"] == "challenge_dispatch_invalid_arguments"
     second_item = SimpleNamespace(
         name="challenge_dispatch",
         arguments=None,
@@ -154,8 +294,9 @@ def test_challenge_dispatch_has_one_argument_recovery() -> None:
         },
     )
     runner._apply_challenge_dispatch_recovery_budget([second_item])
-    assert second_item.result["error"]["code"] == "challenge_dispatch_recovery_exhausted"
-    assert runner._challenge_dispatch_recovery_exhausted is True
+    assert second_item.result["error"]["code"] == "challenge_dispatch_invalid_arguments"
+    assert second_item.result["error"]["retry"]["allowed"] is True
+    assert runner._challenge_dispatch_correction_pending is True
 
 
 def test_session_memory_is_structured_and_bounded() -> None:
@@ -774,6 +915,170 @@ async def test_deepseek_max_policy_preserves_reasoning_for_tool_roundtrip(
     assert assistant["reasoning_content"] == "private reasoning"
     events = await service.list_agent_events("deepseek", agent["agent_id"])
     assert "private reasoning" not in json.dumps(events)
+
+    await runner.close()
+    await client.aclose()
+    await service.close()
+
+
+@pytest.mark.parametrize(
+    ("second_response", "expected_error"),
+    [
+        ("report", None),
+        ("length", "llm_completion_truncated"),
+        ("missing_reasoning", "invalid_llm_response"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execution_length_response_uses_one_strict_reasoning_recovery(
+    tmp_path: Path,
+    second_response: str,
+    expected_error: str | None,
+) -> None:
+    class ReportTools:
+        def tool_specs(self) -> list[ToolSpec]:
+            async def report(_arguments: BaseModel) -> ToolDispatchOutcome:
+                return ToolDispatchOutcome(
+                    {"ok": True, "data": {"terminal": True}},
+                    yield_session=True,
+                )
+
+            return [
+                ToolSpec(
+                    "execution_report",
+                    "submit the structured execution report",
+                    ExecutionReport,
+                    report,
+                    lambda _arguments: (),
+                )
+            ]
+
+        async def close(self) -> None:
+            return None
+
+    settings = _settings(llm_model="deepseek-v4-flash")
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"role": "assistant", "content": "partial"},
+                        }
+                    ]
+                },
+            )
+        if second_response == "length":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"role": "assistant", "content": "partial again"},
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            **(
+                                {"reasoning_content": "finalize"}
+                                if second_response == "report"
+                                else {}
+                            ),
+                            "tool_calls": [
+                                {
+                                    "id": "report-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "execution_report",
+                                        "arguments": json.dumps(
+                                            {
+                                                "status": "completed",
+                                                "summary": "bounded terminal report",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+
+    service = StateService(tmp_path / "truncated" / "state.sqlite3", run_root=tmp_path)
+    await service.create_run("truncated", prompt="task")
+    await service.import_challenges(
+        "truncated",
+        [{"unique_code": "c-01", "description": "local fixture"}],
+    )
+    chief = await service.register_agent("truncated", role="chief")
+    challenge = await service.register_agent(
+        "truncated",
+        role="challenge",
+        parent_id=chief["agent_id"],
+        unique_code="c-01",
+    )
+    execution = await service.register_agent(
+        "truncated",
+        role="execution",
+        parent_id=challenge["agent_id"],
+        unique_code="c-01",
+        timeout_seconds=1_800,
+        initial_prompt="task",
+    )
+    store = await AgentStateStore.open(
+        service,
+        run_id="truncated",
+        agent_id=execution["agent_id"],
+        run_dir=tmp_path / "truncated",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    runner = AgentRunner(
+        settings,
+        ToolRegistry([ReportTools()]),
+        http_client=client,
+        run_root=tmp_path,
+        state_service=service,
+        agent_id=execution["agent_id"],
+        role="execution",
+        require_structured_report=True,
+    )
+
+    if expected_error is None:
+        result = await runner.run_session("task", store=store)
+        assert result.structured_report_seen is True
+    else:
+        with pytest.raises(AgentRunnerError) as failure:
+            await runner.run_session("task", store=store)
+        assert failure.value.code == expected_error
+    assert len(requests) == 2
+    assert requests[1]["thinking"] == {"type": "enabled"}
+    assert requests[1]["reasoning_effort"] == "max"
+    assert "temperature" not in requests[1]
+    assert requests[1]["max_tokens"] == 4_096
+    assert [
+        item["function"]["name"] for item in requests[1]["tools"]
+    ] == ["execution_report"]
+    events = await service.list_agent_events("truncated", execution["agent_id"])
+    assert [
+        item["event_type"] for item in events
+    ].count("llm_length_report_recovery") == 1
 
     await runner.close()
     await client.aclose()

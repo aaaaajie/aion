@@ -89,11 +89,11 @@ def parse_elf_header(path: Path) -> dict[str, Any]:
             if start + header_size > len(data):
                 break
             if is_64:
-                p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _ = struct.unpack_from(
+                p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from(
                     f"{fmt}IIQQQQQQ", data, start
                 )
             else:
-                p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags = struct.unpack_from(
+                p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags, _ = struct.unpack_from(
                     f"{fmt}IIIIIIII", data, start
                 )
             program_headers.append(
@@ -189,11 +189,11 @@ def _program_headers_raw(path: Path) -> list[dict[str, Any]]:
         if start + header_size > len(data):
             break
         if is_64:
-            p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _ = struct.unpack_from(
+            p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from(
                 f"{fmt}IIQQQQQQ", data, start
             )
         else:
-            p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags = struct.unpack_from(
+            p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags, _ = struct.unpack_from(
                 f"{fmt}IIIIIIII", data, start
             )
         headers.append(

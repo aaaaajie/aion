@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import platform
+import pwd
 import re
 import shutil
 import signal
@@ -41,6 +42,18 @@ _OFFLINE_INSTALL_PATTERN = re.compile(
     r"(?:apt(?:-get)?|dnf|yum|apk|brew)\s+(?:install|update|upgrade|add)\b)"
     r"|(?:curl|wget)\b[^\n|;]*\|\s*(?:sh|bash)\b"
 )
+_CONTAINER_CONTROL_PATTERN = re.compile(
+    r"(?ix)"
+    r"(?:^|[\s;&|()<>`'\"])"
+    r"(?:command\s+)?(?:sudo\s+)?(?:docker|podman|nerdctl|crictl)\b"
+    r"|(?:^|[\s;&|()<>`'\"])"
+    r"(?:command\s+)?(?:sudo\s+)?kubectl\s+(?:exec|cp|attach|port-forward|debug)\b"
+)
+_CONTAINER_SOCKET_PATTERN = re.compile(
+    r"(?ix)"
+    r"(?:docker\.sock|docker\.raw\.sock|com\.docker\.docker|"
+    r"\.docker/run/|/var/run/(?:docker|podman)\.sock)"
+)
 ShellTaskStatus = Literal[
     "running",
     "completed",
@@ -52,7 +65,7 @@ ShellTaskStatus = Literal[
 
 
 class SandboxBackend:
-    """Build a mandatory macOS or Linux OS-sandbox command."""
+    """Build a mandatory host-sandbox or container-isolation command."""
 
     def __init__(
         self,
@@ -60,35 +73,95 @@ class SandboxBackend:
         executable: str | None = None,
         platform_name: str | None = None,
         read_only_paths: Sequence[Path] = (),
+        hidden_paths: Sequence[Path] = (),
+        sandbox_user: str | None = None,
     ) -> None:
-        self.root = root
+        self.root = root.expanduser().resolve(strict=True)
         self.read_only_paths = tuple(
             dict.fromkeys(path.expanduser().resolve(strict=True) for path in read_only_paths)
         )
+        self.hidden_paths = tuple(
+            dict.fromkeys(path.expanduser().resolve(strict=False) for path in hidden_paths)
+        )
         self.platform = platform_name or platform.system()
-        if executable is not None:
+        self.sandbox_user = (
+            sandbox_user
+            if sandbox_user is not None
+            else os.environ.get("AION_LINUX_SANDBOX_USER", "").strip()
+        )
+        self.backend = ""
+        if self.platform == "Linux" and self.sandbox_user:
+            self.backend = "setpriv"
+            self.executable = (
+                executable or shutil.which("setpriv") or "/usr/bin/setpriv"
+            )
+        elif executable is not None:
+            if self.platform == "Linux":
+                self.backend = "bwrap"
             self.executable = executable
         elif self.platform == "Darwin":
             self.executable = "/usr/bin/sandbox-exec"
         elif self.platform == "Linux":
+            self.backend = "bwrap"
             self.executable = shutil.which("bwrap") or "/usr/bin/bwrap"
         else:
             self.executable = ""
 
     @property
     def available(self) -> bool:
-        return (
+        executable_available = (
             self.platform in {"Darwin", "Linux"}
             and bool(self.executable)
             and Path(self.executable).is_file()
             and os.access(self.executable, os.X_OK)
         )
+        if not executable_available:
+            return False
+        if self.backend != "setpriv":
+            return True
+        try:
+            pwd.getpwnam(self.sandbox_user)
+        except KeyError:
+            return False
+        return True
+
+    def prepare(self) -> None:
+        """Prepare mutable workspace ownership for the container sandbox user."""
+
+        if self.backend != "setpriv":
+            return
+        try:
+            account = pwd.getpwnam(self.sandbox_user)
+            for _, directory_names, file_names, directory_fd in os.fwalk(
+                self.root,
+                topdown=True,
+                follow_symlinks=False,
+            ):
+                os.fchown(directory_fd, account.pw_uid, account.pw_gid)
+                for name in (*directory_names, *file_names):
+                    try:
+                        os.chown(
+                            name,
+                            account.pw_uid,
+                            account.pw_gid,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+        except (KeyError, OSError) as exc:
+            raise SystemToolError(
+                error_type="execution",
+                code="sandbox_workspace_unavailable",
+                message="The container sandbox workspace could not be prepared",
+            ) from exc
 
     def command(
         self,
         shell_command: str,
         cwd: Path | None = None,
         temp_dir: Path | None = None,
+        write_paths: Sequence[Path] = (),
     ) -> list[str]:
         if self.platform not in {"Darwin", "Linux"}:
             raise SystemToolError(
@@ -106,17 +179,49 @@ class SandboxBackend:
             return [
                 self.executable,
                 "-p",
-                self._macos_profile(),
+                self._macos_profile(write_paths),
                 "/bin/bash",
                 "--noprofile",
                 "--norc",
                 "-lc",
                 shell_command,
             ]
-        return self._linux_command(shell_command, cwd, temp_dir)
+        return self._linux_command(shell_command, cwd, temp_dir, write_paths)
 
-    def _macos_profile(self) -> str:
+    def command_argv(
+        self,
+        argv: Sequence[str],
+        cwd: Path | None = None,
+        temp_dir: Path | None = None,
+        write_paths: Sequence[Path] = (),
+    ) -> list[str]:
+        """Build a Linux sandbox command without introducing a shell parser."""
+
+        if self.platform != "Linux":
+            raise SystemToolError(
+                error_type="execution",
+                code="linux_execution_required",
+                message="ELF process sessions require a Linux sandbox backend",
+            )
+        if not self.available:
+            raise SystemToolError(
+                error_type="execution",
+                code="sandbox_unavailable",
+                message="No supported Linux OS sandbox backend is available",
+            )
+        if not argv or any(not isinstance(item, str) or "\x00" in item for item in argv):
+            raise SystemToolError(
+                error_type="schema",
+                code="invalid_argv",
+                message="argv must contain at least one NUL-free string",
+            )
+        return [*self._linux_prefix(cwd, temp_dir, write_paths), *argv]
+
+    def _macos_profile(self, write_paths: Sequence[Path] = ()) -> str:
         root = json.dumps(str(self.root))
+        writable_paths = [
+            json.dumps(str(path)) for path in self._validated_write_paths(write_paths)
+        ]
         read_only_paths = [json.dumps(str(path)) for path in self.read_only_paths]
         system_read_paths = [
             "/System",
@@ -129,22 +234,63 @@ class SandboxBackend:
             "/dev",
             "/opt/homebrew",
         ]
+        container_socket_paths = [
+            "/var/run/docker.sock",
+            "/private/var/run/docker.sock",
+            str(Path.home() / ".docker/run/docker.sock"),
+            str(Path.home() / "Library/Containers/com.docker.docker/Data/docker.raw.sock"),
+            "/var/run/podman/podman.sock",
+        ]
         lines = [
             "(version 1)",
             "(allow default)",
+            # Network-capable target tools (HTTP, TCP, SSH, scanners) own
+            # their sessions.  Keep the general-purpose Shell workspace
+            # offline so it cannot reach a host daemon through an AF_UNIX
+            # socket or bypass the target-tool audit trail.
+            "(deny network-outbound)",
             "(deny file-read* (subpath \"/Users\"))",
             f"(allow file-read* (subpath {root}))",
             "(deny file-write* (subpath \"/\"))",
-            f"(allow file-write* (subpath {root}))",
             "(allow file-write* (literal \"/dev/null\"))",
             "(allow file-read-metadata (subpath \"/\"))",
         ]
+        # macOS sandbox-exec does not mount the per-Agent TMPDIR at the
+        # conventional absolute /tmp path.  Keep the persistent TMPDIR for
+        # isolation, but explicitly permit the conventional path so ordinary
+        # tools such as curl, grep, and sort do not fail with ENOENT.
+        lines.extend(
+            f"(allow file-read* (subpath {json.dumps(path)}))"
+            for path in ("/tmp", "/private/tmp")
+        )
+        lines.extend(
+            f"(allow file-write* (subpath {json.dumps(path)}))"
+            for path in ("/tmp", "/private/tmp")
+        )
+        lines.extend(f"(allow file-write* (subpath {path}))" for path in writable_paths)
         lines.extend(
             f"(allow file-read* (subpath {json.dumps(path)}))"
             for path in system_read_paths
         )
         lines.extend(f"(allow file-read* (subpath {path}))" for path in read_only_paths)
         lines.extend(f"(deny file-write* (subpath {path}))" for path in read_only_paths)
+        lines.extend(
+            f"(deny file-read* (subpath {json.dumps(str(path))}))"
+            for path in self.hidden_paths
+        )
+        # Agent-private and Challenge-shared workspaces live below the hidden
+        # Runtime directories. Re-open only the exact per-agent paths passed
+        # as writable paths; sibling agents and control-plane files stay hidden.
+        lines.extend(
+            f"(allow file-read* (subpath {json.dumps(str(path))}))"
+            for path in self._validated_write_paths(write_paths)
+        )
+        lines.extend(
+            f"(deny file-read* (literal {json.dumps(path)}))\n"
+            f"(deny file-write* (literal {json.dumps(path)}))\n"
+            f"(deny network-outbound (literal {json.dumps(path)}))"
+            for path in container_socket_paths
+        )
         return "\n".join(lines)
 
     def _linux_command(
@@ -152,7 +298,38 @@ class SandboxBackend:
         shell_command: str,
         cwd: Path | None,
         temp_dir: Path | None,
+        write_paths: Sequence[Path],
     ) -> list[str]:
+        return [
+            *self._linux_prefix(cwd, temp_dir, write_paths),
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-lc",
+            shell_command,
+        ]
+
+    def _linux_prefix(
+        self,
+        cwd: Path | None,
+        temp_dir: Path | None,
+        write_paths: Sequence[Path] = (),
+    ) -> list[str]:
+        if self.backend == "setpriv":
+            account = pwd.getpwnam(self.sandbox_user)
+            return [
+                self.executable,
+                f"--reuid={account.pw_uid}",
+                f"--regid={account.pw_gid}",
+                "--clear-groups",
+                "--no-new-privs",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--bounding-set=-all",
+                "/usr/bin/env",
+                "-C",
+                str(cwd or self.root),
+            ]
         command = [
             self.executable,
             "--die-with-parent",
@@ -189,11 +366,13 @@ class SandboxBackend:
             if resolv_target is not None:
                 bind_paths.append((str(resolv_target), "/etc/resolv.conf"))
 
+        writable_paths = self._validated_write_paths(write_paths)
         read_only_bind_paths = [
             (str(path), str(path)) for path in self.read_only_paths
         ]
+        writable_bind_paths = [(str(path), str(path)) for path in writable_paths]
         destination_parents: set[Path] = set()
-        for _, destination in bind_paths + read_only_bind_paths + [
+        for _, destination in bind_paths + read_only_bind_paths + writable_bind_paths + [
             (str(self.root), str(self.root))
         ]:
             parent = Path(destination).parent
@@ -206,13 +385,41 @@ class SandboxBackend:
             command.extend(["--ro-bind", source, destination])
         if temp_dir is not None:
             command.extend(["--bind", str(temp_dir), "/tmp"])
-        command.extend(["--bind", str(self.root), str(self.root)])
+        command.extend(["--ro-bind", str(self.root), str(self.root)])
+        for path in self.hidden_paths:
+            command.extend(["--tmpfs", str(path)])
+        # Re-bind the exact per-agent and shared paths after hiding the parent
+        # control-plane directories. This preserves shared evidence without
+        # exposing prior runs or other Agents' private workspaces.
+        for source, destination in writable_bind_paths:
+            command.extend(["--bind", source, destination])
         for source, destination in read_only_bind_paths:
             command.extend(["--ro-bind", source, destination])
         if cwd is not None:
             command.extend(["--chdir", str(cwd)])
-        command.extend(["/bin/bash", "--noprofile", "--norc", "-lc", shell_command])
         return command
+
+    def _validated_write_paths(self, paths: Sequence[Path]) -> tuple[Path, ...]:
+        validated: list[Path] = []
+        for raw_path in paths:
+            path = Path(raw_path).expanduser().resolve(strict=False)
+            try:
+                path.relative_to(self.root)
+            except ValueError as exc:
+                raise SystemToolError(
+                    error_type="permission",
+                    code="sandbox_write_path_invalid",
+                    message="Sandbox write paths must be inside the project root",
+                ) from exc
+            if path == self.root:
+                raise SystemToolError(
+                    error_type="permission",
+                    code="sandbox_write_path_invalid",
+                    message="The project root cannot be made writable",
+                )
+            if path not in validated:
+                validated.append(path)
+        return tuple(validated)
 
 
 @dataclass
@@ -236,9 +443,22 @@ class LiveShellTask:
 class AgentShellClient:
     """Agent-bound view of one Run-level task manager."""
 
-    def __init__(self, manager: "ShellTaskManager", agent_id: str) -> None:
+    def __init__(
+        self,
+        manager: "ShellTaskManager",
+        agent_id: str,
+        *,
+        shared_root: Path | None = None,
+    ) -> None:
         self.manager = manager
         self.agent_id = agent_id
+        self.shared_work_root = (
+            manager.validate_workspace_root(shared_root) if shared_root is not None else None
+        )
+
+    @property
+    def agent_work_root(self) -> Path:
+        return self.manager.agent_work_root(self.agent_id)
 
     async def run_shell(
         self,
@@ -255,7 +475,18 @@ class AgentShellClient:
             timeout=timeout,
             max_output_chars=max_output_chars,
             run_in_background=run_in_background,
+            shared_root=self.shared_work_root,
         )
+
+    async def ensure_workspace(self) -> None:
+        await self.manager.ensure_workspace(
+            self.agent_id, shared_root=self.shared_work_root
+        )
+
+    async def record_workspace_event(
+        self, event_type: str, payload: Mapping[str, Any] | None = None
+    ) -> None:
+        await self.manager.record_workspace_event(self.agent_id, event_type, payload)
 
     async def task_output(
         self,
@@ -300,7 +531,9 @@ class ShellTaskManager:
         self.service = service
         self.run_id = self._component(run_id, "run_id")
         self.sandbox = sandbox or SandboxBackend(
-            policy.root, read_only_paths=read_only_paths
+            policy.root,
+            read_only_paths=read_only_paths,
+            hidden_paths=(policy.root / ".aion", policy.root / ".system-tools"),
         )
         self.environment = dict(environment or {})
         self.psutil = psutil_module
@@ -309,6 +542,7 @@ class ShellTaskManager:
         self.runtime_root = policy.root / ".system-tools" / "runs" / self.run_id
         self._live: dict[str, LiveShellTask] = {}
         self._agent_cleanup_locks: dict[str, asyncio.Lock] = {}
+        self._workspace_ready: set[str] = set()
         self._run_cleanup_lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
         self._initialized = False
@@ -326,8 +560,96 @@ class ShellTaskManager:
                 self._reaper_loop(), name=f"aion-shell-reaper-{self.run_id}"
             )
 
-    def bind(self, agent_id: str) -> AgentShellClient:
-        return AgentShellClient(self, self._component(agent_id, "agent_id"))
+    def bind(
+        self, agent_id: str, *, shared_root: Path | None = None
+    ) -> AgentShellClient:
+        return AgentShellClient(
+            self,
+            self._component(agent_id, "agent_id"),
+            shared_root=shared_root,
+        )
+
+    def agent_work_root(self, agent_id: str) -> Path:
+        return self._owner_root(self._component(agent_id, "agent_id")) / "work"
+
+    def shared_workspace_root(self, unique_code: str) -> Path:
+        return (
+            self.policy.root
+            / ".aion"
+            / "runs"
+            / self.run_id
+            / "shared"
+            / self._component(unique_code, "unique_code")
+        )
+
+    def validate_workspace_root(self, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        candidate = Path(path).expanduser().resolve(strict=False)
+        try:
+            candidate.relative_to(self.policy.root)
+        except ValueError as exc:
+            raise self._error(
+                "permission",
+                "workspace_root_invalid",
+                "Agent workspace must be inside the project root",
+            ) from exc
+        if candidate == self.policy.root:
+            raise self._error(
+                "permission",
+                "workspace_root_invalid",
+                "Agent workspace cannot be the project root",
+            )
+        return candidate
+
+    async def ensure_workspace(
+        self, agent_id: str, *, shared_root: Path | None = None
+    ) -> None:
+        agent_id = self._component(agent_id, "agent_id")
+        owner_root, home_dir, temp_dir, task_dir, work_dir = self._owner_directories(agent_id)
+        validated_shared = self.validate_workspace_root(shared_root)
+        for directory in (
+            owner_root,
+            work_dir,
+            home_dir,
+            temp_dir,
+            task_dir,
+            home_dir / ".config",
+        ):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if validated_shared is not None:
+            validated_shared.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prepare_offline_home(home_dir)
+        if agent_id not in self._workspace_ready:
+            self._workspace_ready.add(agent_id)
+            await self.record_workspace_event(
+                agent_id,
+                "agent_workspace_created",
+                {"path_class": "agent_work"},
+            )
+
+    async def record_workspace_event(
+        self,
+        agent_id: str,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        safe_payload = {
+            key: value
+            for key, value in dict(payload or {}).items()
+            if key in {"path_class", "operation", "reason"}
+            and isinstance(value, (str, int, float, bool))
+        }
+        try:
+            await self.service.append_agent_event(
+                self.run_id,
+                self._component(agent_id, "agent_id"),
+                event_type,
+                safe_payload,
+            )
+        except (StateConflict, StateNotFound):
+            # Diagnostics must not make cleanup or a user-facing tool fail.
+            return
 
     async def run_shell(
         self,
@@ -338,6 +660,7 @@ class ShellTaskManager:
         timeout: float = 30.0,
         max_output_chars: int = 30_000,
         run_in_background: bool = False,
+        shared_root: Path | None = None,
     ) -> dict[str, Any]:
         self._require_open()
         if self.sandbox.platform not in {"Darwin", "Linux"}:
@@ -352,7 +675,11 @@ class ShellTaskManager:
                 "sandbox_unavailable",
                 "No supported OS sandbox backend is available",
             )
-        working_directory = self.policy.resolve(cwd, must_exist=True)
+        validated_shared = self.validate_workspace_root(shared_root)
+        await self.ensure_workspace(agent_id, shared_root=validated_shared)
+        working_directory = self._resolve_shell_cwd(
+            agent_id, cwd, shared_root=validated_shared
+        )
         if not working_directory.is_dir():
             raise self._error(
                 "validation", "not_a_directory", "Shell cwd is not a directory"
@@ -366,6 +693,12 @@ class ShellTaskManager:
                 "validation",
                 "offline_install_blocked",
                 "Package-manager and network installer commands are disabled in the offline runtime",
+            )
+        if _CONTAINER_CONTROL_PATTERN.search(command) or _CONTAINER_SOCKET_PATTERN.search(command):
+            raise self._error(
+                "permission",
+                "container_control_blocked",
+                "Host container-engine control is outside the Agent target scope",
             )
         owner = await self.service.get_agent_runtime(self.run_id, agent_id)
         if owner["agent"]["status"] in {
@@ -381,19 +714,28 @@ class ShellTaskManager:
                 "Finished Agent cannot start a Shell task",
             )
 
-        owner_root, home_dir, temp_dir, task_dir = self._owner_directories(agent_id)
-        for directory in (owner_root, home_dir, temp_dir, task_dir, home_dir / ".config"):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._prepare_offline_home(home_dir)
+        owner_root, home_dir, temp_dir, task_dir, work_dir = self._owner_directories(agent_id)
         task_id = f"task-{uuid.uuid4().hex}"
         output_path = task_dir / f"{task_id}.log"
         output_path.touch(mode=0o600, exist_ok=False)
         process: asyncio.subprocess.Process | None = None
         try:
+            self.sandbox.prepare()
             process = await asyncio.create_subprocess_exec(
-                *self.sandbox.command(command, working_directory, temp_dir),
+                *self.sandbox.command(
+                    command,
+                    working_directory,
+                    temp_dir,
+                    write_paths=(work_dir, home_dir, temp_dir, task_dir, validated_shared or work_dir),
+                ),
                 cwd=str(working_directory),
-                env=self._safe_environment(home_dir, temp_dir, working_directory),
+                env=self._safe_environment(
+                    home_dir,
+                    temp_dir,
+                    working_directory,
+                    work_dir=work_dir,
+                    shared_root=validated_shared,
+                ),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -416,7 +758,7 @@ class ShellTaskManager:
                 task_id=task_id,
                 pid=process.pid,
                 process_started_at=process_started_at,
-                cwd=self.policy.relative(working_directory),
+                cwd=self._cwd_label(cwd, working_directory),
                 temp_dir=self.policy.relative(temp_dir),
                 output_path=self.policy.relative_lexical(output_path),
                 capture_limit=min(max_output_chars, MAX_PERSISTED_OUTPUT_CHARS),
@@ -572,7 +914,16 @@ class ShellTaskManager:
             for row in rows:
                 if row["status"] == "running":
                     await self._finish_persisted(row, status="stopped")
+            work_dir = self.agent_work_root(agent_id)
+            had_work = work_dir.exists()
             await asyncio.to_thread(self._remove_tree, self._owner_root(agent_id))
+            if had_work:
+                await self.record_workspace_event(
+                    agent_id,
+                    "agent_workspace_cleaned",
+                    {"path_class": "agent_work"},
+                )
+            self._workspace_ready.discard(agent_id)
             await self._mark_rows_cleaned(rows, reason="agent_terminal")
 
     async def finish_run(self) -> None:
@@ -847,9 +1198,15 @@ class ShellTaskManager:
 
     def _owner_directories(
         self, agent_id: str
-    ) -> tuple[Path, Path, Path, Path]:
+    ) -> tuple[Path, Path, Path, Path, Path]:
         owner_root = self._owner_root(agent_id)
-        return owner_root, owner_root / "home", owner_root / "tmp", owner_root / "tasks"
+        return (
+            owner_root,
+            owner_root / "home",
+            owner_root / "tmp",
+            owner_root / "tasks",
+            owner_root / "work",
+        )
 
     def _owner_root(self, agent_id: str) -> Path:
         return self.runtime_root / "agents" / self._component(agent_id, "agent_id")
@@ -866,7 +1223,13 @@ class ShellTaskManager:
         return output_path
 
     def _safe_environment(
-        self, home_dir: Path, temp_dir: Path, working_directory: Path
+        self,
+        home_dir: Path,
+        temp_dir: Path,
+        working_directory: Path,
+        *,
+        work_dir: Path,
+        shared_root: Path | None,
     ) -> dict[str, str]:
         venv_bin = self.environment.get("AION_VENV_BIN", "")
         toolchain_bin = self.environment.get("AION_TOOLCHAIN_BIN", "")
@@ -886,6 +1249,9 @@ class ShellTaskManager:
         ]
         environment = {
             "HOME": str(home_dir),
+            "AION_AGENT_WORKDIR": str(work_dir),
+            "AION_SHARED_WORKDIR": str(shared_root or ""),
+            "AION_PROJECT_ROOT": str(self.policy.root),
             "TMPDIR": str(temp_dir),
             "TMP": str(temp_dir),
             "TEMP": str(temp_dir),
@@ -900,7 +1266,77 @@ class ShellTaskManager:
             "LOGNAME": "sandbox",
         }
         environment.update(self.environment)
+        environment.update(
+            {
+                "AION_AGENT_WORKDIR": str(work_dir),
+                "AION_SHARED_WORKDIR": str(shared_root or ""),
+                "AION_PROJECT_ROOT": str(self.policy.root),
+            }
+        )
         return environment
+
+    def _resolve_shell_cwd(
+        self,
+        agent_id: str,
+        raw_cwd: str,
+        *,
+        shared_root: Path | None,
+    ) -> Path:
+        if not isinstance(raw_cwd, str) or not raw_cwd or "\x00" in raw_cwd:
+            raise self._error("validation", "invalid_path", "Shell cwd must be a non-empty string")
+        work_dir = self.agent_work_root(agent_id)
+        path = Path(raw_cwd).expanduser()
+        if not path.is_absolute() and raw_cwd in {".", "agent"}:
+            return work_dir
+        if not path.is_absolute() and (raw_cwd == "shared" or raw_cwd.startswith("shared/")):
+            if shared_root is None:
+                raise self._error(
+                    "permission",
+                    "shared_workspace_unavailable",
+                    "The shared Agent workspace is not available",
+                )
+            suffix = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+            return self._resolve_shell_subpath(shared_root, suffix)
+        if not path.is_absolute() and (raw_cwd == "project" or raw_cwd.startswith("project/")):
+            suffix = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+            return self._resolve_shell_subpath(self.policy.root, suffix)
+        if not path.is_absolute() and (raw_cwd.startswith("agent/") or raw_cwd == "agent"):
+            suffix = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
+            return self._resolve_shell_subpath(work_dir, suffix)
+        base = self.policy.root if path.is_absolute() else work_dir
+        return self._resolve_shell_subpath(base, path)
+
+    def _resolve_shell_subpath(self, base: Path, suffix: Path) -> Path:
+        base = base.resolve(strict=False)
+        candidate = Path(os.path.abspath(os.path.normpath(base / suffix)))
+        try:
+            candidate.relative_to(base)
+        except ValueError as exc:
+            raise self._error(
+                "permission",
+                "workspace_path_rejected",
+                "Shell cwd cannot escape its assigned workspace",
+            ) from exc
+        resolved = self.policy.resolve(candidate, must_exist=True)
+        try:
+            resolved.relative_to(base)
+        except ValueError as exc:
+            raise self._error(
+                "permission",
+                "workspace_path_rejected",
+                "Shell cwd cannot resolve outside its assigned workspace",
+            ) from exc
+        if not resolved.is_dir():
+            raise self._error("validation", "not_a_directory", "Shell cwd is not a directory")
+        return resolved
+
+    def _cwd_label(self, raw_cwd: str, working_directory: Path) -> str:
+        if raw_cwd in {"", "."}:
+            return "."
+        try:
+            return self.policy.relative(working_directory)
+        except SystemToolError:
+            return raw_cwd
 
     @staticmethod
     def _prepare_offline_home(home_dir: Path) -> None:

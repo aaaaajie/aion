@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-from typing import Awaitable, TypeVar
+from typing import Any, Awaitable, TypeVar
 from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,13 +20,12 @@ from agent.config import AgentSettings
 from agent.prompts import load_prompt
 from agent.runtime import AgentRuntime, RuntimePausedError
 from challenges_sdk import ChallengesClient, ChallengesSettings
-from scripts.network_manager import VPNManager, discover_vpn_config
-from scripts.runtime_web import RuntimeMonitor
 from tools.benchmark import BenchmarkTools
 
 
 DEFAULT_WAIT_SECONDS = 0.0
-DEFAULT_MONITOR_PORT = 8765
+RUNTIME_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+VPN_SHUTDOWN_TIMEOUT_SECONDS = 8.0
 _T = TypeVar("_T")
 PAUSE_SIGNAL = getattr(signal, "SIGUSR1", None)
 
@@ -47,9 +46,34 @@ def _read_benchmark_token(path: Path) -> str:
     return value
 
 
-def _benchmark_from_token(token: str) -> BenchmarkTools:
+def _read_benchmark_token_from_environment() -> str:
+    """Read the platform-injected benchmark token without logging or fallback."""
+
+    value = os.environ.get("BENCHMARK_TOKEN")
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError(
+            "BENCHMARK_TOKEN must contain exactly one non-empty environment value"
+        )
+    return value
+
+
+def _benchmark_from_token(
+    token: str, agent_settings: AgentSettings | None = None
+) -> BenchmarkTools:
     settings = ChallengesSettings(benchmark_token=token)
-    return BenchmarkTools(ChallengesClient.from_settings(settings))
+    if agent_settings is None:
+        return BenchmarkTools(ChallengesClient.from_settings(settings))
+    from tools.benchmark.recovery import BenchmarkLLMRecovery
+
+    recoverer = BenchmarkLLMRecovery(agent_settings)
+    return BenchmarkTools(
+        ChallengesClient.from_settings(
+            settings,
+            response_recoverer=recoverer,
+            contract_recoverer=recoverer,
+        ),
+        response_recoverer=recoverer,
+    )
 
 
 def _openvpn_requires_sudo() -> bool:
@@ -126,6 +150,33 @@ def _signal_result(received: int | None) -> tuple[int, str]:
     return 130, "online Runtime interrupted"
 
 
+async def _bounded_shutdown(operation: Awaitable[Any], label: str, timeout: float) -> None:
+    """Keep systemd shutdown below its stop window while preserving best effort cleanup."""
+
+    try:
+        await asyncio.wait_for(operation, timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[online] shutdown: {label} exceeded {timeout:g}s", flush=True)
+    except Exception as exc:
+        print(f"[online] shutdown: {label} failed: {type(exc).__name__}", flush=True)
+
+
+async def _mark_runtime_interrupted(runtime: AgentRuntime, reason: str) -> None:
+    """Persist a terminal stop state before resource cleanup can detach the service."""
+
+    service = runtime.state_service
+    if service is None or runtime.run_id is None:
+        return
+    try:
+        await service.finish_run(
+            runtime.run_id,
+            "interrupted",
+            report={"type": "runtime_interrupted", "summary": reason[:500]},
+        )
+    except Exception as exc:
+        print(f"[online] state: interrupt mark failed: {type(exc).__name__}", flush=True)
+
+
 def _write_current_run(path: Path, run_id: str) -> None:
     target = path.expanduser().resolve()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -160,25 +211,35 @@ async def run_online(
     *,
     run_id: str,
     resume: bool,
-    benchmark_token_file: Path,
+    benchmark_token_file: Path | None,
+    hosted: bool,
     vpn_config: Path | None,
     workspace_root: Path,
     run_root: Path | None,
     wait_seconds: float,
-    monitor_enabled: bool,
-    monitor_port: int,
-    monitor_exit_on_complete: bool,
     current_run_file: Path | None,
 ) -> int:
-    token = _read_benchmark_token(benchmark_token_file)
+    if hosted:
+        token = _read_benchmark_token_from_environment()
+    else:
+        if benchmark_token_file is None:
+            raise ValueError("--benchmark-token-file is required outside hosted mode")
+        token = _read_benchmark_token(benchmark_token_file)
     settings = AgentSettings()
     workspace = workspace_root.expanduser().resolve()
-    state_root = (run_root or settings.run_root).expanduser().resolve()
+    state_root = (
+        run_root or workspace / ".aion" / "runs"
+    ).expanduser().resolve()
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    config_path = discover_vpn_config(PROJECT_ROOT, vpn_config)
-    vpn = VPNManager(config_path, use_sudo=_openvpn_requires_sudo())
-    benchmark = _benchmark_from_token(token)
+    vpn: Any | None = None
+    config_path: Path | None = None
+    if not hosted:
+        from scripts.network_manager import VPNManager, discover_vpn_config
+
+        config_path = discover_vpn_config(PROJECT_ROOT, vpn_config)
+        vpn = VPNManager(config_path, use_sudo=_openvpn_requires_sudo())
+    benchmark = _benchmark_from_token(token, settings)
     del token
     runtime = AgentRuntime(
         settings,
@@ -187,15 +248,18 @@ async def run_online(
         project_root=workspace,
         run_root=state_root,
     )
-    monitor: RuntimeMonitor | None = None
-    monitor_started = False
     result_code = 1
     result_message = "online Runtime did not complete"
     interrupted = False
+    interrupted_reason: str | None = None
     stop_event = asyncio.Event()
     signal_state, installed_signals = _install_signal_handlers(stop_event)
     try:
-        print(f"[online] vpn: starting with {config_path}", flush=True)
+        if hosted:
+            print("[hosted] network: using platform-provided network", flush=True)
+        else:
+            assert vpn is not None and config_path is not None
+            print(f"[online] vpn: starting with {config_path}", flush=True)
         phase, chief_id = await _wait_for_operation(
             runtime.start(
                 load_prompt("chief_agent.txt"), run_id=run_id, resume=resume
@@ -205,21 +269,17 @@ async def run_online(
         if phase == "stopped":
             interrupted = True
             result_code, result_message = _signal_result(signal_state["signal"])
+            interrupted_reason = result_message
             print(f"[online] result: {result_message}", flush=True)
             return result_code
         assert chief_id is not None
         await runtime.ensure_healthy()
         if current_run_file is not None:
             _write_current_run(current_run_file, run_id)
-        print(f"[online] vpn: connected pid={vpn.status.pid}", flush=True)
+        if vpn is not None:
+            print(f"[online] vpn: connected pid={vpn.status.pid}", flush=True)
         print(f"[online] run_id: {run_id}", flush=True)
         print(f"[online] chief_agent_id: {chief_id}", flush=True)
-
-        if monitor_enabled:
-            state_path = state_root / run_id / "state.sqlite3"
-            monitor = RuntimeMonitor(state_path, run_id, port=monitor_port)
-            print(f"[online] web monitor: {monitor.start()}", flush=True)
-            monitor_started = True
 
         phase, _ = await _wait_for_operation(
             runtime.wait(chief_id),
@@ -232,9 +292,11 @@ async def run_online(
         elif phase == "timeout":
             result_code = 124
             result_message = f"online Runtime reached the {wait_seconds:g}s deadline"
+            interrupted_reason = result_message
         else:
             interrupted = True
             result_code, result_message = _signal_result(signal_state["signal"])
+            interrupted_reason = result_message
         print(f"[online] result: {result_message}", flush=True)
     except RuntimePausedError as exc:
         result_code = 0
@@ -268,20 +330,19 @@ async def run_online(
             PAUSE_SIGNAL is not None
             and signal_state["signal"] == int(PAUSE_SIGNAL)
         )
+        if not pause_requested and interrupted_reason is not None:
+            await _mark_runtime_interrupted(runtime, interrupted_reason)
         if pause_requested:
-            await runtime.pause()
+            await _bounded_shutdown(
+                runtime.pause(), "runtime pause", RUNTIME_SHUTDOWN_TIMEOUT_SECONDS
+            )
         else:
-            await runtime.close()
-        print("[online] vpn: stopped", flush=True)
-        if monitor_started and monitor is not None:
-            try:
-                monitor.freeze(result_code, message=result_message)
-                print(f"[online] web monitor frozen: {monitor.url}", flush=True)
-                if not monitor_exit_on_complete and not interrupted:
-                    print("[online] waiting for SIGINT or SIGTERM", flush=True)
-                    await stop_event.wait()
-            finally:
-                monitor.close()
+            await _bounded_shutdown(
+                runtime.close(), "runtime close", RUNTIME_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        if vpn is not None:
+            await _bounded_shutdown(vpn.close(), "vpn close", VPN_SHUTDOWN_TIMEOUT_SECONDS)
+            print("[online] vpn: stopped", flush=True)
         _remove_signal_handlers(installed_signals)
     return result_code
 
@@ -290,11 +351,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the production AION Runtime against the online Benchmark"
     )
-    parser.add_argument(
+    token_source = parser.add_mutually_exclusive_group(required=True)
+    token_source.add_argument(
         "--benchmark-token-file",
         type=Path,
-        required=True,
         help="file containing exactly one BENCHMARK_TOKEN value",
+    )
+    token_source.add_argument(
+        "--hosted",
+        action="store_true",
+        help="use platform-injected environment variables and skip OpenVPN",
     )
     parser.add_argument(
         "--run-id",
@@ -324,7 +390,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-root",
         type=Path,
-        help="persistent Runtime state root; defaults to AgentSettings.run_root",
+        help="persistent Runtime state root; defaults to <workspace-root>/.aion/runs",
     )
     parser.add_argument(
         "--current-run-file",
@@ -337,22 +403,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WAIT_SECONDS,
         help="maximum online Runtime time; 0 waits until completion (default: 0)",
     )
-    parser.add_argument(
-        "--no-monitor",
-        action="store_true",
-        help="disable the local read-only web monitor",
-    )
-    parser.add_argument(
-        "--monitor-port",
-        type=int,
-        default=DEFAULT_MONITOR_PORT,
-        help=f"localhost monitor port (default: {DEFAULT_MONITOR_PORT})",
-    )
-    parser.add_argument(
-        "--monitor-exit-on-complete",
-        action="store_true",
-        help="exit instead of holding the frozen monitor after completion",
-    )
     return parser
 
 
@@ -361,8 +411,8 @@ async def async_main() -> int:
     args = parser.parse_args()
     if args.wait_seconds < 0:
         parser.error("--wait-seconds must not be negative")
-    if not 0 <= args.monitor_port <= 65535:
-        parser.error("--monitor-port must be between 0 and 65535")
+    if args.hosted and args.vpn_config is not None:
+        parser.error("--vpn-config cannot be used with --hosted")
     if args.launch_config_file is not None and (args.resume or args.run_id):
         parser.error("--launch-config-file cannot be combined with --resume or --run-id")
     if args.resume and not args.run_id:
@@ -377,13 +427,11 @@ async def async_main() -> int:
             run_id=run_id,
             resume=resume,
             benchmark_token_file=args.benchmark_token_file,
+            hosted=args.hosted,
             vpn_config=args.vpn_config,
             workspace_root=args.workspace_root,
             run_root=args.run_root,
             wait_seconds=args.wait_seconds,
-            monitor_enabled=not args.no_monitor,
-            monitor_port=args.monitor_port,
-            monitor_exit_on_complete=args.monitor_exit_on_complete,
             current_run_file=args.current_run_file,
         )
     except ValueError as exc:

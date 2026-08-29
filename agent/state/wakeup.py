@@ -17,9 +17,16 @@ class StateSignalBus:
 
     async def notify(self, key: str, sequence: int) -> int:
         async with self._condition:
-            self._generations[key] = max(self._generations[key], sequence)
+            current = self._generations[key]
+            if sequence <= current:
+                # Signals are durable generations, not edge-triggered events.
+                # Re-notifying an already observed sequence only wakes idle
+                # consumers again and can turn an idempotent checkpoint into a
+                # duplicate model turn.
+                return current
+            self._generations[key] = sequence
             self._condition.notify_all()
-            return self._generations[key]
+            return sequence
 
     async def wait(self, key: str, after_sequence: int, timeout: float) -> int:
         async with self._condition:

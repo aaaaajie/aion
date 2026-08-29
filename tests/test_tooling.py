@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.runner import AgentRunner
+from agent.subagents.models import ChallengeDispatchArguments, ExecutionReport
 from agent.tooling import (
     AccessClaim,
     ToolExecutor,
@@ -18,6 +20,7 @@ from agent.tooling import (
     ToolResultStore,
     ToolSpec,
     PreparedToolCall,
+    serialize_tool_arguments,
     tool_error,
 )
 
@@ -94,6 +97,81 @@ def test_probe_argument_recovery_budget_allows_one_correction() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_executor_accepts_synchronous_and_async_handlers() -> None:
+    def synchronous_handler(arguments: BaseModel) -> dict[str, Any]:
+        return {"value": arguments.value}
+
+    executor = ToolExecutor(ToolRegistry([Provider(synchronous_handler)]))
+    result = (await executor.execute([call("test_tool", '{"value":1}', "sync")]))[0]
+
+    assert result.result == {"ok": True, "data": {"value": 1}}
+
+
+def test_best_effort_tool_arguments_serialize_without_pydantic_warnings() -> None:
+    dispatch = ChallengeDispatchArguments.model_validate(
+        {"summary": "dispatch", "tasks": [{"objective": "collect baseline"}]}
+    )
+    report = ExecutionReport.model_validate(
+        {
+            "status": "completed",
+            "summary": "done",
+            "findings": [{"summary": "a finding", "evidence_refs": []}],
+        }
+    )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        dispatch_payload = serialize_tool_arguments(dispatch)
+        report_payload = serialize_tool_arguments(report)
+    assert not [
+        item for item in captured if "PydanticSerialization" in str(item.message)
+    ]
+    assert dispatch_payload["tasks"] == [{"objective": "collect baseline"}]
+    assert report_payload["findings"] == [
+        {"summary": "a finding", "evidence_refs": []}
+    ]
+
+
+def test_probe_argument_recovery_rejects_an_exact_duplicate() -> None:
+    runner = AgentRunner.__new__(AgentRunner)
+    runner._probe_argument_failure_streak = 0
+    runner._probe_recovery_exhausted = False
+    runner._probe_invalid_argument_digest = None
+    first = PreparedToolCall(
+        0,
+        "first",
+        "system_http_probe",
+        10,
+        raw_arguments_digest="same-invalid-call",
+        result=tool_error(
+            "schema",
+            "invalid_arguments",
+            "invalid",
+            retry_allowed=True,
+            retry_action="rewrite_arguments",
+        ),
+    )
+    runner._apply_probe_recovery_budget([first])
+    duplicate = PreparedToolCall(
+        0,
+        "duplicate",
+        "system_http_probe",
+        10,
+        raw_arguments_digest="same-invalid-call",
+        result=tool_error(
+            "schema",
+            "invalid_arguments",
+            "invalid",
+            retry_allowed=True,
+            retry_action="rewrite_arguments",
+        ),
+    )
+    runner._apply_probe_recovery_budget([duplicate])
+    assert duplicate.result["error"]["code"] == "probe_argument_recovery_exhausted"
+    assert duplicate.result["error"]["details"]["same_arguments"] is True
+    assert duplicate.result["error"]["retry"]["allowed"] is False
+
+
+@pytest.mark.asyncio
 async def test_invalid_json_and_schema_errors_never_reach_handler() -> None:
     calls = 0
 
@@ -112,6 +190,8 @@ async def test_invalid_json_and_schema_errors_never_reach_handler() -> None:
     assert calls == 0
     assert invalid_json.result["error"]["stage"] == "parse"
     assert invalid_json.result["error"]["code"] == "invalid_json"
+    assert invalid_json.result["error"]["details"]["json_error"]
+    assert invalid_json.result["error"]["retry"]["tool"] == "test_tool"
     assert invalid_json.result["error"]["details"]["required"] == ["value"]
     assert invalid_schema.result["error"]["stage"] == "schema"
     paths = {item["path"] for item in invalid_schema.result["error"]["details"]["fields"]}

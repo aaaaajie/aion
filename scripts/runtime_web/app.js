@@ -271,6 +271,12 @@
     return icon;
   }
 
+  function agentIconRole(agent) {
+    if (agent?.kind === "bootstrap") return "bootstrap";
+    if (agent?.kind === "exploration") return "exploration";
+    return agent?.role || "chief";
+  }
+
   function makeSecaiIcon(kind) {
     const icon = svgPart("svg", { viewBox: "0 0 24 24", focusable: "false", "aria-hidden": "true" });
     icon.classList.add("secai-icon");
@@ -375,6 +381,7 @@
     const workStatus = String(challenge.work_status || "").toLowerCase();
     if (challenge.slot_occupied === true && ACTIVE_CHALLENGE_WORK.has(workStatus)) return "机器执行中";
     if (challenge.slot_occupied === true && workStatus === "paused") return "机器已占用 · 已暂停";
+    if (challenge.slot_occupied !== true && workStatus === "paused") return "暂停且靶机已释放";
     if (challenge.slot_occupied === true) return "机器已占用";
     return "机器已释放";
   }
@@ -772,7 +779,10 @@
       "#resource-readout",
       `${Number(latestResource.cpu_percent || 0).toFixed(0)}% / ${Number(latestResource.memory_percent || 0).toFixed(0)}%`,
     );
-    setText("#monitor-status", monitor.mode === "frozen" ? `已冻结 · ${monitor.test_result || "结束"}` : "实时观测");
+    const frozenLabel = monitor.message?.includes("read-only")
+      ? "已停止 · 只读"
+      : `已冻结 · ${monitor.test_result || "结束"}`;
+    setText("#monitor-status", monitor.mode === "frozen" ? frozenLabel : "实时观测");
     setText("#captured-at", monitor.captured_at ? `更新 ${clock(monitor.captured_at)}` : "—");
     $("#run-status-dot").className = stateTone(run.status);
     setText("#mobile-agent-count", allAgents().length, "0");
@@ -879,7 +889,7 @@
     row.setAttribute("role", "treeitem");
     row.setAttribute("aria-label", `${displayName(agent)}，${statusLabel(agent.status)}，${agentStartLabel(agent)}`);
     const robot = make("span", "robot-slot");
-    robot.append(makeAgentIcon("execution", agentIconStatus(agent)));
+    robot.append(makeAgentIcon(agentIconRole(agent), agentIconStatus(agent)));
     const copy = make("span", "execution-copy");
     copy.append(make("strong", "", displayName(agent)), make("small", "", short(agent.mission || agent.agent_id, 34)));
     const unread = state.unreadByAgent.get(agent.agent_id) || 0;
@@ -909,6 +919,7 @@
     if (agent.status === "queued" || agent.status === "pending") return { label: "排队中", tone: "warn", spinning: true };
     if (agent.status === "starting") return { label: "启动中", tone: "warn", spinning: true };
     if (TERMINAL.has(agent.status)) return { label: statusLabel(agent.status), tone: stateTone(agent.status), spinning: false };
+    if (agent.kind === "bootstrap") return { label: "后台探索中", tone: "good", spinning: true };
     const latest = [...events].reverse().find((event) => event.event_type !== "agent_heartbeat");
     if (!latest) return { label: "思考中", tone: "good", spinning: true };
     if (latest.event_type === "tool_call") return { label: "调用工具", tone: "good", spinning: true };
@@ -924,7 +935,7 @@
     const events = selectedEvents();
     const thinking = thinkingStatus(agent, events);
     const avatar = $("#selected-avatar");
-    avatar.replaceChildren(makeAgentIcon(agent?.role || "chief", agentIconStatus(agent)));
+    avatar.replaceChildren(makeAgentIcon(agentIconRole(agent), agentIconStatus(agent)));
     setText("#selected-role", agent ? `${agentRoleLabel(agent)} · ${agent.unique_code || "全局"}` : "未选择 Agent");
     setText("#selected-name", agent ? displayName(agent) : "选择左侧 Agent");
     setText("#selected-mission", agent ? short(agentMission(agent) || agent.agent_id, 110) : "选择后显示该 Agent 的任务、思考和工具活动");
@@ -2128,7 +2139,7 @@
     const challenge = (state.snapshot.challenges || []).find((item) => item.unique_code === agent.unique_code);
     const identity = make("div", "identity-card");
     const identityAvatar = make("span", "robot-slot identity-avatar");
-    identityAvatar.append(makeAgentIcon(agent.role, agentIconStatus(agent)));
+    identityAvatar.append(makeAgentIcon(agentIconRole(agent), agentIconStatus(agent)));
     identity.append(identityAvatar);
     const copy = make("div", "identity-copy");
     copy.append(make("strong", "", agentRoleLabel(agent)), make("small", "", agent.agent_id));
@@ -2160,6 +2171,7 @@
         ["远端状态", challenge.container_status || "未知"],
         ["工作状态", statusLabel(challenge.work_status)],
         ["槽位", challenge.slot_occupied === true ? "已占用" : "已释放"],
+        ["Hint", challenge.hint_requested ? "已申请提示" : challenge.hint_signal?.eligible ? "可申请提示" : "暂不可申请"],
       ]));
       const addressBlock = make("section", "detail-block");
       addressBlock.append(make("p", "detail-label", "目标地址"));

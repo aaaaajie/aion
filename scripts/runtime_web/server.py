@@ -97,7 +97,36 @@ def _run(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _challenge(row: sqlite3.Row) -> dict[str, Any]:
+def _challenge(row: sqlite3.Row, run_row: sqlite3.Row | None = None) -> dict[str, Any]:
+    signal = {
+        "eligible": bool(row["hint_eligible"] and not row["hint_requested"]),
+        "reason": None,
+        "no_progress_seconds": 0,
+        "run_elapsed_seconds": 0,
+        "remaining_seconds": None,
+    }
+    if run_row is not None:
+        now = datetime.now(timezone.utc)
+        started = datetime.fromisoformat(str(run_row["started_at"]).replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(str(run_row["deadline_at"]).replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        signal["run_elapsed_seconds"] = max(0, int((now - started).total_seconds()))
+        signal["remaining_seconds"] = max(0, int((deadline - now).total_seconds()))
+        baseline = row["last_progress_at"] or row["active_since"] or run_row["started_at"]
+        baseline_at = datetime.fromisoformat(str(baseline).replace("Z", "+00:00"))
+        if baseline_at.tzinfo is None:
+            baseline_at = baseline_at.replace(tzinfo=timezone.utc)
+        signal["no_progress_seconds"] = max(0, int((now - baseline_at).total_seconds()))
+        if signal["eligible"]:
+            if signal["remaining_seconds"] <= 30 * 60:
+                signal["reason"] = "final_30_minutes"
+            elif row["pause_reason"] == "stagnation_timeout":
+                signal["reason"] = "hard_stagnation"
+            elif row["stagnation_level"]:
+                signal["reason"] = "low_yield"
     return {
         "run_id": row["run_id"],
         "unique_code": row["unique_code"],
@@ -112,10 +141,13 @@ def _challenge(row: sqlite3.Row) -> dict[str, Any]:
         "container_status": row["container_status"],
         "slot_occupied": container_slot_occupied(row["container_status"]),
         "container_addr": _redact(_json_load(row["container_addr"], [])),
+        "direction": row["direction"] if "direction" in row.keys() else "unknown",
         "work_status": row["work_status"],
+        "pause_reason": row["pause_reason"],
         "low_yield": bool(row["stagnation_level"]),
         "hint_eligible": bool(row["hint_eligible"]),
         "hint_requested": bool(row["hint_requested"]),
+        "hint_signal": signal,
         "exploration_seconds": row["exploration_seconds"],
         "active_since": _iso(row["active_since"]),
         "last_progress_at": _iso(row["last_progress_at"]),
@@ -337,7 +369,7 @@ class _ReadOnlyStore:
 
             run = _run(run_row)
             challenges = [
-                _challenge(row)
+                _challenge(row, run_row)
                 for row in connection.execute(
                     "SELECT * FROM challenges WHERE run_id = ? ORDER BY unique_code",
                     (self.run_id,),
@@ -612,6 +644,29 @@ class RuntimeMonitor:
         if self._poll_thread is not None and self._poll_thread is not threading.current_thread():
             self._poll_thread.join(timeout=2.0)
 
+    def resume(self) -> None:
+        """Resume polling the same run after the Runtime becomes active again."""
+
+        with self._lock:
+            if self._server is None:
+                raise RuntimeError("RuntimeMonitor has not started")
+            self._state = _MonitorState()
+            self._stop.clear()
+        self._refresh()
+        if self._poll_thread is None or not self._poll_thread.is_alive():
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop,
+                name=f"aion-monitor-poll-{self.run_id}",
+                daemon=True,
+            )
+            self._poll_thread.start()
+        LOGGER.info("monitor_resumed run_id=%s", self.run_id)
+
+    @property
+    def frozen(self) -> bool:
+        with self._lock:
+            return self._state.mode == "frozen"
+
     def close(self) -> None:
         LOGGER.info("monitor_closing run_id=%s", self.run_id)
         self._stop.set()
@@ -727,7 +782,13 @@ class RuntimeMonitor:
                         self._send_file("app.js", "text/javascript; charset=utf-8", send_body)
                     elif path == "/assets/styles.css":
                         self._send_file("styles.css", "text/css; charset=utf-8", send_body)
-                    elif path in {"/assets/Challenge.svg", "/assets/Chief.svg", "/assets/Execution.svg"}:
+                    elif path in {
+                        "/assets/Challenge.svg",
+                        "/assets/Chief.svg",
+                        "/assets/Execution.svg",
+                        "/assets/gongji.svg",
+                        "/assets/yewutansuo.svg",
+                    }:
                         self._send_file(Path(path).name, "image/svg+xml", send_body)
                     elif path == "/api/snapshot":
                         after = self._int_param(params, "after_sequence", 0)

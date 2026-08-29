@@ -37,6 +37,7 @@ include = ["challenges_sdk*", "tools*", "agent*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "live: requires BENCHMARK credentials and a working VPN connection",

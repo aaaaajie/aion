@@ -176,6 +176,9 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
     frozen = _get_json(f"{url}api/snapshot")
     assert frozen["monitor"]["mode"] == "frozen"
     assert frozen["monitor"]["test_code"] == 0
+    monitor.resume()
+    resumed = _get_json(f"{url}api/snapshot")
+    assert resumed["monitor"]["mode"] == "live"
     monitor.close()
 
 

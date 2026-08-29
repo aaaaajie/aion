@@ -22,16 +22,19 @@ from typing import Any, Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VPS_HOST = "vps.example.invalid"
-VPS_USER = "root"
-VPS_KEY = Path("<ssh-key-path>")
-KNOWN_HOSTS = PROJECT_ROOT / "deploy" / "vps_known_hosts"
-SSH_TARGET = f"{VPS_USER}@{VPS_HOST}"
+VPS_HOST = os.environ.get("AION_VPS_HOST", "")
+VPS_USER = os.environ.get("AION_VPS_USER", "")
+VPS_KEY_VALUE = os.environ.get("AION_VPS_KEY", "")
+VPS_KEY = Path(VPS_KEY_VALUE) if VPS_KEY_VALUE else Path()
+KNOWN_HOSTS_VALUE = os.environ.get("AION_VPS_KNOWN_HOSTS", "")
+KNOWN_HOSTS = Path(KNOWN_HOSTS_VALUE) if KNOWN_HOSTS_VALUE else Path()
+SSH_TARGET = f"{VPS_USER}@{VPS_HOST}" if VPS_USER and VPS_HOST else ""
 APP_ROOT = Path("/opt/aion")
 RUN_ROOT = Path("/var/lib/aion/runs")
 VPN_CONFIG = Path("/etc/aion/vpn/benchmark.ovpn")
 LOCAL_LOG_ROOT = PROJECT_ROOT / ".aion" / "remote-logs"
 RUNS_SHARE_ROOT = "/opt/aion/runs-share"
+RUNS_SHARE_URL = os.environ.get("AION_RUNS_SHARE_URL", "")
 RUNS_SHARE_SERVICE = "aion-runs.service"
 SOURCE_NAMES = (
     "agent",
@@ -113,6 +116,11 @@ def _decode(completed: subprocess.CompletedProcess[bytes]) -> str:
 def _validate_local_access() -> None:
     if os.geteuid() == 0:
         raise OperatorError("run aion-vps as the local workspace user, not root")
+    if not VPS_HOST or not VPS_USER or not VPS_KEY_VALUE or not KNOWN_HOSTS_VALUE:
+        raise OperatorError(
+            "set AION_VPS_HOST, AION_VPS_USER, AION_VPS_KEY, and "
+            "AION_VPS_KNOWN_HOSTS before using aion-vps"
+        )
     if not VPS_KEY.is_file() or not os.access(VPS_KEY, os.R_OK):
         raise OperatorError(f"SSH key is not readable: {VPS_KEY}")
     if not KNOWN_HOSTS.is_file() or not os.access(KNOWN_HOSTS, os.R_OK):
@@ -183,6 +191,7 @@ def _local_verify() -> None:
             str(PROJECT_ROOT / "deploy" / "aionctl"),
             str(PROJECT_ROOT / "deploy" / "release_manager.py"),
             str(PROJECT_ROOT / "scripts" / "online_runtime.py"),
+            str(PROJECT_ROOT / "scripts" / "runtime_monitor.py"),
             str(PROJECT_ROOT / "scripts" / "export_run_bundle.py"),
             str(PROJECT_ROOT / "scripts" / "runs_download_server.py"),
         ],
@@ -238,14 +247,20 @@ def _remote_state() -> dict[str, Any]:
         raise OperatorError("remote state response was invalid") from exc
 
 
-def _remote_doctor() -> None:
+def _remote_doctor(*, require_monitor_service: bool = False) -> None:
+    monitor_check = (
+        "test -f /etc/systemd/system/aion-monitor.service; "
+        if require_monitor_service
+        else ""
+    )
     script = (
         "set -euo pipefail; "
         "python3 -c 'import sys; raise SystemExit(sys.version_info[:2] != (3,11))'; "
         "command -v openvpn >/dev/null; command -v bwrap >/dev/null; "
         "command -v nginx >/dev/null; "
-        "test -d /etc/aion; test -d /var/lib/aion/workspace; "
-        "test -d /var/lib/aion/runs; nginx -t >/dev/null"
+        + monitor_check
+        + "test -d /etc/aion; test -d /var/lib/aion/workspace; "
+        + "test -d /var/lib/aion/runs; nginx -t >/dev/null"
     )
     _ssh(["bash", "-lc", script])
 
@@ -506,7 +521,7 @@ def _deploy(token: str, vpn: Path | None) -> None:
             ):
                 raise OperatorError("one or more running challenge containers were lost")
             _verify_token_absent(token)
-        _remote_doctor()
+        _remote_doctor(require_monitor_service=True)
         if _package_hash() != package_hash:
             raise OperatorError("routine deployment changed the host package manifest")
         _commit_release(release_id)
@@ -731,7 +746,10 @@ if target.is_file() and not backup.exists():
     run_after = (after.get("run") or {}).get("run_id")
     if not after.get("active") or run_after != run_before:
         raise OperatorError("AION Runtime changed while enabling runs-share")
-    print("runs-share: https://vps.example.invalid:8443/runs/")
+    if RUNS_SHARE_URL:
+        print(f"runs-share: {RUNS_SHARE_URL.rstrip('/')}/runs/")
+    else:
+        print("runs-share: set AION_RUNS_SHARE_URL to display the public URL")
     print(f"runs-share: user={username}")
     print(f"runs-share: current run={run_after}")
 

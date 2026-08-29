@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -55,6 +57,9 @@ from .path_probe import (
 
 ResourceGuard = Callable[[str], Awaitable[dict[str, Any]]]
 TERMINAL = {"completed", "failed", "stopped", "interrupted"}
+RECLAIM_HEADROOM_BYTES = 64 * 1024 * 1024
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -208,6 +213,8 @@ class HttpProbeManager:
         engine: HttpInteractionEngine | None = None,
         path_transport: httpx.AsyncBaseTransport | None = None,
         resource_guard: ResourceGuard | None = None,
+        disk_reserve_bytes: int = 1_073_741_824,
+        disk_reserve_percent: float = 5.0,
     ) -> None:
         self.policy = policy
         self.service = service
@@ -215,6 +222,8 @@ class HttpProbeManager:
         self.engine = engine or HttpInteractionEngine(policy)
         self.path_transport = path_transport
         self.resource_guard = resource_guard
+        self.disk_reserve_bytes = max(0, disk_reserve_bytes)
+        self.disk_reserve_percent = max(0.0, disk_reserve_percent)
         self._live: dict[str, LiveInteraction] = {}
         self._analysis_scopes: dict[tuple[str, int], tuple[set[str], str | None]] = {}
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -232,6 +241,7 @@ class HttpProbeManager:
         self._response_size_estimates: dict[
             tuple[str, str | None, int | None], tuple[int, int]
         ] = {}
+        self._reclaim_lock = asyncio.Lock()
         self._closed = False
 
     def bind(self, agent_id: str) -> AgentHttpClient:
@@ -239,6 +249,7 @@ class HttpProbeManager:
 
     async def initialize(self, *, resume: bool = False) -> None:
         await self._remove_orphan_interaction_directories()
+        await self._reclaim_terminal_response_bodies()
         await self._load_response_size_estimates()
         if not resume:
             return
@@ -400,16 +411,9 @@ class HttpProbeManager:
             "expanded_requests": len(requests),
             "url_samples": [item.spec.url for item in requests[:3]],
         }
-        interaction_dir = self._interaction_dir(agent_id, interaction_id)
-        response_dir = interaction_dir / "responses"
-        response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-        for private_dir in (
-            self._agent_root(agent_id),
-            self._agent_root(agent_id) / "http-interactions",
-            interaction_dir,
-            response_dir,
-        ):
-            os.chmod(private_dir, 0o700)
+        interaction_dir, response_dir = await self._create_interaction_directories(
+            agent_id, interaction_id
+        )
         journal = interaction_dir / "results.jsonl"
         journal.touch(mode=0o600, exist_ok=False)
         plan_path = interaction_dir / "plan.json"
@@ -539,16 +543,9 @@ class HttpProbeManager:
             request_group_id=group_id,
         )
         engine = PathProbeEngine(self.policy, options, transport=self.path_transport)
-        interaction_dir = self._interaction_dir(agent_id, interaction_id)
-        response_dir = interaction_dir / "responses"
-        response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-        for private_dir in (
-            self._agent_root(agent_id),
-            self._agent_root(agent_id) / "http-interactions",
-            interaction_dir,
-            response_dir,
-        ):
-            os.chmod(private_dir, 0o700)
+        interaction_dir, response_dir = await self._create_interaction_directories(
+            agent_id, interaction_id
+        )
         journal = interaction_dir / "results.jsonl"
         journal.touch(mode=0o600, exist_ok=False)
         requests_path = interaction_dir / "requests.ndjson"
@@ -681,16 +678,9 @@ class HttpProbeManager:
             1 + (1 if options.include_favicon else 0) if options.passive else 0
         )
         estimated_requests = passive_requests + len(active_paths)
-        interaction_dir = self._interaction_dir(agent_id, interaction_id)
-        response_dir = interaction_dir / "responses"
-        response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-        for private_dir in (
-            self._agent_root(agent_id),
-            self._agent_root(agent_id) / "http-interactions",
-            interaction_dir,
-            response_dir,
-        ):
-            os.chmod(private_dir, 0o700)
+        interaction_dir, response_dir = await self._create_interaction_directories(
+            agent_id, interaction_id
+        )
         journal = interaction_dir / "results.jsonl"
         journal.touch(mode=0o600, exist_ok=False)
         plan_path = interaction_dir / "plan.json"
@@ -758,7 +748,7 @@ class HttpProbeManager:
             else:
                 runner = self._run_execution
             live.execution_task = asyncio.create_task(
-                runner(live, work_id),
+                self._run_with_reclamation(live, runner(live, work_id)),
                 name=f"aion-http-execution-{interaction_id}",
             )
         else:
@@ -775,9 +765,35 @@ class HttpProbeManager:
                 resource_status="running",
             )
             live.analysis_task = asyncio.create_task(
-                self._run_analysis(live, work_id, revision=revision),
+                self._run_with_reclamation(
+                    live,
+                    self._run_analysis(live, work_id, revision=revision),
+                ),
                 name=f"aion-http-analysis-{interaction_id}-{revision}",
             )
+
+    async def _run_with_reclamation(
+        self,
+        live: LiveInteraction,
+        operation: Awaitable[None],
+    ) -> None:
+        cancelled = False
+        try:
+            await operation
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if not cancelled:
+                try:
+                    await self._reclaim_terminal_response_bodies(
+                        exclude_interaction_ids={live.interaction_id}
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "http_body_reclaim_failed run_id=%s trigger=work_finished",
+                        self.run_id,
+                    )
 
     async def output(
         self,
@@ -844,7 +860,14 @@ class HttpProbeManager:
         path = self._response_dir(agent_id, interaction_id) / str(record["body_file"])
         if not path.exists():
             raise self._error(
-                "not_found", "http_response_not_found", "HTTP response body was not found"
+                "not_found",
+                "http_response_body_reclaimed",
+                "HTTP response body was reclaimed under disk pressure",
+                detail={
+                    "interaction_id": interaction_id,
+                    "requested_request_id": request_id,
+                    "recommended_action": "repeat_request_if_still_required",
+                },
             )
         with path.open("rb") as source:
             source.seek(offset_bytes)
@@ -946,26 +969,65 @@ class HttpProbeManager:
                     "request_group_not_found",
                     "Request group was not found in this interaction",
                 )
-            revision = await self._next_analysis_revision(agent_id, interaction_id)
-            self._analysis_scopes[(interaction_id, revision)] = (
-                set(request_ids or []),
-                request_group_id,
+            selected_responses = responses
+            if request_ids:
+                selected = set(request_ids)
+                selected_responses = [
+                    item
+                    for item in selected_responses
+                    if item.get("request_id") in selected
+                ]
+            if request_group_id is not None:
+                selected_responses = [
+                    item
+                    for item in selected_responses
+                    if item.get("request_group_id") == request_group_id
+                ]
+            lock = self._interaction_locks.setdefault(
+                (agent_id, interaction_id), asyncio.Lock()
             )
-            if live is None:
-                live = LiveInteraction(
-                    interaction_id,
-                    agent_id,
-                    self._load_plan(agent_id, interaction_id),
+            async with lock:
+                reclaimed_ids = [
+                    str(item["request_id"])
+                    for item in selected_responses
+                    if item.get("body_file")
+                    and not self._response_body_available(
+                        agent_id, interaction_id, item
+                    )
+                ]
+                if reclaimed_ids:
+                    raise self._error(
+                        "not_found",
+                        "http_response_body_reclaimed",
+                        "HTTP response bodies were reclaimed under disk pressure",
+                        detail={
+                            "interaction_id": interaction_id,
+                            "request_ids": reclaimed_ids[:200],
+                            "recommended_action": "repeat_request_if_still_required",
+                        },
+                    )
+                revision = await self._next_analysis_revision(
+                    agent_id, interaction_id
                 )
-                self._live[interaction_id] = live
-            live.analysis_done.clear()
-            try:
-                await self._queue_analysis(live, revision=revision)
-            except Exception:
-                self._analysis_scopes.pop((interaction_id, revision), None)
-                live.analysis_done.set()
-                live.changed.set()
-                raise
+                self._analysis_scopes[(interaction_id, revision)] = (
+                    set(request_ids or []),
+                    request_group_id,
+                )
+                if live is None:
+                    live = LiveInteraction(
+                        interaction_id,
+                        agent_id,
+                        self._load_plan(agent_id, interaction_id),
+                    )
+                    self._live[interaction_id] = live
+                live.analysis_done.clear()
+                try:
+                    await self._queue_analysis(live, revision=revision)
+                except Exception:
+                    self._analysis_scopes.pop((interaction_id, revision), None)
+                    live.analysis_done.set()
+                    live.changed.set()
+                    raise
         if live is not None:
             await self._wait(live.analysis_done, wait_seconds)
         filters = HttpOutputFilters(
@@ -1103,11 +1165,21 @@ class HttpProbeManager:
             )
             async with lock:
                 current = await self._owned(agent_id, interaction_id)
-                if current["status"] not in TERMINAL:
-                    await self._stop_interaction(agent_id, interaction_id)
+                try:
+                    if current["status"] not in TERMINAL:
+                        await self._stop_interaction(agent_id, interaction_id)
+                except (FileNotFoundError, NotADirectoryError):
+                    # A request worker may have removed its private directory
+                    # just before terminal cleanup acquired the interaction
+                    # lock. The durable row is still authoritative, so this
+                    # interaction is already stopped for cleanup purposes.
+                    pass
                 path = self._interaction_dir(agent_id, interaction_id)
-                if path.exists():
-                    shutil.rmtree(path, ignore_errors=True)
+                try:
+                    if path.exists():
+                        shutil.rmtree(path, ignore_errors=True)
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
                 self._drop_interaction_caches(agent_id, interaction_id)
                 current = await self._owned(agent_id, interaction_id)
                 if current["output_cleaned_at"] is None:
@@ -2085,6 +2157,9 @@ class HttpProbeManager:
         for ordinal, item in enumerate(planned, start=1):
             request_id = str(item.request_id)
             record = response_records.get(request_id, {})
+            response_available = self._response_body_available(
+                agent_id, interaction_id, record
+            )
             catalog.append(
                 {
                     "request_id": request_id,
@@ -2095,7 +2170,7 @@ class HttpProbeManager:
                         if record.get("outcome") == "response"
                         else record.get("outcome") or "pending"
                     ),
-                    "response_available": bool(record.get("body_file")),
+                    "response_available": response_available,
                 }
             )
             seen.add(request_id)
@@ -2104,13 +2179,16 @@ class HttpProbeManager:
         ):
             if request_id in seen:
                 continue
+            response_available = self._response_body_available(
+                agent_id, interaction_id, record
+            )
             catalog.append(
                 {
                     "request_id": request_id,
                     "sequence": ordinal,
                     "method": record.get("method"),
                     "status": record.get("outcome") or "completed",
-                    "response_available": bool(record.get("body_file")),
+                    "response_available": response_available,
                 }
             )
         return catalog[:256]
@@ -2397,6 +2475,12 @@ class HttpProbeManager:
                     resource_status="running",
                 )
                 return
+            if decision.get("reason") in {"disk_pressure", "disk_reservation"}:
+                reclaimed = await self._reclaim_terminal_response_bodies(
+                    exclude_interaction_ids={live.interaction_id}
+                )
+                if reclaimed["reclaimed_bytes"]:
+                    continue
             await self.service.update_http_interaction(
                 self.run_id,
                 live.agent_id,
@@ -2405,6 +2489,166 @@ class HttpProbeManager:
             )
             live.changed.set()
             await asyncio.sleep(float(decision.get("retry_after_seconds", 1.0)))
+
+    async def _create_interaction_directories(
+        self, agent_id: str, interaction_id: str
+    ) -> tuple[Path, Path]:
+        await self._reclaim_terminal_response_bodies()
+        interaction_dir = self._interaction_dir(agent_id, interaction_id)
+        response_dir = interaction_dir / "responses"
+        try:
+            response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        except OSError as exc:
+            storage_errnos = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
+            if exc.errno not in storage_errnos:
+                raise
+            reclaimed = await self._reclaim_terminal_response_bodies(force=True)
+            try:
+                response_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+            except OSError as retry_exc:
+                if retry_exc.errno not in storage_errnos:
+                    raise
+                raise self._error(
+                    "resource",
+                    "http_storage_exhausted",
+                    "HTTP response storage is exhausted",
+                    detail={
+                        "reclaimed_bytes": reclaimed["reclaimed_bytes"],
+                        "free_bytes": reclaimed["free_bytes_after"],
+                        "recommended_action": "wait_for_terminal_work_cleanup",
+                    },
+                ) from retry_exc
+        for private_dir in (
+            self._agent_root(agent_id),
+            self._agent_root(agent_id) / "http-interactions",
+            interaction_dir,
+            response_dir,
+        ):
+            os.chmod(private_dir, 0o700)
+        return interaction_dir, response_dir
+
+    async def _reclaim_terminal_response_bodies(
+        self,
+        *,
+        force: bool = False,
+        exclude_interaction_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Evict old terminal response blobs while preserving interaction metadata."""
+
+        excluded = exclude_interaction_ids or set()
+        async with self._reclaim_lock:
+            usage = shutil.disk_usage(self.policy.root)
+            reserve_floor = max(
+                self.disk_reserve_bytes,
+                int(usage.total * self.disk_reserve_percent / 100.0),
+            )
+            if not force and usage.free > reserve_floor:
+                return {
+                    "triggered": False,
+                    "reclaimed_bytes": 0,
+                    "reclaimed_files": 0,
+                    "reclaimed_interactions": 0,
+                    "free_bytes_before": usage.free,
+                    "free_bytes_after": usage.free,
+                    "reserve_floor_bytes": reserve_floor,
+                }
+
+            free_before = usage.free
+            target_free = min(
+                usage.total,
+                max(reserve_floor, usage.free) + RECLAIM_HEADROOM_BYTES,
+            )
+            rows = await self.service.list_http_interactions(self.run_id)
+
+            def reclaim_order(row: dict[str, Any]) -> tuple[int, str, str]:
+                if row["status"] in {"failed", "stopped", "interrupted"}:
+                    priority = 0
+                elif row["analysis_status"] in {
+                    "completed",
+                    "failed",
+                    "interrupted",
+                }:
+                    priority = 1
+                else:
+                    priority = 2
+                return priority, str(row["created_at"]), str(row["interaction_id"])
+
+            candidates = sorted(
+                (
+                    row
+                    for row in rows
+                    if row["interaction_id"] not in excluded
+                    and row["status"] in TERMINAL
+                    and row["analysis_status"] not in {"queued", "running"}
+                    and row["output_cleaned_at"] is None
+                ),
+                key=reclaim_order,
+            )
+            reclaimed_bytes = 0
+            reclaimed_files = 0
+            reclaimed_interactions = 0
+            for row in candidates:
+                agent_id = str(row["agent_id"])
+                interaction_id = str(row["interaction_id"])
+                lock = self._interaction_locks.setdefault(
+                    (agent_id, interaction_id), asyncio.Lock()
+                )
+                if lock.locked():
+                    continue
+                interaction_bytes = 0
+                interaction_files = 0
+                async with lock:
+                    current = await self._owned(agent_id, interaction_id)
+                    if (
+                        current["status"] not in TERMINAL
+                        or current["analysis_status"] in {"queued", "running"}
+                        or current["output_cleaned_at"] is not None
+                    ):
+                        continue
+                    response_dir = self._response_dir(agent_id, interaction_id)
+                    if not response_dir.is_dir() or response_dir.is_symlink():
+                        continue
+                    for body_path in response_dir.iterdir():
+                        if body_path.is_symlink() or not body_path.is_file():
+                            continue
+                        if not body_path.name.endswith((".body", ".body.part")):
+                            continue
+                        try:
+                            size = body_path.stat().st_size
+                            body_path.unlink()
+                        except FileNotFoundError:
+                            continue
+                        interaction_bytes += size
+                        interaction_files += 1
+                if interaction_files:
+                    reclaimed_bytes += interaction_bytes
+                    reclaimed_files += interaction_files
+                    reclaimed_interactions += 1
+                usage = shutil.disk_usage(self.policy.root)
+                if usage.free >= target_free:
+                    break
+
+            free_after = shutil.disk_usage(self.policy.root).free
+            if reclaimed_files:
+                LOGGER.warning(
+                    "http_body_storage_reclaimed run_id=%s bytes=%s files=%s interactions=%s free_before=%s free_after=%s reserve_floor=%s",
+                    self.run_id,
+                    reclaimed_bytes,
+                    reclaimed_files,
+                    reclaimed_interactions,
+                    free_before,
+                    free_after,
+                    reserve_floor,
+                )
+            return {
+                "triggered": True,
+                "reclaimed_bytes": reclaimed_bytes,
+                "reclaimed_files": reclaimed_files,
+                "reclaimed_interactions": reclaimed_interactions,
+                "free_bytes_before": free_before,
+                "free_bytes_after": free_after,
+                "reserve_floor_bytes": reserve_floor,
+            }
 
     async def _wait(self, event: asyncio.Event, seconds: float | None) -> None:
         if event.is_set() or seconds == 0:
@@ -2706,6 +2950,18 @@ class HttpProbeManager:
             ),
             None,
         )
+
+    def _response_body_available(
+        self,
+        agent_id: str,
+        interaction_id: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        body_file = record.get("body_file")
+        if not body_file:
+            return False
+        path = self._response_dir(agent_id, interaction_id) / str(body_file)
+        return not path.is_symlink() and path.is_file()
 
     async def _next_analysis_revision(
         self, agent_id: str, interaction_id: str

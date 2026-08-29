@@ -18,6 +18,7 @@ from sqlalchemy import delete, func, select, update
 from agent.memory.models import AgentNode, Checkpoint, TargetState
 from agent.memory.redaction import redact_value
 from .clock import active_seconds, aware, utc_now
+from .blackboard import blackboard_content_digest
 from .database import StateDatabase
 from .errors import StateConflict, StateError, StateNotFound, StatePermission
 from .models import (
@@ -69,9 +70,6 @@ from .wakeup import StateSignalBus
 
 
 EVIDENCE_BACKED_PROGRESS_CONFIDENCE = 0.8
-BOOTSTRAP_FOLLOWUP_CATEGORIES = frozenset(
-    {"vulnerability", "credential", "privilege", "attack_path", "flag"}
-)
 REPORT_FINDING_CATEGORIES = frozenset(
     {"service", "vulnerability", "credential", "privilege", "attack_path", "flag", "other"}
 )
@@ -108,6 +106,32 @@ CONTROLLER_SUMMARY_CHARS = 1_000
 CONTROLLER_MISSION_CHARS = 600
 CONTROLLER_NEXT_STEP_CHARS = 300
 
+BOOTSTRAP_CYCLE_TIMEOUT_SECONDS = 240
+BOOTSTRAP_MAX_ROUNDS = 24
+BOOTSTRAP_TARGETED_ROUND = 9
+BOOTSTRAP_REPORT_ONLY_ROUND = 20
+BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS = 30
+EXECUTION_CHECKPOINT_LIMIT = 2
+BOOTSTRAP_CHECKPOINT_LIMIT = 2
+BOOTSTRAP_MISSION = (
+    "Obtain one exact, previously unsubmitted candidate Flag for this Challenge."
+)
+BOOTSTRAP_SUCCESS_CRITERIA = (
+    "Return one exact, previously unsubmitted candidate Flag in a terminal execution_report.candidate_flag.",
+    "Preserve the decisive verification artifacts as Evidence references before reporting the candidate.",
+    "Generic reconnaissance, new Evidence without a Flag-producing route, or an unverified guess is not success.",
+)
+INITIAL_EXECUTION_MISSION = (
+    "Perform one bounded independent reconnaissance pass and report one verified "
+    "high-value fact that can shorten the path to the final result."
+)
+INITIAL_EXECUTION_SUCCESS_CRITERIA = (
+    "Produce one verified high-value fact or a concrete negative result.",
+    "Use Evidence references for any checkpoint or final finding.",
+    "Do not repeat the Bootstrap route or perform unbounded reconnaissance.",
+)
+BOOTSTRAP_ROUTE_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+
 
 def _controller_text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
@@ -117,6 +141,70 @@ def _controller_refs(value: Any, limit: int = 10) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
     return list(dict.fromkeys(item for item in value if isinstance(item, str)))[:limit]
+
+
+def _is_high_value_finding(finding: Mapping[str, Any]) -> bool:
+    if finding.get("category") not in EVIDENCE_PROGRESS_CATEGORIES:
+        return False
+    if finding.get("verification_status") == "rejected":
+        return False
+    evidence_refs = finding.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not any(
+        isinstance(ref, str) and ref.startswith("evidence:") for ref in evidence_refs
+    ):
+        return False
+    if finding.get("verification_status") == "verified":
+        return True
+    try:
+        confidence = float(finding.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return confidence >= EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+
+
+def _is_high_value_report(payload: Mapping[str, Any]) -> bool:
+    """Return whether a report is safe and useful for Bootstrap context."""
+
+    if payload.get("type") in {"bootstrap_checkpoint", "execution_checkpoint"}:
+        return True
+    candidate_flag = payload.get("candidate_flag")
+    if isinstance(candidate_flag, str) and bool(candidate_flag.strip()):
+        return True
+    findings = payload.get("findings")
+    if isinstance(findings, list):
+        for finding in findings:
+            if isinstance(finding, Mapping) and _is_high_value_finding(finding):
+                return True
+    return False
+
+
+def _safe_blackboard_reports(reports: Sequence[Any]) -> list[Any]:
+    """Remove exact candidate values from durable blackboard snapshots.
+
+    The live controller response still carries the candidate through the
+    ephemeral/report path.  Persisted snapshot events retain only a presence
+    marker, so event logs and replayable blackboard payloads never contain the
+    opaque candidate itself.
+    """
+
+    safe_reports: list[Any] = []
+    for raw in reports:
+        if not isinstance(raw, Mapping):
+            safe_reports.append(raw)
+            continue
+        report = dict(raw)
+        payload = report.get("payload")
+        if isinstance(payload, Mapping):
+            safe_payload = dict(payload)
+            candidate = safe_payload.pop("candidate_flag", None)
+            if isinstance(candidate, str) and candidate:
+                safe_payload["candidate_present"] = True
+            report["payload"] = safe_payload
+        candidate = report.pop("candidate_flag", None)
+        if isinstance(candidate, str) and candidate:
+            report["candidate_present"] = True
+        safe_reports.append(report)
+    return safe_reports
 
 
 def _stable_task_digest(
@@ -144,6 +232,7 @@ def _bootstrap_stop_reason(challenge: ChallengeRecord) -> str | None:
     if challenge.is_completed or challenge.work_status in {
         "closed",
         "completed",
+        "paused",
     }:
         return "challenge_stopped"
     if (
@@ -198,6 +287,11 @@ def derive_phase(started_at: datetime, deadline_at: datetime, now: datetime | No
 ACTIVE_EXECUTION_STATUSES = frozenset(
     {"pending", "queued", "reserved", "starting", "running", "working"}
 )
+# Bootstrap is single-lane by default.  Capacity can grow once per productive
+# 15-minute window while the Challenge remains active, up to three lanes.
+DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE = 1
+MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE = 3
+BOOTSTRAP_SCALE_INTERVAL_SECONDS = 15 * 60
 EVIDENCE_PROGRESS_CATEGORIES = frozenset(
     {"vulnerability", "credential", "privilege", "attack_path", "flag"}
 )
@@ -312,13 +406,12 @@ class StateService:
                         metadata_json=dict(metadata or {}),
                         storage_name=storage_name,
                         size_chars=len(content),
+                        created_at=self.clock(),
                     )
                     session.add(row)
                     challenge = await self._require_challenge(
                         session, run_id, unique_code
                     )
-                    challenge.last_progress_at = self.clock()
-                    challenge.stagnation_level = 0
                     challenge.version += 1
                     sequence = await self._event(
                         session,
@@ -661,7 +754,10 @@ class StateService:
                     .order_by(AgentRecord.created_at)
                 )
             ).all()
-            challenge_values = [self._challenge_dict(item) for item in challenges]
+            challenge_values = [
+                self._challenge_dict(item, run=run, now=self.clock())
+                for item in challenges
+            ]
             return {
                 "run": self._run_dict(run),
                 "challenges": challenge_values,
@@ -703,9 +799,140 @@ class StateService:
 
     async def list_challenges(self, run_id: str) -> list[dict[str, Any]]:
         async with self.db.sessions() as session:
-            await self._require_run(session, run_id)
+            run = await self._require_run(session, run_id)
             rows = (await session.scalars(select(ChallengeRecord).where(ChallengeRecord.run_id == run_id).order_by(ChallengeRecord.unique_code))).all()
-            return [self._challenge_dict(item) for item in rows]
+            return [self._challenge_dict(item, run=run, now=self.clock()) for item in rows]
+
+    async def evaluate_hint_eligibility(
+        self, run_id: str, unique_code: str
+    ) -> dict[str, Any]:
+        """Derive and persist the one-way signal that allows Chief to request a hint."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                run = await self._require_run(session, run_id)
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                now = aware(self.clock())
+                started = aware(run.started_at)
+                deadline = aware(run.deadline_at)
+                elapsed = max(0, int((now - started).total_seconds()))
+                remaining = max(0, int((deadline - now).total_seconds()))
+                duration = max(1, int(run.duration_minutes or 360) * 60)
+                first_window = (duration * 25) // 100
+                hard_window_end = (duration * 75) // 100
+                emergency_window = remaining <= 30 * 60
+                baseline = challenge.last_progress_at or challenge.active_since or run.started_at
+                no_progress = max(0, int((now - aware(baseline)).total_seconds()))
+                has_started_work = challenge.started_at is not None or challenge.work_status in {
+                    "active",
+                    "warning",
+                    "extended",
+                    "paused",
+                }
+                reason: str | None = None
+                if (
+                    not challenge.is_completed
+                    and challenge.work_status != "closed"
+                    and not challenge.hint_requested
+                ):
+                    if emergency_window:
+                        reason = "final_30_minutes"
+                    elif has_started_work and elapsed >= first_window and elapsed < hard_window_end and no_progress >= 15 * 60:
+                        reason = "hard_stagnation"
+                    elif has_started_work and elapsed >= hard_window_end and elapsed < duration - 30 * 60 and no_progress >= 8 * 60:
+                        reason = "low_yield"
+                newly_eligible = bool(reason) and not challenge.hint_eligible
+                if newly_eligible:
+                    challenge.hint_eligible = True
+                    challenge.version += 1
+                    sequence = await self._event(
+                        session,
+                        run_id,
+                        "challenge_hint_eligible",
+                        {
+                            "unique_code": unique_code,
+                            "reason": reason,
+                            "no_progress_seconds": no_progress,
+                            "run_elapsed_seconds": elapsed,
+                            "remaining_seconds": remaining,
+                            "total_score": challenge.total_score,
+                            "work_status": challenge.work_status,
+                        },
+                    )
+                else:
+                    sequence = None
+                signal = {
+                    "eligible": bool(challenge.hint_eligible and not challenge.hint_requested),
+                    "reason": reason if newly_eligible else ("already_eligible" if challenge.hint_eligible else None),
+                    "no_progress_seconds": no_progress,
+                    "run_elapsed_seconds": elapsed,
+                    "remaining_seconds": remaining,
+                }
+                result = {
+                    "unique_code": unique_code,
+                    "hint_signal": signal,
+                    "newly_eligible": newly_eligible,
+                    "event_sequence": sequence,
+                }
+        if result["newly_eligible"]:
+            await self._publish_hint_eligibility_report(run_id, unique_code, result["hint_signal"])
+        return result
+
+    async def disable_hint_eligibility(
+        self, run_id: str, *, reason: str = "hint_unavailable"
+    ) -> int:
+        """Stop future Hint signals after the platform proves Hint is absent."""
+
+        changed: list[str] = []
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await self._require_run(session, run_id)
+                challenges = (
+                    await session.scalars(
+                        select(ChallengeRecord).where(
+                            ChallengeRecord.run_id == run_id,
+                            ChallengeRecord.hint_requested.is_(False),
+                            ChallengeRecord.hint_eligible.is_(True),
+                        )
+                    )
+                ).all()
+                for challenge in challenges:
+                    challenge.hint_eligible = False
+                    challenge.version += 1
+                    changed.append(challenge.unique_code)
+                if changed:
+                    await self._event(
+                        session,
+                        run_id,
+                        "benchmark_capability_unavailable",
+                        {
+                            "operation": "get_hint",
+                            "reason": reason,
+                            "unique_codes": sorted(changed),
+                        },
+                    )
+        return len(changed)
+
+    async def _publish_hint_eligibility_report(
+        self, run_id: str, unique_code: str, signal: Mapping[str, Any]
+    ) -> None:
+        overview = await self.get_overview(run_id)
+        chief = next((item for item in overview["agents"] if item["role"] == "chief"), None)
+        if chief is None:
+            return
+        await self.publish_control_report(
+            run_id,
+            sender_id=chief["agent_id"],
+            recipient_id=chief["agent_id"],
+            unique_code=unique_code,
+            report_type="challenge_status",
+            status="hint_eligible",
+            payload={
+                "type": "challenge_hint_eligible",
+                "unique_code": unique_code,
+                **dict(signal),
+            },
+        )
 
     async def _latest_cycle_in_session(
         self, session: Any, run_id: str, unique_code: str
@@ -732,6 +959,7 @@ class StateService:
                 "status": challenge.work_status,
                 "is_completed": challenge.is_completed,
                 "direction": challenge.direction,
+                "control_state": challenge.control_state,
             },
         }
 
@@ -744,6 +972,7 @@ class StateService:
         compact: bool = False,
     ) -> dict[str, Any]:
         async with self.db.sessions() as session:
+            run = await self._require_run(session, run_id)
             challenge = await self._require_challenge(session, run_id, unique_code)
             if context is not None:
                 agent = await self._authorize(session, context, roles={"chief", "challenge", "execution"}, unique_code=unique_code)
@@ -833,11 +1062,37 @@ class StateService:
                     )
                 ).all()
             )
+            hint_rows = list(
+                (
+                    await session.scalars(
+                        select(ReportRecord)
+                        .where(
+                            ReportRecord.run_id == run_id,
+                            ReportRecord.unique_code == unique_code,
+                            ReportRecord.report_type == "hint",
+                        )
+                        .order_by(ReportRecord.sequence.desc())
+                        .limit(4 if compact else 20)
+                    )
+                ).all()
+            )
+            hint_rows.reverse()
             result = {
                 "authority": self._authority(
                     run_id, challenge, cycle_rows[0] if cycle_rows else None
                 ),
-                "challenge": self._challenge_dict(challenge),
+                "challenge": self._challenge_dict(
+                    challenge, run=run, now=self.clock()
+                ),
+                "hints": [
+                    {
+                        "report_ref": f"report:{item.report_id}",
+                        "hint": str((item.payload or {}).get("hint") or "")[:1_000],
+                        "reason": str((item.payload or {}).get("reason") or "")[:500],
+                        "requested_at": _json_value(item.created_at),
+                    }
+                    for item in hint_rows
+                ],
                 "findings": [
                     self._controller_finding_dict(item) if compact else self._finding_dict(item)
                     for item in findings
@@ -1262,7 +1517,7 @@ class StateService:
             result["admission_status"] = admission.status
         return result
 
-    async def register_challenge_with_bootstrap(
+    async def register_challenge_workgroup(
         self,
         run_id: str,
         *,
@@ -1272,16 +1527,29 @@ class StateService:
         unique_code: str,
         challenge_prompt: str,
         bootstrap_prompt: str,
+        initial_execution: ExecutionTaskInput | None = None,
         bootstrap_enabled: bool = True,
         bootstrap_priority: int = 100,
+        bootstrap_count: int = DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE,
     ) -> dict[str, Any]:
-        """Atomically create a Challenge controller and its optional Bootstrap.
+        """Atomically create a Challenge controller, Bootstrap, and initial scout.
 
         Bootstrap is an internal execution kind.  It deliberately bypasses
         hypothesis/branch creation so the controller never sees it as a normal
-        planned task.  The admission row is committed with the two Agent rows,
-        then one run signal wakes the scheduler.
+        planned task. One independent reconnaissance Execution is created
+        alongside it with its own hypothesis and branch. Additional Bootstrap rows are created only by an
+        explicit independent-route request or a productive runtime scale
+        window, and the durable target never exceeds three.
+        The admission rows are committed with the Agent rows, then one run
+        signal wakes the scheduler.
         """
+
+        if not isinstance(bootstrap_count, int) or isinstance(bootstrap_count, bool):
+            raise ValueError("bootstrap_count must be an integer")
+        if not 1 <= bootstrap_count <= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
+            raise ValueError(
+                f"bootstrap_count must be between 1 and {MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE}"
+            )
 
         event_sequence: int | None = None
         async with self._lock:
@@ -1301,6 +1569,37 @@ class StateService:
                 bootstrap_enabled_now = bool(bootstrap_enabled) and (
                     bootstrap_stop_reason is None
                 )
+                initial_execution = initial_execution or ExecutionTaskInput(
+                    objective=INITIAL_EXECUTION_MISSION,
+                    task_key="initial-recon",
+                    hypothesis_key="initial-surface-recon",
+                    branch_key="initial-recon:discovery",
+                    kind="recon",
+                    task_stage="discovery",
+                    priority=90,
+                    success_criteria=list(INITIAL_EXECUTION_SUCCESS_CRITERIA),
+                    timeout_seconds=900,
+                )
+                if (
+                    initial_execution.kind != "recon"
+                    or initial_execution.task_stage != "discovery"
+                    or initial_execution.priority != 90
+                    or initial_execution.timeout_seconds != 900
+                ):
+                    raise StateError(
+                        "invalid_initial_execution",
+                        "Initial Execution must be recon discovery work with priority 90 and a 900-second budget",
+                        status_code=422,
+                    )
+                initial_digest = _stable_task_digest(
+                    objective=initial_execution.objective,
+                    kind=initial_execution.kind,
+                    task_stage=initial_execution.task_stage,
+                    context_refs=initial_execution.context_refs,
+                    success_criteria=initial_execution.success_criteria,
+                    explicit_task_key=initial_execution.task_key,
+                )
+                initial_task_key = initial_execution.task_key or f"task:{initial_digest}"
                 existing = await session.scalar(
                     select(AgentRecord).where(
                         AgentRecord.run_id == run_id,
@@ -1310,20 +1609,75 @@ class StateService:
                     )
                 )
                 if existing is not None:
-                    bootstrap = await session.scalar(
-                        select(AgentRecord).where(
-                            AgentRecord.run_id == run_id,
-                            AgentRecord.parent_id == existing.agent_id,
-                            AgentRecord.kind == "bootstrap",
-                        )
+                    bootstraps = list(
+                        (
+                            await session.scalars(
+                                select(AgentRecord)
+                                .where(
+                                    AgentRecord.run_id == run_id,
+                                    AgentRecord.parent_id == existing.agent_id,
+                                    AgentRecord.kind == "bootstrap",
+                                    AgentRecord.status.not_in(
+                                        [
+                                            "failed",
+                                            "stopped",
+                                            "completed",
+                                            "cancelled",
+                                            "interrupted",
+                                        ]
+                                    ),
+                                )
+                                .order_by(AgentRecord.created_at)
+                            )
+                        ).all()
+                    )
+                    initial_rows = list(
+                        (
+                            await session.scalars(
+                                select(AgentRecord)
+                                .where(
+                                    AgentRecord.run_id == run_id,
+                                    AgentRecord.unique_code == unique_code,
+                                    AgentRecord.role == "execution",
+                                    AgentRecord.task_key == initial_task_key,
+                                )
+                                .order_by(AgentRecord.created_at)
+                            )
+                        ).all()
                     )
                     result = self._agent_dict(existing)
                     result["idempotent"] = True
+                    result["bootstraps"] = []
+                    for item in bootstraps:
+                        bootstrap_data = {"enabled": True, **self._agent_dict(item)}
+                        bootstrap_admission = await session.scalar(
+                            select(AdmissionRecord).where(
+                                AdmissionRecord.run_id == run_id,
+                                AdmissionRecord.agent_id == item.agent_id,
+                            )
+                        )
+                        if bootstrap_admission is not None:
+                            bootstrap_data["admission_id"] = bootstrap_admission.admission_id
+                            bootstrap_data["admission_status"] = bootstrap_admission.status
+                        result["bootstraps"].append(bootstrap_data)
                     result["bootstrap"] = (
-                        {"enabled": True, **self._agent_dict(bootstrap)}
-                        if bootstrap is not None
+                        result["bootstraps"][0]
+                        if result["bootstraps"]
                         else {"enabled": False}
                     )
+                    result["initial_executions"] = []
+                    for item in initial_rows:
+                        initial_data = {"enabled": True, **self._agent_dict(item)}
+                        initial_admission = await session.scalar(
+                            select(AdmissionRecord).where(
+                                AdmissionRecord.run_id == run_id,
+                                AdmissionRecord.agent_id == item.agent_id,
+                            )
+                        )
+                        if initial_admission is not None:
+                            initial_data["admission_id"] = initial_admission.admission_id
+                            initial_data["admission_status"] = initial_admission.status
+                        result["initial_executions"].append(initial_data)
                     return result
 
                 challenge_agent = AgentRecord(
@@ -1359,64 +1713,82 @@ class StateService:
                     agent_id=challenge_agent_id,
                 )
 
-                bootstrap_data: dict[str, Any] = {
-                    "enabled": bootstrap_enabled_now,
-                    "agent_id": None,
-                    "status": None,
-                }
-                if bootstrap_enabled_now:
-                    bootstrap_agent = AgentRecord(
-                        agent_id=bootstrap_agent_id,
+                initial_execution_list: list[dict[str, Any]] = []
+                existing_initial = await session.scalar(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "execution",
+                        AgentRecord.task_key == initial_task_key,
+                    )
+                )
+                if existing_initial is not None:
+                    initial_execution_list.append(
+                        {"enabled": True, **self._agent_dict(existing_initial)}
+                    )
+                else:
+                    initial_hypothesis_key = (
+                        initial_execution.hypothesis_key or f"hypothesis:{initial_digest}"
+                    )
+                    initial_branch_key = (
+                        initial_execution.branch_key
+                        or f"{initial_hypothesis_key}:{initial_execution.kind}:{initial_execution.task_stage}"
+                    )
+                    initial_agent_id = f"execution_{uuid4().hex}"
+                    await self._upsert_hypothesis(
+                        session,
+                        run_id=run_id,
+                        unique_code=unique_code,
+                        hypothesis=HypothesisInput(
+                            key=initial_hypothesis_key,
+                            statement=initial_execution.objective,
+                            based_on_observations=list(initial_execution.context_refs),
+                        ),
+                        created_by=challenge_agent_id,
+                        status="active",
+                    )
+                    await self._upsert_branch(
+                        session,
+                        run_id=run_id,
+                        unique_code=unique_code,
+                        branch_key=initial_branch_key,
+                        hypothesis_key=initial_hypothesis_key,
+                        kind=initial_execution.kind,
+                        task_stage=initial_execution.task_stage,
+                        priority=initial_execution.priority,
+                        mission=initial_execution.objective,
+                        agent_id=initial_agent_id,
+                        status="queued",
+                    )
+                    initial_agent = AgentRecord(
+                        agent_id=initial_agent_id,
                         run_id=run_id,
                         parent_id=challenge_agent_id,
                         unique_code=unique_code,
                         cycle_id=None,
                         role="execution",
-                        kind="bootstrap",
-                        task_stage="discovery",
-                        priority=bootstrap_priority,
-                        mission=(
-                            "Autonomously advance this Challenge and obtain an exact candidate result."
-                        ),
-                        initial_prompt=bootstrap_prompt,
+                        kind=initial_execution.kind,
+                        task_stage=initial_execution.task_stage,
+                        priority=initial_execution.priority,
+                        mission=initial_execution.objective,
+                        initial_prompt=initial_execution.objective,
                         session_memory=DEFAULT_SESSION_MEMORY,
-                        success_criteria=[],
-                        context_refs=[],
-                        report_cursors={
-                            "bootstrap_shared_challenge": int(
-                                int.from_bytes(
-                                    hashlib.sha256(
-                                        json.dumps(
-                                            {
-                                                "direction": challenge.direction,
-                                                "is_completed": challenge.is_completed,
-                                                "work_status": challenge.work_status,
-                                                "container_status": challenge.container_status,
-                                                "container_addr": challenge.container_addr,
-                                            },
-                                            sort_keys=True,
-                                            ensure_ascii=False,
-                                            default=str,
-                                        ).encode("utf-8")
-                                    ).digest()[:8],
-                                    "big",
-                                )
-                            )
-                        },
-                        hypothesis_key=None,
-                        task_key=None,
-                        branch_key=None,
-                        timeout_seconds=None,
+                        success_criteria=list(initial_execution.success_criteria),
+                        context_refs=list(initial_execution.context_refs),
+                        hypothesis_key=initial_hypothesis_key,
+                        task_key=initial_task_key,
+                        branch_key=initial_branch_key,
+                        timeout_seconds=initial_execution.timeout_seconds,
                         status="queued",
                     )
-                    session.add(bootstrap_agent)
+                    session.add(initial_agent)
                     admission = AdmissionRecord(
                         admission_id=f"admission_{uuid4().hex}",
                         run_id=run_id,
-                        agent_id=bootstrap_agent_id,
+                        agent_id=initial_agent_id,
                         unique_code=unique_code,
                         role="execution",
-                        priority=bootstrap_priority,
+                        priority=initial_execution.priority,
                         status="queued",
                     )
                     session.add(admission)
@@ -1425,15 +1797,62 @@ class StateService:
                         run_id,
                         "agent_created",
                         {
-                            "agent_id": bootstrap_agent_id,
+                            "agent_id": initial_agent_id,
                             "role": "execution",
                             "parent_id": challenge_agent_id,
                             "unique_code": unique_code,
-                            "kind": "bootstrap",
-                            "task_stage": "discovery",
+                            "kind": initial_execution.kind,
+                            "task_stage": initial_execution.task_stage,
+                            "task_key": initial_task_key,
                         },
-                        agent_id=bootstrap_agent_id,
+                        agent_id=initial_agent_id,
                     )
+                    await self._event(
+                        session,
+                        run_id,
+                        "initial_execution_created",
+                        {
+                            "agent_id": initial_agent_id,
+                            "parent_id": challenge_agent_id,
+                            "task_key": initial_task_key,
+                            "priority": initial_execution.priority,
+                        },
+                        agent_id=initial_agent_id,
+                    )
+                    event_sequence = await self._event(
+                        session,
+                        run_id,
+                        "agent_admission_queued",
+                        {
+                            "agent_id": initial_agent_id,
+                            "admission_id": admission.admission_id,
+                            "priority": initial_execution.priority,
+                        },
+                        agent_id=initial_agent_id,
+                    )
+                    initial_execution_list.append(
+                        {
+                            "enabled": True,
+                            **self._agent_dict(initial_agent),
+                            "admission_id": admission.admission_id,
+                            "admission_status": admission.status,
+                        }
+                    )
+
+                bootstrap_data: dict[str, Any] = {
+                    "enabled": bootstrap_enabled_now,
+                    "agent_id": None,
+                    "status": None,
+                }
+                bootstrap_list: list[dict[str, Any]] = []
+                if bootstrap_enabled_now:
+                    bootstrap_agent_ids = [
+                        bootstrap_agent_id,
+                        *(
+                            f"execution_{uuid4().hex}"
+                            for _ in range(bootstrap_count - 1)
+                        ),
+                    ]
                     await self._event(
                         session,
                         run_id,
@@ -1441,39 +1860,104 @@ class StateService:
                         {
                             "bootstrap_enabled": True,
                             "priority": bootstrap_priority,
+                            "count": len(bootstrap_agent_ids),
                             "lifecycle": "challenge_bound",
                         },
                         agent_id=challenge_agent_id,
                     )
-                    event_sequence = await self._event(
+                    await self._event(
                         session,
                         run_id,
-                        "bootstrap_created",
+                        "bootstrap_capacity_changed",
                         {
-                            "agent_id": bootstrap_agent_id,
-                            "parent_id": challenge_agent_id,
-                            "admission_id": admission.admission_id,
-                            "priority": bootstrap_priority,
+                            "unique_code": unique_code,
+                            "target_count": len(bootstrap_agent_ids),
+                            "reason": "initial_capacity",
                         },
-                        agent_id=bootstrap_agent_id,
+                        agent_id=challenge_agent_id,
                     )
-                    event_sequence = await self._event(
-                        session,
-                        run_id,
-                        "agent_admission_queued",
-                        {
-                            "agent_id": bootstrap_agent_id,
-                            "admission_id": admission.admission_id,
-                            "priority": bootstrap_priority,
-                        },
-                        agent_id=bootstrap_agent_id,
-                    )
-                    bootstrap_data = {
-                        "enabled": True,
-                        "agent_id": bootstrap_agent_id,
-                        "status": "queued",
-                        "admission_id": admission.admission_id,
-                    }
+                    for bootstrap_agent_id in bootstrap_agent_ids:
+                        bootstrap_agent = AgentRecord(
+                            agent_id=bootstrap_agent_id,
+                            run_id=run_id,
+                            parent_id=challenge_agent_id,
+                            unique_code=unique_code,
+                            cycle_id=None,
+                            role="execution",
+                            kind="bootstrap",
+                            task_stage="discovery",
+                            priority=bootstrap_priority,
+                            mission=BOOTSTRAP_MISSION,
+                            initial_prompt=bootstrap_prompt,
+                            session_memory=DEFAULT_SESSION_MEMORY,
+                            success_criteria=list(BOOTSTRAP_SUCCESS_CRITERIA),
+                            context_refs=[],
+                            report_cursors={
+                                "bootstrap_cycle": 0,
+                            },
+                            hypothesis_key=None,
+                            task_key=None,
+                            branch_key=None,
+                            timeout_seconds=BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
+                            status="queued",
+                        )
+                        session.add(bootstrap_agent)
+                        admission = AdmissionRecord(
+                            admission_id=f"admission_{uuid4().hex}",
+                            run_id=run_id,
+                            agent_id=bootstrap_agent_id,
+                            unique_code=unique_code,
+                            role="execution",
+                            priority=bootstrap_priority,
+                            status="queued",
+                        )
+                        session.add(admission)
+                        await self._event(
+                            session,
+                            run_id,
+                            "agent_created",
+                            {
+                                "agent_id": bootstrap_agent_id,
+                                "role": "execution",
+                                "parent_id": challenge_agent_id,
+                                "unique_code": unique_code,
+                                "kind": "bootstrap",
+                                "task_stage": "discovery",
+                            },
+                            agent_id=bootstrap_agent_id,
+                        )
+                        event_sequence = await self._event(
+                            session,
+                            run_id,
+                            "bootstrap_created",
+                            {
+                                "agent_id": bootstrap_agent_id,
+                                "parent_id": challenge_agent_id,
+                                "admission_id": admission.admission_id,
+                                "priority": bootstrap_priority,
+                            },
+                            agent_id=bootstrap_agent_id,
+                        )
+                        event_sequence = await self._event(
+                            session,
+                            run_id,
+                            "agent_admission_queued",
+                            {
+                                "agent_id": bootstrap_agent_id,
+                                "admission_id": admission.admission_id,
+                                "priority": bootstrap_priority,
+                            },
+                            agent_id=bootstrap_agent_id,
+                        )
+                        bootstrap_list.append(
+                            {
+                                "enabled": True,
+                                **self._agent_dict(bootstrap_agent),
+                                "admission_id": admission.admission_id,
+                                "admission_status": admission.status,
+                            }
+                        )
+                    bootstrap_data = bootstrap_list[0]
                 else:
                     if bootstrap_stop_reason is not None:
                         bootstrap_data["reason"] = bootstrap_stop_reason
@@ -1489,6 +1973,8 @@ class StateService:
                     )
                 result = self._agent_dict(challenge_agent)
                 result["bootstrap"] = bootstrap_data
+                result["bootstraps"] = bootstrap_list
+                result["initial_executions"] = initial_execution_list
         if event_sequence is not None:
             await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
         return result
@@ -1501,8 +1987,17 @@ class StateService:
         parent_id: str,
         bootstrap_prompt: str,
         bootstrap_priority: int = 100,
+        bootstrap_count: int | None = None,
     ) -> dict[str, Any]:
-        """Return the live Bootstrap or queue a fresh one for an active Challenge."""
+        """Keep the requested bounded Bootstrap lanes for an active Challenge."""
+
+        if bootstrap_count is not None:
+            if not isinstance(bootstrap_count, int) or isinstance(bootstrap_count, bool):
+                raise ValueError("bootstrap_count must be an integer")
+            if not 1 <= bootstrap_count <= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
+                raise ValueError(
+                    f"bootstrap_count must be between 1 and {MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE}"
+                )
 
         event_sequence: int | None = None
         async with self._lock:
@@ -1536,135 +2031,535 @@ class StateService:
                         "status": None,
                         "reason": "challenge_stopped",
                     }
-                existing = await session.scalar(
-                    select(AgentRecord)
-                    .where(
-                        AgentRecord.run_id == run_id,
-                        AgentRecord.unique_code == unique_code,
-                        AgentRecord.parent_id == parent_id,
-                        AgentRecord.role == "execution",
-                        AgentRecord.kind == "bootstrap",
-                        AgentRecord.status.not_in(
-                            [
-                                "failed",
-                                "stopped",
-                                "completed",
-                                "cancelled",
-                                "interrupted",
-                            ]
-                        ),
+                pending_candidate = await self._pending_bootstrap_candidate(
+                    session, run_id, unique_code, parent_id
+                )
+                if pending_candidate:
+                    return {
+                        "enabled": False,
+                        "agent_id": None,
+                        "status": None,
+                        "reason": "candidate_pending_submission",
+                    }
+                if bootstrap_count is None:
+                    bootstrap_count = await self._bootstrap_capacity_target(
+                        session, run_id, unique_code, parent_id
                     )
-                    .order_by(AgentRecord.created_at.desc())
+                existing = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord)
+                            .where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == unique_code,
+                                AgentRecord.parent_id == parent_id,
+                                AgentRecord.role == "execution",
+                                AgentRecord.kind == "bootstrap",
+                                AgentRecord.status.not_in(
+                                    [
+                                        "failed",
+                                        "stopped",
+                                        "completed",
+                                        "cancelled",
+                                        "interrupted",
+                                    ]
+                                ),
+                            )
+                            .order_by(AgentRecord.created_at)
+                        )
+                    ).all()
+                )
+                bootstrap_results = [
+                    {
+                        **self._agent_dict(item),
+                        "enabled": True,
+                        "idempotent": True,
+                    }
+                    for item in existing
+                ]
+                for _ in range(
+                    max(0, bootstrap_count - len(existing))
+                ):
+                    bootstrap_agent_id = f"execution_{uuid4().hex}"
+                    bootstrap_agent = AgentRecord(
+                        agent_id=bootstrap_agent_id,
+                        run_id=run_id,
+                        parent_id=parent_id,
+                        unique_code=unique_code,
+                        cycle_id=None,
+                        role="execution",
+                        kind="bootstrap",
+                        task_stage="discovery",
+                        priority=bootstrap_priority,
+                        mission=BOOTSTRAP_MISSION,
+                        initial_prompt=bootstrap_prompt,
+                        session_memory=DEFAULT_SESSION_MEMORY,
+                        success_criteria=list(BOOTSTRAP_SUCCESS_CRITERIA),
+                        context_refs=[],
+                        report_cursors={
+                            "bootstrap_cycle": 0,
+                        },
+                        hypothesis_key=None,
+                        task_key=None,
+                        branch_key=None,
+                        timeout_seconds=BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
+                        status="queued",
+                    )
+                    session.add(bootstrap_agent)
+                    admission = AdmissionRecord(
+                        admission_id=f"admission_{uuid4().hex}",
+                        run_id=run_id,
+                        agent_id=bootstrap_agent_id,
+                        unique_code=unique_code,
+                        role="execution",
+                        priority=bootstrap_priority,
+                        status="queued",
+                    )
+                    session.add(admission)
+                    await self._event(
+                        session,
+                        run_id,
+                        "agent_created",
+                        {
+                            "agent_id": bootstrap_agent_id,
+                            "role": "execution",
+                            "parent_id": parent_id,
+                            "unique_code": unique_code,
+                            "kind": "bootstrap",
+                            "task_stage": "discovery",
+                        },
+                        agent_id=bootstrap_agent_id,
+                    )
+                    await self._event(
+                        session,
+                        run_id,
+                        "bootstrap_created",
+                        {
+                            "agent_id": bootstrap_agent_id,
+                            "parent_id": parent_id,
+                            "admission_id": admission.admission_id,
+                            "priority": bootstrap_priority,
+                            "reason": "bootstrap_cycle",
+                        },
+                        agent_id=bootstrap_agent_id,
+                    )
+                    event_sequence = await self._event(
+                        session,
+                        run_id,
+                        "agent_admission_queued",
+                        {
+                            "agent_id": bootstrap_agent_id,
+                            "admission_id": admission.admission_id,
+                            "priority": bootstrap_priority,
+                        },
+                        agent_id=bootstrap_agent_id,
+                    )
+                    bootstrap_results.append(
+                        {
+                            **self._agent_dict(bootstrap_agent),
+                            "enabled": True,
+                            "created": True,
+                            "admission_id": admission.admission_id,
+                            "admission_status": admission.status,
+                        }
+                    )
+                primary = next(
+                    (item for item in bootstrap_results if item.get("created")),
+                    bootstrap_results[0],
+                )
+                result = {
+                    **primary,
+                    "created": any(item.get("created") for item in bootstrap_results),
+                    "bootstraps": bootstrap_results,
+                }
+                if not result["created"]:
+                    result["idempotent"] = True
+        if event_sequence is not None:
+            await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
+        return result
+
+    async def _pending_bootstrap_candidate(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+        parent_id: str,
+    ) -> bool:
+        """Prevent a terminal successful Bootstrap from being recycled.
+
+        Bootstrap completion and Challenge flag submission are separate
+        transactions.  During that short handoff window the Challenge still
+        looks active, so a naive capacity repair can create a duplicate lane.
+        Treat an unconsumed candidate report as a durable stop signal.  A
+        later explicit rejection clears the signal and permits another cycle.
+        """
+
+        reports = list(
+            (
+                await session.scalars(
+                    select(ReportRecord)
+                    .join(AgentRecord, AgentRecord.agent_id == ReportRecord.agent_id)
+                    .where(
+                        ReportRecord.run_id == run_id,
+                        ReportRecord.unique_code == unique_code,
+                        ReportRecord.report_type == "execution",
+                        AgentRecord.parent_id == parent_id,
+                        AgentRecord.kind == "bootstrap",
+                    )
+                    .order_by(ReportRecord.sequence.desc())
+                )
+            ).all()
+        )
+        candidate_report = next(
+            (
+                item
+                for item in reports
+                if isinstance(item.payload, Mapping)
+                and isinstance(item.payload.get("candidate_flag"), str)
+                and bool(item.payload.get("candidate_flag"))
+            ),
+            None,
+        )
+        if candidate_report is None:
+            return False
+
+        decisions = list(
+            (
+                await session.scalars(
+                    select(ReportRecord)
+                    .where(
+                        ReportRecord.run_id == run_id,
+                        ReportRecord.unique_code == unique_code,
+                        ReportRecord.report_type == "challenge_status",
+                        ReportRecord.sequence > candidate_report.sequence,
+                    )
+                    .order_by(ReportRecord.sequence.desc())
+                )
+            ).all()
+        )
+        for decision in decisions:
+            payload = decision.payload if isinstance(decision.payload, Mapping) else {}
+            if payload.get("type") != "challenge_flag":
+                continue
+            return not (payload.get("accepted") is False)
+        return True
+
+    async def _bootstrap_capacity_event(
+        self,
+        session: Any,
+        run_id: str,
+        parent_id: str,
+    ) -> StateEventRecord | None:
+        return await session.scalar(
+            select(StateEventRecord)
+            .where(
+                StateEventRecord.run_id == run_id,
+                StateEventRecord.agent_id == parent_id,
+                StateEventRecord.event_type.in_(
+                    ["bootstrap_capacity_changed", "bootstrap_policy_configured"]
+                ),
+            )
+            .order_by(StateEventRecord.sequence.desc())
+            .limit(1)
+        )
+
+    async def _bootstrap_capacity_target(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+        parent_id: str,
+    ) -> int:
+        event = await self._bootstrap_capacity_event(session, run_id, parent_id)
+        payload = dict(event.payload or {}) if event is not None else {}
+        raw_target = payload.get("target_count", payload.get("count", 1))
+        try:
+            target = int(raw_target)
+        except (TypeError, ValueError):
+            target = DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE
+        return max(
+            DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE,
+            min(MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE, target),
+        )
+
+    async def set_bootstrap_capacity(
+        self,
+        run_id: str,
+        unique_code: str,
+        *,
+        parent_id: str,
+        target_count: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Atomically raise the durable Bootstrap capacity target."""
+
+        if not isinstance(target_count, int) or isinstance(target_count, bool):
+            raise ValueError("target_count must be an integer")
+        if not 1 <= target_count <= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
+            raise ValueError(
+                f"target_count must be between 1 and {MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE}"
+            )
+        event_sequence: int | None = None
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                if _bootstrap_stop_reason(challenge) is not None:
+                    return {
+                        "unique_code": unique_code,
+                        "target_count": 0,
+                        "changed": False,
+                        "active_count": 0,
+                        "reason": "challenge_stopped",
+                    }
+                parent = await session.get(AgentRecord, parent_id)
+                if (
+                    parent is None
+                    or parent.run_id != run_id
+                    or parent.role != "challenge"
+                    or parent.unique_code != unique_code
+                ):
+                    raise StatePermission(
+                        "invalid_parent", "Bootstrap capacity requires its Challenge Agent"
+                    )
+                current_target = await self._bootstrap_capacity_target(
+                    session, run_id, unique_code, parent_id
+                )
+                active_count = int(
+                    await session.scalar(
+                        select(func.count(AgentRecord.agent_id)).where(
+                            AgentRecord.run_id == run_id,
+                            AgentRecord.unique_code == unique_code,
+                            AgentRecord.parent_id == parent_id,
+                            AgentRecord.kind == "bootstrap",
+                            AgentRecord.status.in_(sorted(ACTIVE_EXECUTION_STATUSES)),
+                        )
+                    )
+                    or 0
+                )
+                target_count = max(target_count, current_target)
+                if target_count > current_target:
+                    event_sequence = await self._event(
+                        session,
+                        run_id,
+                        "bootstrap_capacity_changed",
+                        {
+                            "unique_code": unique_code,
+                            "target_count": target_count,
+                            "reason": reason,
+                        },
+                        agent_id=parent_id,
+                    )
+                result = {
+                    "unique_code": unique_code,
+                    "target_count": target_count,
+                    "changed": target_count > current_target,
+                    "active_count": active_count,
+                    "reason": reason,
+                }
+        if event_sequence is not None:
+            await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
+        return result
+
+    async def _bootstrap_productive_output_since(
+        self,
+        session: Any,
+        run_id: str,
+        unique_code: str,
+        agent_ids: Sequence[str],
+        since: datetime,
+    ) -> dict[str, Any] | None:
+        if not agent_ids:
+            return None
+        evidence_rows = list(
+            (
+                await session.scalars(
+                    select(EvidenceRecord)
+                    .where(
+                        EvidenceRecord.run_id == run_id,
+                        EvidenceRecord.unique_code == unique_code,
+                        EvidenceRecord.agent_id.in_(list(agent_ids)),
+                        EvidenceRecord.created_at <= self.clock(),
+                    )
+                    .order_by(EvidenceRecord.created_at, EvidenceRecord.evidence_id)
+                )
+            ).all()
+        )
+        seen_hashes: set[str] = set()
+        for item in evidence_rows:
+            created_at = aware(item.created_at)
+            if created_at < aware(since):
+                seen_hashes.add(item.content_sha256)
+                continue
+            if item.content_sha256 not in seen_hashes:
+                return {
+                    "kind": "new_evidence",
+                    "evidence_ref": f"evidence:{item.evidence_id}",
+                    "created_at": item.created_at,
+                }
+            seen_hashes.add(item.content_sha256)
+
+        report_events = list(
+            (
+                await session.scalars(
+                    select(StateEventRecord)
+                    .where(
+                        StateEventRecord.run_id == run_id,
+                        StateEventRecord.agent_id.in_(list(agent_ids)),
+                        StateEventRecord.event_type == "agent_report",
+                        StateEventRecord.created_at >= aware(since),
+                    )
+                    .order_by(StateEventRecord.created_at, StateEventRecord.sequence)
+                )
+            ).all()
+        )
+        for event in report_events:
+            payload = dict(event.payload or {})
+            if payload.get("valid_progress") or payload.get("candidate_flag_present"):
+                return {
+                    "kind": "productive_report",
+                    "sequence": event.sequence,
+                    "created_at": event.created_at,
+                }
+        return None
+
+    async def maybe_scale_bootstrap_capacity(
+        self,
+        run_id: str,
+        unique_code: str,
+        *,
+        parent_id: str,
+    ) -> dict[str, Any]:
+        """Claim one 15-minute Bootstrap capacity increase when due and useful."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                parent = await session.get(AgentRecord, parent_id)
+                bootstrap_agents = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord)
+                            .where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == unique_code,
+                                AgentRecord.parent_id == parent_id,
+                                AgentRecord.kind == "bootstrap",
+                            )
+                            .order_by(AgentRecord.created_at, AgentRecord.agent_id)
+                        )
+                    ).all()
+                )
+                active_count = sum(
+                    1 for item in bootstrap_agents if item.status in ACTIVE_EXECUTION_STATUSES
+                )
+                target_count = await self._bootstrap_capacity_target(
+                    session, run_id, unique_code, parent_id
+                )
+                if (
+                    parent is None
+                    or parent.status in {"failed", "stopped", "completed", "cancelled", "interrupted"}
+                    or not challenge_work_active(challenge)
+                    or _bootstrap_stop_reason(challenge) is not None
+                ):
+                    return {
+                        "unique_code": unique_code,
+                        "active_count": active_count,
+                        "target_count": target_count,
+                        "should_ensure": False,
+                        "reason": "challenge_not_active",
+                    }
+                capacity_event = await self._bootstrap_capacity_event(
+                    session, run_id, parent_id
+                )
+                flag_event = await session.scalar(
+                    select(StateEventRecord)
+                    .where(
+                        StateEventRecord.run_id == run_id,
+                        StateEventRecord.agent_id == parent_id,
+                        StateEventRecord.event_type == "bootstrap_flag_accepted",
+                    )
+                    .order_by(StateEventRecord.sequence.desc())
                     .limit(1)
                 )
-                if existing is not None:
-                    result = self._agent_dict(existing)
-                    result.update({"enabled": True, "idempotent": True})
-                    return result
-
-                bootstrap_agent_id = f"execution_{uuid4().hex}"
-                bootstrap_agent = AgentRecord(
-                    agent_id=bootstrap_agent_id,
-                    run_id=run_id,
-                    parent_id=parent_id,
-                    unique_code=unique_code,
-                    cycle_id=None,
-                    role="execution",
-                    kind="bootstrap",
-                    task_stage="discovery",
-                    priority=bootstrap_priority,
-                    mission=(
-                        "Autonomously advance this Challenge and obtain an exact candidate result."
-                    ),
-                    initial_prompt=bootstrap_prompt,
-                    session_memory=DEFAULT_SESSION_MEMORY,
-                    success_criteria=[],
-                    context_refs=[],
-                    report_cursors={
-                        "bootstrap_shared_challenge": int(
-                            int.from_bytes(
-                                hashlib.sha256(
-                                    json.dumps(
-                                        {
-                                            "direction": challenge.direction,
-                                            "is_completed": challenge.is_completed,
-                                            "work_status": challenge.work_status,
-                                            "container_status": challenge.container_status,
-                                            "container_addr": challenge.container_addr,
-                                        },
-                                        sort_keys=True,
-                                        ensure_ascii=False,
-                                        default=str,
-                                    ).encode("utf-8")
-                                ).digest()[:8],
-                                "big",
-                            )
-                        )
-                    },
-                    hypothesis_key=None,
-                    task_key=None,
-                    branch_key=None,
-                    timeout_seconds=None,
-                    status="queued",
+                window_timestamps = [
+                    aware(item.created_at)
+                    for item in (capacity_event, flag_event)
+                    if item is not None
+                ]
+                window_timestamps.append(
+                    aware(challenge.active_since or challenge.started_at or challenge.created_at)
                 )
-                session.add(bootstrap_agent)
-                admission = AdmissionRecord(
-                    admission_id=f"admission_{uuid4().hex}",
-                    run_id=run_id,
-                    agent_id=bootstrap_agent_id,
-                    unique_code=unique_code,
-                    role="execution",
-                    priority=bootstrap_priority,
-                    status="queued",
-                )
-                session.add(admission)
-                await self._event(
-                    session,
-                    run_id,
-                    "agent_created",
-                    {
-                        "agent_id": bootstrap_agent_id,
-                        "role": "execution",
-                        "parent_id": parent_id,
+                window_start = max(window_timestamps)
+                now = aware(self.clock())
+                if active_count < target_count:
+                    return {
                         "unique_code": unique_code,
-                        "kind": "bootstrap",
-                        "task_stage": "discovery",
-                    },
-                    agent_id=bootstrap_agent_id,
-                )
-                await self._event(
+                        "active_count": active_count,
+                        "target_count": target_count,
+                        "should_ensure": True,
+                        "reason": "restore_capacity",
+                    }
+                if target_count >= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
+                    return {
+                        "unique_code": unique_code,
+                        "active_count": active_count,
+                        "target_count": target_count,
+                        "should_ensure": False,
+                        "reason": "capacity_limit",
+                    }
+                elapsed = max(0, int((now - window_start).total_seconds()))
+                if elapsed < BOOTSTRAP_SCALE_INTERVAL_SECONDS:
+                    return {
+                        "unique_code": unique_code,
+                        "active_count": active_count,
+                        "target_count": target_count,
+                        "should_ensure": False,
+                        "elapsed_seconds": elapsed,
+                        "reason": "scale_window_open",
+                    }
+                output = await self._bootstrap_productive_output_since(
                     session,
                     run_id,
-                    "bootstrap_created",
-                    {
-                        "agent_id": bootstrap_agent_id,
-                        "parent_id": parent_id,
-                        "admission_id": admission.admission_id,
-                        "priority": bootstrap_priority,
-                        "reason": "bootstrap_cycle",
-                    },
-                    agent_id=bootstrap_agent_id,
+                    unique_code,
+                    [item.agent_id for item in bootstrap_agents],
+                    window_start,
+                )
+                if output is None:
+                    return {
+                        "unique_code": unique_code,
+                        "active_count": active_count,
+                        "target_count": target_count,
+                        "should_ensure": False,
+                        "elapsed_seconds": elapsed,
+                        "reason": "no_productive_output",
+                    }
+                next_target = min(
+                    MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE,
+                    max(target_count, active_count) + 1,
                 )
                 event_sequence = await self._event(
                     session,
                     run_id,
-                    "agent_admission_queued",
+                    "bootstrap_capacity_changed",
                     {
-                        "agent_id": bootstrap_agent_id,
-                        "admission_id": admission.admission_id,
-                        "priority": bootstrap_priority,
+                        "unique_code": unique_code,
+                        "target_count": next_target,
+                        "reason": "no_flag_productive_window",
+                        "window_seconds": elapsed,
+                        "output_kind": output["kind"],
                     },
-                    agent_id=bootstrap_agent_id,
+                    agent_id=parent_id,
                 )
                 result = {
-                    **self._agent_dict(bootstrap_agent),
-                    "enabled": True,
-                    "created": True,
-                    "admission_id": admission.admission_id,
-                    "admission_status": admission.status,
+                    "unique_code": unique_code,
+                    "active_count": active_count,
+                    "target_count": next_target,
+                    "should_ensure": True,
+                    "reason": "no_flag_productive_window",
+                    "output": output,
+                    "event_sequence": event_sequence,
                 }
-        if event_sequence is not None:
-            await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
+        await self.notifier.notify(self.run_signal_key(run_id), int(result["event_sequence"]))
         return result
 
     async def prepare_bootstrap_shared_update(
@@ -1687,21 +2582,28 @@ class StateService:
                 if agent.kind != "bootstrap" or not agent.unique_code:
                     return None
                 cursors = dict(agent.report_cursors or {})
-                pending = int(cursors.get("bootstrap_shared_pending", 0) or 0)
-                if pending:
+                pending_digest = cursors.get("bootstrap_shared_pending_digest")
+                if isinstance(pending_digest, str) and pending_digest:
                     event = await session.scalar(
                         select(StateEventRecord)
                         .where(
                             StateEventRecord.run_id == run_id,
                             StateEventRecord.agent_id == agent.agent_id,
                             StateEventRecord.event_type == "bootstrap_shared_snapshot",
-                            StateEventRecord.sequence >= pending,
                         )
                         .order_by(StateEventRecord.sequence.desc())
                         .limit(1)
                     )
-                    if event is not None:
-                        return {**dict(event.payload or {}), "replayed": True}
+                    if (
+                        event is not None
+                        and isinstance(event.payload, Mapping)
+                        and event.payload.get("content_digest") == pending_digest
+                    ):
+                        replayed = {**dict(event.payload or {}), "replayed": True}
+                        replayed["reports"] = await self._hydrate_blackboard_candidates(
+                            session, list(replayed.get("reports") or [])
+                        )
+                        return replayed
                 cursor = int(cursors.get("bootstrap_shared", 0) or 0)
                 hint_cursor = int(cursors.get("bootstrap_hint", 0) or 0)
                 rows = list(
@@ -1720,6 +2622,56 @@ class StateService:
                         )
                     ).all()
                 )
+                scanned_report_through = rows[-1].sequence if rows else cursor
+                high_value_rows = [
+                    row
+                    for row in rows
+                    if isinstance(row.payload, Mapping)
+                    and _is_high_value_report(row.payload)
+                ]
+                # Keep only distinct, evidence-backed conclusions. Explicit
+                # checkpoints remain one-per-report because their stable keys
+                # drive deterministic follow-up work.
+                report_findings: dict[str, list[Mapping[str, Any]]] = {}
+                report_candidates: dict[str, str | None] = {}
+                seen_conclusions: set[tuple[str, str]] = set()
+                filtered_rows: list[ReportRecord] = []
+                for row in high_value_rows:
+                    payload = row.payload if isinstance(row.payload, Mapping) else {}
+                    report_type = payload.get("type")
+                    if report_type in {"bootstrap_checkpoint", "execution_checkpoint"}:
+                        filtered_rows.append(row)
+                        continue
+                    safe_findings: list[Mapping[str, Any]] = []
+                    for finding in list(payload.get("findings") or []):
+                        if not isinstance(finding, Mapping) or not _is_high_value_finding(finding):
+                            continue
+                        finding_ref = finding.get("finding_ref")
+                        if not isinstance(finding_ref, str) or not finding_ref:
+                            finding_ref = " ".join(str(finding.get("summary") or "").lower().split())
+                        key = (
+                            "finding",
+                            f"{finding.get('category') or 'other'}:{finding_ref}",
+                        )
+                        if key in seen_conclusions:
+                            continue
+                        seen_conclusions.add(key)
+                        safe_findings.append(finding)
+                    candidate = payload.get("candidate_flag")
+                    candidate_key = (
+                        "candidate",
+                        candidate.strip() if isinstance(candidate, str) else "",
+                    )
+                    if isinstance(candidate, str) and candidate.strip():
+                        if candidate_key in seen_conclusions:
+                            candidate = None
+                        else:
+                            seen_conclusions.add(candidate_key)
+                    report_candidates[row.report_id] = candidate if isinstance(candidate, str) else None
+                    if safe_findings or (isinstance(candidate, str) and candidate.strip()):
+                        filtered_rows.append(row)
+                        report_findings[row.report_id] = safe_findings
+                high_value_rows = filtered_rows
                 hints = list(
                     (
                         await session.scalars(
@@ -1736,50 +2688,89 @@ class StateService:
                     ).all()
                 )
                 challenge = await self._require_challenge(session, run_id, agent.unique_code)
-                challenge_token = int.from_bytes(
-                    hashlib.sha256(
-                        json.dumps(
-                            {
-                                "direction": challenge.direction,
-                                "is_completed": challenge.is_completed,
-                                "work_status": challenge.work_status,
-                                "container_status": challenge.container_status,
-                                "container_addr": challenge.container_addr,
-                            },
-                            sort_keys=True,
-                            ensure_ascii=False,
-                            default=str,
-                        ).encode("utf-8")
-                    ).digest()[:8],
-                    "big",
+                authority_view = {
+                    "direction": challenge.direction,
+                    "is_completed": challenge.is_completed,
+                    "work_status": challenge.work_status,
+                    "control_state": challenge.control_state,
+                    "flag_count": challenge.flag_count,
+                    "correct_flag_count": challenge.correct_flag_count,
+                }
+                authority_digest = blackboard_content_digest(
+                    {"challenge": authority_view}
                 )
-                if (
-                    not rows
-                    and not hints
-                    and cursors.get("bootstrap_shared_challenge") == challenge_token
-                ):
-                    return None
+                if not high_value_rows and not hints:
+                    previous_authority_digest = cursors.get(
+                        "bootstrap_shared_authority_digest"
+                    )
+                    shared_cursor = max(cursor, scanned_report_through)
+                    agent.report_cursors = {
+                        **cursors,
+                        "bootstrap_shared": shared_cursor,
+                        "bootstrap_shared_authority_digest": authority_digest,
+                    }
+                    if not previous_authority_digest or previous_authority_digest == authority_digest:
+                        if previous_authority_digest == authority_digest and cursors.get(
+                            "bootstrap_shared_last_dedup_digest"
+                        ) != authority_digest:
+                            await self._event(
+                                session,
+                                run_id,
+                                "blackboard_dedup_hit",
+                                {
+                                    "receiver": "bootstrap",
+                                    "content_digest": authority_digest,
+                                    "through_sequence": shared_cursor,
+                                    "cursor_from": cursor,
+                                    "cursor_to": shared_cursor,
+                                    "cursor_advanced": shared_cursor > cursor,
+                                },
+                                agent_id=agent.agent_id,
+                            )
+                            agent.report_cursors = {
+                                **agent.report_cursors,
+                                "bootstrap_shared_last_dedup_digest": authority_digest,
+                            }
+                        return None
                 reports: list[dict[str, Any]] = []
-                for row in rows:
+                for row in high_value_rows:
                     payload = dict((row.payload or {}))
+                    safe_findings = report_findings.get(row.report_id)
+                    if safe_findings is None:
+                        safe_findings = [
+                            item
+                            for item in list(payload.get("findings") or [])
+                            if isinstance(item, Mapping) and _is_high_value_finding(item)
+                        ]
                     reports.append(
                         {
                             "report_ref": f"report:{row.report_id}",
                             "agent_id": row.agent_id,
                             "status": row.status,
+                            "type": payload.get("type"),
                             "summary": str(payload.get("summary") or "")[:800],
+                            "route_key": payload.get("route_key"),
+                            "task_stage": payload.get("task_stage"),
+                            "urgency": payload.get("urgency"),
+                            "next_step": str(payload.get("next_step") or "")[:1_000],
+                            "task_key": payload.get("task_key"),
+                            "branch_key": payload.get("branch_key"),
                             "findings": [
                                 {
                                     "finding_ref": item.get("finding_ref"),
+                                    "category": item.get("category"),
                                     "summary": str(item.get("summary") or "")[:500],
                                     "verification_status": item.get("verification_status"),
-                                    "evidence_refs": list(item.get("evidence_refs") or [])[:10],
+                                    "confidence": item.get("confidence"),
+                                    "evidence_refs": _controller_refs(item.get("evidence_refs")),
                                 }
-                                for item in list(payload.get("findings") or [])[:5]
+                                for item in list(safe_findings)[:5]
                                 if isinstance(item, Mapping)
                             ],
-                            "evidence_refs": list(payload.get("evidence_refs") or [])[:10],
-                            "candidate_flag": payload.get("candidate_flag"),
+                            "evidence_refs": _controller_refs(payload.get("evidence_refs")),
+                            "candidate_flag": report_candidates.get(
+                                row.report_id, payload.get("candidate_flag")
+                            ),
                         }
                     )
                 hint_values = [
@@ -1791,7 +2782,8 @@ class StateService:
                     for item in hints
                 ]
                 through_sequence = max(
-                    [item.sequence for item in (*rows, *hints)] or [cursor, hint_cursor]
+                    [item.sequence for item in (*rows, *hints)]
+                    or [cursor, hint_cursor]
                 )
                 update_payload: dict[str, Any] = {
                     "type": "bootstrap_shared_update",
@@ -1799,55 +2791,168 @@ class StateService:
                     "challenge": {
                         "direction": challenge.direction,
                         "is_completed": challenge.is_completed,
+                        "work_status": challenge.work_status,
+                        "control_state": challenge.control_state,
+                        "flag_count": challenge.flag_count,
+                        "correct_flag_count": challenge.correct_flag_count,
                     },
                     "reports": reports,
                     "hints": hint_values,
-                    "has_more": len(rows) >= max_reports or len(hints) >= 4,
+                    "has_more": len(rows) >= max_reports
+                    or len(high_value_rows) > len(reports)
+                    or len(hints) >= 4,
                     "replayed": False,
                 }
+                reports = sorted(
+                    reports,
+                    key=lambda item: (
+                        0
+                        if item.get("candidate_flag")
+                        or item.get("type") == "bootstrap_checkpoint"
+                        or (
+                            item.get("type") == "execution_checkpoint"
+                            and item.get("urgency") == "interrupt"
+                        )
+                        else 1
+                    ),
+                )
+                update_payload["reports"] = reports
                 encoded = json.dumps(update_payload, ensure_ascii=False, default=str)
-                if len(encoded) > max_chars:
-                    while len(reports) > 1 and len(encoded) > max_chars:
+                while len(encoded) > max_chars:
+                    changed = False
+                    if len(reports) > 1:
                         reports.pop()
-                        update_payload["reports"] = reports
-                        update_payload["has_more"] = True
-                        encoded = json.dumps(update_payload, ensure_ascii=False, default=str)
-                    while len(hint_values) > 1 and len(encoded) > max_chars:
-                        hint_values.pop()
-                        update_payload["hints"] = hint_values
-                        update_payload["has_more"] = True
-                        encoded = json.dumps(update_payload, ensure_ascii=False, default=str)
-                included_report_rows = rows[: len(reports)]
+                        changed = True
+                    elif reports:
+                        report = reports[0]
+                        findings = report.get("findings")
+                        refs = report.get("evidence_refs")
+                        next_step = str(report.get("next_step") or "")
+                        summary = str(report.get("summary") or "")
+                        if isinstance(findings, list) and findings:
+                            findings.pop()
+                            changed = True
+                        elif isinstance(refs, list) and len(refs) > 1:
+                            report["evidence_refs"] = refs[:1]
+                            changed = True
+                        elif "branch_key" in report:
+                            report.pop("branch_key", None)
+                            changed = True
+                        elif "task_key" in report:
+                            report.pop("task_key", None)
+                            changed = True
+                        elif len(next_step) > 64:
+                            report["next_step"] = next_step[: max(32, len(next_step) // 2)]
+                            changed = True
+                        elif len(summary) > 64:
+                            report["summary"] = summary[: max(32, len(summary) // 2)]
+                            changed = True
+                        elif report.get("candidate_flag") is None:
+                            report.pop("candidate_flag", None)
+                            changed = True
+                    if not changed and hint_values:
+                        if len(hint_values) > 1:
+                            hint_values.pop()
+                            changed = True
+                        else:
+                            hint = hint_values[0]
+                            hint_text = str(hint.get("hint") or "")
+                            reason_text = str(hint.get("reason") or "")
+                            if len(hint_text) > 256:
+                                hint["hint"] = hint_text[: max(128, len(hint_text) // 2)]
+                                changed = True
+                            elif len(reason_text) > 128:
+                                hint["reason"] = reason_text[: max(64, len(reason_text) // 2)]
+                                changed = True
+                    if not changed:
+                        break
+                    update_payload["reports"] = reports
+                    update_payload["hints"] = hint_values
+                    update_payload["has_more"] = True
+                    encoded = json.dumps(update_payload, ensure_ascii=False, default=str)
+                included_report_ids = {
+                    item.get("report_ref")
+                    for item in reports
+                    if isinstance(item.get("report_ref"), str)
+                }
+                included_report_rows = [
+                    row
+                    for row in high_value_rows
+                    if f"report:{row.report_id}" in included_report_ids
+                ]
                 report_through = (
                     included_report_rows[-1].sequence
                     if included_report_rows
-                    else cursor
+                    else (scanned_report_through if not high_value_rows else cursor)
                 )
-                through_sequence = max(
-                    report_through,
+                report_through = max(cursor, report_through)
+                hint_through = max(
+                    hint_cursor,
                     hints[: len(hint_values)][-1].sequence
                     if hint_values
                     else hint_cursor,
                 )
-                update_payload["through_sequence"] = through_sequence
-                agent.report_cursors = {
-                    **cursors,
-                    "bootstrap_shared": report_through,
-                    "bootstrap_hint": (
-                        hints[: len(hint_values)][-1].sequence
-                        if hint_values
-                        else hint_cursor
+                update_payload["through_sequence"] = max(
+                    report_through, hint_through
+                )
+                content_digest = blackboard_content_digest(update_payload)
+                if content_digest == cursors.get("bootstrap_shared_content_digest"):
+                    agent.report_cursors = {
+                        **cursors,
+                        "bootstrap_shared": report_through,
+                        "bootstrap_hint": hint_through,
+                        "bootstrap_shared_authority_digest": authority_digest,
+                        "bootstrap_shared_content_digest": content_digest,
+                    }
+                    if cursors.get("bootstrap_shared_last_dedup_digest") != content_digest:
+                        await self._event(
+                            session,
+                            run_id,
+                            "blackboard_dedup_hit",
+                            {
+                                "receiver": "bootstrap",
+                                "content_digest": content_digest,
+                                "through_sequence": update_payload["through_sequence"],
+                                "cursor_from": max(cursor, hint_cursor),
+                                "cursor_to": update_payload["through_sequence"],
+                                "cursor_advanced": (
+                                    report_through > cursor or hint_through > hint_cursor
+                                ),
+                            },
+                            agent_id=agent.agent_id,
+                        )
+                        agent.report_cursors = {
+                            **agent.report_cursors,
+                            "bootstrap_shared_last_dedup_digest": content_digest,
+                        }
+                    return None
+                event_payload = {
+                    **update_payload,
+                    "content_digest": content_digest,
+                    "authority_digest": authority_digest,
+                    "reports": _safe_blackboard_reports(
+                        list(update_payload.get("reports") or [])
                     ),
-                    "bootstrap_shared_challenge": challenge_token,
-                    "bootstrap_shared_pending": through_sequence,
                 }
-                await self._event(
+                event_sequence = await self._event(
                     session,
                     run_id,
                     "bootstrap_shared_snapshot",
-                    update_payload,
+                    event_payload,
                     agent_id=agent.agent_id,
                 )
+                agent.report_cursors = {
+                    **cursors,
+                    "bootstrap_shared": report_through,
+                    "bootstrap_hint": hint_through,
+                    "bootstrap_shared_authority_digest": authority_digest,
+                    "bootstrap_shared_content_digest": content_digest,
+                    "bootstrap_shared_pending_digest": content_digest,
+                    "bootstrap_shared_pending_through": update_payload[
+                        "through_sequence"
+                    ],
+                    "bootstrap_shared_pending_event": event_sequence,
+                }
                 return update_payload
 
     async def acknowledge_bootstrap_shared_update(
@@ -1864,9 +2969,18 @@ class StateService:
                 if agent.kind != "bootstrap":
                     return
                 cursors = dict(agent.report_cursors or {})
-                pending = int(cursors.get("bootstrap_shared_pending", 0) or 0)
-                if pending and through_sequence >= pending:
-                    cursors.pop("bootstrap_shared_pending", None)
+                pending_digest = cursors.get("bootstrap_shared_pending_digest")
+                pending_through = int(
+                    cursors.get("bootstrap_shared_pending_through", 0) or 0
+                )
+                if (
+                    isinstance(pending_digest, str)
+                    and pending_digest
+                    and through_sequence >= pending_through
+                ):
+                    cursors.pop("bootstrap_shared_pending_digest", None)
+                    cursors.pop("bootstrap_shared_pending_through", None)
+                    cursors.pop("bootstrap_shared_pending_event", None)
                     agent.report_cursors = cursors
 
     async def get_assignment(self, run_id: str, agent_id: str, context: CapabilityContext) -> dict[str, Any]:
@@ -2261,6 +3375,53 @@ class StateService:
                     cycle_id=agent.cycle_id,
                 )
         return self._agent_dict(agent)
+
+    async def mark_execution_branch_running(
+        self, run_id: str, agent_id: str
+    ) -> dict[str, Any]:
+        """Synchronize the durable branch with the Agent admission transition."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                agent = await session.get(AgentRecord, agent_id)
+                if agent is None or agent.run_id != run_id:
+                    raise StateNotFound("agent_not_found", "Execution Agent was not found")
+                if agent.role != "execution" or not agent.branch_key or not agent.unique_code:
+                    return {"updated": False, "reason": "branch_not_bound"}
+                branch = await session.get(
+                    ExecutionBranchRecord,
+                    (run_id, agent.unique_code, agent.branch_key),
+                )
+                if branch is None or branch.status in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "exhausted",
+                }:
+                    return {
+                        "updated": False,
+                        "reason": "branch_terminal" if branch is not None else "branch_not_found",
+                    }
+                branch.status = "running"
+                branch.updated_at = self.clock()
+                branch.version += 1
+                await self._event(
+                    session,
+                    run_id,
+                    "execution_branch_running",
+                    {
+                        "agent_id": agent_id,
+                        "unique_code": agent.unique_code,
+                        "branch_key": agent.branch_key,
+                    },
+                    agent_id=agent_id,
+                    cycle_id=agent.cycle_id,
+                )
+                return {
+                    "updated": True,
+                    "branch_key": branch.branch_key,
+                    "status": branch.status,
+                }
 
     async def transition_controller(
         self,
@@ -3767,7 +4928,11 @@ class StateService:
                         if report_type == "execution" and agent.unique_code
                         else None
                     )
+                    digest_key = (
+                        f"controller_{report_type or 'all'}_content_digest"
+                    )
                     if rows:
+                        previous_cursor = current_cursor
                         current_cursor = rows[-1].sequence
                         agent.report_cursors = {
                             **agent.report_cursors,
@@ -3795,22 +4960,56 @@ class StateService:
                                 self._controller_report_projection(item)
                                 for item in reports
                             ]
-                        await self._event(
-                            session,
-                            run_id,
-                            "controller_snapshot",
-                            {
-                                "through_sequence": current_cursor,
-                                "count": len(rows),
-                                "report_type": report_type,
-                                "reports": redact_value(reports),
-                                "activity": redact_value(activity or {}),
-                            },
-                            agent_id=agent.agent_id,
+                        snapshot_payload = {
+                            "through_sequence": current_cursor,
+                            "count": len(rows),
+                            "report_type": report_type,
+                            "reports": _safe_blackboard_reports(reports),
+                            "activity": redact_value(activity or {}),
+                        }
+                        content_digest = blackboard_content_digest(snapshot_payload)
+                        content_changed = (
+                            agent.role != "challenge"
+                            or content_digest
+                            != agent.report_cursors.get(digest_key)
                         )
+                        if content_changed:
+                            snapshot_payload["content_digest"] = content_digest
+                            await self._event(
+                                session,
+                                run_id,
+                                "controller_snapshot",
+                                snapshot_payload,
+                                agent_id=agent.agent_id,
+                            )
+                        elif agent.role == "challenge" and agent.report_cursors.get(
+                            f"{digest_key}_last_dedup_event"
+                        ) != content_digest:
+                            await self._event(
+                                session,
+                                run_id,
+                                "blackboard_dedup_hit",
+                                {
+                                    "receiver": "challenge",
+                                    "content_digest": content_digest,
+                                    "through_sequence": current_cursor,
+                                    "cursor_from": previous_cursor,
+                                    "cursor_to": current_cursor,
+                                    "cursor_advanced": current_cursor > previous_cursor,
+                                },
+                                agent_id=agent.agent_id,
+                            )
+                            agent.report_cursors = {
+                                **agent.report_cursors,
+                                f"{digest_key}_last_dedup_event": content_digest,
+                            }
+                        agent.report_cursors = {
+                            **agent.report_cursors,
+                            digest_key: content_digest,
+                        }
                         result = {
-                            "reports": reports,
-                            "count": len(reports),
+                            "reports": reports if content_changed else [],
+                            "count": len(reports) if content_changed else 0,
                             "next_sequence": current_cursor,
                             "consumed_at": consumed_at.isoformat(),
                         }
@@ -3818,19 +5017,53 @@ class StateService:
                             result.update(activity)
                         return result
                     if wait_seconds <= 0:
-                        await self._event(
-                            session,
-                            run_id,
-                            "controller_snapshot",
-                            {
-                                "through_sequence": current_cursor,
-                                "count": 0,
-                                "report_type": report_type,
-                                "reports": [],
-                                "activity": redact_value(activity or {}),
-                            },
-                            agent_id=agent.agent_id,
+                        snapshot_payload = {
+                            "through_sequence": current_cursor,
+                            "count": 0,
+                            "report_type": report_type,
+                            "reports": [],
+                            "activity": redact_value(activity or {}),
+                        }
+                        content_digest = blackboard_content_digest(snapshot_payload)
+                        content_changed = (
+                            agent.role != "challenge"
+                            or content_digest
+                            != agent.report_cursors.get(digest_key)
                         )
+                        if content_changed:
+                            snapshot_payload["content_digest"] = content_digest
+                            await self._event(
+                                session,
+                                run_id,
+                                "controller_snapshot",
+                                snapshot_payload,
+                                agent_id=agent.agent_id,
+                            )
+                        elif agent.role == "challenge" and agent.report_cursors.get(
+                            f"{digest_key}_last_dedup_event"
+                        ) != content_digest:
+                            await self._event(
+                                session,
+                                run_id,
+                                "blackboard_dedup_hit",
+                                {
+                                    "receiver": "challenge",
+                                    "content_digest": content_digest,
+                                    "through_sequence": current_cursor,
+                                    "cursor_from": current_cursor,
+                                    "cursor_to": current_cursor,
+                                    "cursor_advanced": False,
+                                },
+                                agent_id=agent.agent_id,
+                            )
+                            agent.report_cursors = {
+                                **agent.report_cursors,
+                                f"{digest_key}_last_dedup_event": content_digest,
+                            }
+                        agent.report_cursors = {
+                            **agent.report_cursors,
+                            digest_key: content_digest,
+                        }
                         result = {
                             "reports": [],
                             "count": 0,
@@ -3896,15 +5129,56 @@ class StateService:
                     .limit(1)
                 )
                 if acknowledged is None:
+                    hydrated = await self._hydrate_blackboard_candidates(
+                        session, saved[:max_reports]
+                    )
                     return {
-                        "reports": saved[:max_reports],
-                        "count": min(len(saved), max_reports),
+                        "reports": hydrated,
+                        "count": len(hydrated),
                         "next_sequence": int(
                             payload.get("through_sequence") or 0
                         ),
                     }
                 return None
         return None
+
+    async def _hydrate_blackboard_candidates(
+        self, session: Any, reports: Sequence[Any]
+    ) -> list[Any]:
+        """Restore candidates for a live replay without persisting them."""
+
+        hydrated: list[Any] = []
+        for raw in reports:
+            if not isinstance(raw, Mapping):
+                hydrated.append(raw)
+                continue
+            report = dict(raw)
+            report_id = report.get("report_id")
+            if not isinstance(report_id, str) or not report_id:
+                report_ref = report.get("report_ref")
+                if isinstance(report_ref, str) and report_ref.startswith("report:"):
+                    report_id = report_ref.removeprefix("report:")
+            candidate = self._ephemeral_reports.get(report_id) if report_id else None
+            if not isinstance(candidate, str) or not candidate:
+                source = await session.get(ReportRecord, report_id) if report_id else None
+                source_payload = source.payload if source is not None else None
+                candidate = (
+                    source_payload.get("candidate_flag")
+                    if isinstance(source_payload, Mapping)
+                    else None
+                )
+            if isinstance(candidate, str) and candidate:
+                payload = report.get("payload")
+                if isinstance(payload, Mapping):
+                    payload_copy = dict(payload)
+                    payload_copy.pop("candidate_present", None)
+                    payload_copy["candidate_flag"] = candidate
+                    report["payload"] = payload_copy
+                else:
+                    report.pop("candidate_present", None)
+                    report["candidate_flag"] = candidate
+            hydrated.append(report)
+        return hydrated
 
     async def _execution_activity_in_session(
         self,
@@ -4030,6 +5304,50 @@ class StateService:
         )
         return self._report_dict(report)
 
+    async def publish_challenge_report(
+        self,
+        run_id: str,
+        *,
+        sender_id: str,
+        unique_code: str,
+        report_type: str,
+        status: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a challenge-level report that survives Agent replacement."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                sender = await session.get(AgentRecord, sender_id)
+                if sender is None or sender.run_id != run_id:
+                    raise StateNotFound("agent_not_found", "Challenge report Agent was not found")
+                sequence = await self._next_sequence(session, run_id)
+                report = ReportRecord(
+                    report_id=f"report_{uuid4().hex}",
+                    run_id=run_id,
+                    sequence=sequence,
+                    agent_id=sender_id,
+                    parent_id=None,
+                    unique_code=unique_code,
+                    report_type=report_type,
+                    status=status,
+                    payload=redact_value(dict(payload)),
+                )
+                session.add(report)
+                await self._event_with_sequence(
+                    session,
+                    run_id,
+                    sequence,
+                    "challenge_report_created",
+                    {
+                        "report_id": report.report_id,
+                        "unique_code": unique_code,
+                        "report_type": report_type,
+                    },
+                    agent_id=sender_id,
+                )
+        return self._report_dict(report)
+
     async def dispatch_challenge(
         self,
         run_id: str,
@@ -4124,9 +5442,9 @@ class StateService:
                             * 1_000
                         )
 
-                bootstrap_followup_tasks: list[ExecutionTaskInput] = []
+                high_value_followup_tasks: list[ExecutionTaskInput] = []
                 if not payload.tasks and report_cursor > previous_decision_sequence:
-                    bootstrap_followup_tasks = await self._bootstrap_followup_tasks(
+                    high_value_followup_tasks = await self._high_value_followup_tasks(
                         session,
                         run_id=run_id,
                         unique_code=unique_code,
@@ -4134,7 +5452,36 @@ class StateService:
                         after_sequence=previous_decision_sequence,
                         through_sequence=report_cursor,
                     )
-                dispatch_tasks = list(payload.tasks) or bootstrap_followup_tasks
+                dispatch_tasks = list(payload.tasks) or high_value_followup_tasks
+
+                # Empty controller decisions are intentionally idempotent.  A
+                # Challenge may call ``challenge_dispatch`` while waiting for a
+                # new report; do not create a Cycle, snapshot, or wakeup when
+                # neither the report cursor nor authoritative direction changed.
+                # Reports that were consumed since the previous decision still
+                # create a Cycle, even when they do not produce a follow-up, so
+                # the decision cursor advances durably.
+                empty_decision = (
+                    not payload.tasks
+                    and not dispatch_tasks
+                    and payload.direction is None
+                    and not payload.evidence_refs
+                    and not payload.next_steps
+                    and payload.outcome in {"continue", "blocked"}
+                )
+                if empty_decision and report_cursor <= previous_decision_sequence:
+                    return {
+                        "decision_number": previous_cycle.cycle_number
+                        if previous_cycle is not None
+                        else 0,
+                        "admissions": [],
+                        "idempotent_tasks": [],
+                        "warnings": warnings,
+                        "high_value_followup_task_count": 0,
+                        "decision_report_sequence": None,
+                        "transition_latency_ms": None,
+                        "no_action": True,
+                    }
 
                 cycle_number = int(
                     await session.scalar(
@@ -4212,6 +5559,20 @@ class StateService:
                                 "task_key": task_key,
                                 "agent_id": existing.agent_id,
                                 "status": existing.status,
+                            }
+                        )
+                        continue
+
+                    existing_branch = await session.get(
+                        ExecutionBranchRecord,
+                        (run_id, unique_code, branch_key),
+                    )
+                    if existing_branch is not None and existing_branch.status == "exhausted":
+                        warnings.append(
+                            {
+                                "code": "branch_exhausted",
+                                "message": "The requested branch was already exhausted",
+                                "details": {"branch_key": branch_key},
                             }
                         )
                         continue
@@ -4346,8 +5707,8 @@ class StateService:
                         "cycle_number": cycle.cycle_number,
                         "outcome": payload.outcome,
                         "task_count": len(admissions),
-                        "bootstrap_followup_task_count": len(
-                            bootstrap_followup_tasks
+                        "high_value_followup_task_count": len(
+                            high_value_followup_tasks
                         ),
                         "idempotent_task_count": len(idempotent_tasks),
                         "warning_count": len(warnings),
@@ -4382,17 +5743,113 @@ class StateService:
                 )
 
         await self.notifier.notify(self.run_signal_key(run_id), final_sequence)
+        if unique_code:
+            await self._maybe_signal_challenge_quiescence(run_id, unique_code)
         return {
             "decision_number": cycle.cycle_number,
             "admissions": admissions,
             "idempotent_tasks": idempotent_tasks,
             "warnings": warnings,
-            "bootstrap_followup_task_count": len(bootstrap_followup_tasks),
+            "high_value_followup_task_count": len(high_value_followup_tasks),
             "decision_report_sequence": decision_report_sequence,
             "transition_latency_ms": transition_latency_ms,
         }
 
-    async def _bootstrap_followup_tasks(
+    async def _maybe_signal_challenge_quiescence(
+        self, run_id: str, unique_code: str
+    ) -> bool:
+        """Wake a Challenge once its non-Bootstrap work has gone quiet.
+
+        This is a readiness signal only.  The Challenge remains the authority
+        for dispatching follow-ups and submitting the final candidate.  A
+        Bootstrap cycle-yield is deliberately excluded so the persistent lane
+        does not cause repeated quiescence wakeups.
+        """
+
+        challenge_agent_id: str | None = None
+        event_sequence: int | None = None
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                if challenge.is_completed or challenge.work_status in {
+                    "closed",
+                    "paused",
+                    "completed",
+                }:
+                    return False
+                controller = await session.scalar(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "challenge",
+                        AgentRecord.status.not_in(
+                            ["failed", "stopped", "completed", "cancelled", "interrupted"]
+                        ),
+                    )
+                )
+                if controller is None:
+                    return False
+                active_count = int(
+                    await session.scalar(
+                        select(func.count(AgentRecord.agent_id)).where(
+                            AgentRecord.run_id == run_id,
+                            AgentRecord.unique_code == unique_code,
+                            AgentRecord.role == "execution",
+                            AgentRecord.kind != "bootstrap",
+                            AgentRecord.status.in_(sorted(ACTIVE_EXECUTION_STATUSES)),
+                        )
+                    )
+                    or 0
+                )
+                if active_count:
+                    return False
+                latest_terminal = await session.scalar(
+                    select(func.max(ReportRecord.sequence))
+                    .join(
+                        AgentRecord,
+                        AgentRecord.agent_id == ReportRecord.agent_id,
+                    )
+                    .where(
+                        ReportRecord.run_id == run_id,
+                        ReportRecord.unique_code == unique_code,
+                        ReportRecord.report_type == "execution",
+                        ReportRecord.status.in_(
+                            ["completed", "blocked", "failed", "cancelled"]
+                        ),
+                        AgentRecord.kind != "bootstrap",
+                    )
+                )
+                if latest_terminal is None:
+                    return False
+                cursors = dict(controller.report_cursors or {})
+                previous = int(
+                    cursors.get("challenge_quiescence_sequence", 0) or 0
+                )
+                if int(latest_terminal) <= previous:
+                    return False
+                challenge_agent_id = controller.agent_id
+                event_sequence = await self._event(
+                    session,
+                    run_id,
+                    "challenge_quiescence_ready",
+                    {
+                        "unique_code": unique_code,
+                        "terminal_report_sequence": int(latest_terminal),
+                        "active_execution_count": 0,
+                    },
+                    agent_id=controller.agent_id,
+                    cycle_id=controller.cycle_id,
+                )
+                cursors["challenge_quiescence_sequence"] = int(latest_terminal)
+                controller.report_cursors = cursors
+        if challenge_agent_id is not None and event_sequence is not None:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, challenge_agent_id), event_sequence
+            )
+            return True
+        return False
+
+    async def _high_value_followup_tasks(
         self,
         session: Any,
         *,
@@ -4402,7 +5859,7 @@ class StateService:
         after_sequence: int,
         through_sequence: int,
     ) -> list[ExecutionTaskInput]:
-        """Build deterministic validation/exploitation work from new Bootstrap findings."""
+        """Build deterministic work from newly consumed high-value checkpoints."""
 
         rows = (
             await session.execute(
@@ -4415,142 +5872,105 @@ class StateService:
                     ReportRecord.consumed_by == controller_id,
                     ReportRecord.sequence > after_sequence,
                     ReportRecord.sequence <= through_sequence,
-                    ReportRecord.status.in_({"completed", "blocked"}),
+                    ReportRecord.status.in_({"completed", "blocked", "working"}),
                     AgentRecord.run_id == run_id,
                     AgentRecord.unique_code == unique_code,
                     AgentRecord.role == "execution",
-                    AgentRecord.kind == "bootstrap",
                 )
                 .order_by(ReportRecord.sequence)
             )
         ).all()
         tasks: list[ExecutionTaskInput] = []
-        seen_finding_refs: set[str] = set()
         for report, _bootstrap in rows:
             payload = report.payload if isinstance(report.payload, Mapping) else {}
-            raw_findings = payload.get("findings")
-            if not isinstance(raw_findings, list):
-                continue
-            candidate_flag_present = isinstance(
-                payload.get("candidate_flag"), str
-            ) and bool(str(payload.get("candidate_flag") or "").strip())
-            for raw_finding in raw_findings:
-                if not isinstance(raw_finding, Mapping):
-                    continue
-                finding_ref = raw_finding.get("finding_ref")
-                if (
-                    not isinstance(finding_ref, str)
-                    or not REPORT_FINDING_REF_PATTERN.fullmatch(finding_ref)
-                    or finding_ref in seen_finding_refs
-                ):
-                    continue
-                finding = await session.get(
-                    FindingRecord, finding_ref.removeprefix("finding:")
-                )
-                if (
-                    finding is None
-                    or finding.run_id != run_id
-                    or finding.unique_code != unique_code
-                    or finding.category not in BOOTSTRAP_FOLLOWUP_CATEGORIES
-                    or finding.verification_status == "rejected"
-                ):
-                    continue
-                detail = finding.detail if isinstance(finding.detail, Mapping) else {}
-                raw_evidence_refs = detail.get("evidence_refs")
-                if not isinstance(raw_evidence_refs, list):
-                    continue
-                candidate_evidence_refs = list(
-                    dict.fromkeys(
-                        ref
-                        for ref in raw_evidence_refs
-                        if isinstance(ref, str) and ref.startswith("evidence:")
-                    )
-                )
-                if not candidate_evidence_refs:
-                    continue
-                evidence_ids = [
-                    ref.removeprefix("evidence:")
-                    for ref in candidate_evidence_refs
-                ]
-                valid_evidence_ids = set(
-                    (
-                        await session.scalars(
-                            select(EvidenceRecord.evidence_id).where(
-                                EvidenceRecord.run_id == run_id,
-                                EvidenceRecord.unique_code == unique_code,
-                                EvidenceRecord.evidence_id.in_(evidence_ids),
-                            )
-                        )
-                    ).all()
-                )
+            if payload.get("type") == "execution_checkpoint":
+                next_step = payload.get("next_step")
+                current_stage = payload.get("task_stage")
                 evidence_refs = [
-                    ref
-                    for ref, evidence_id in zip(
-                        candidate_evidence_refs, evidence_ids
-                    )
-                    if evidence_id in valid_evidence_ids
+                    item
+                    for item in list(payload.get("evidence_refs") or [])
+                    if isinstance(item, str) and item.startswith("evidence:")
                 ]
-                if not evidence_refs:
+                if (
+                    not isinstance(next_step, str)
+                    or not next_step.strip()
+                    or current_stage not in {
+                        "discovery",
+                        "validation",
+                        "exploitation",
+                        "post_exploitation",
+                    }
+                    or not evidence_refs
+                ):
                     continue
-                verified = finding.verification_status == "verified"
-                if not verified and finding.confidence < EVIDENCE_BACKED_PROGRESS_CONFIDENCE:
-                    continue
-                if finding.category == "flag" and candidate_flag_present:
-                    continue
-
-                finding_token = finding_ref.removeprefix("finding:")
-                if verified:
-                    task_stage = "exploitation"
-                    kind = {
-                        "vulnerability": "exploit",
-                        "attack_path": "exploit",
-                        "credential": "credential",
-                        "privilege": "privilege",
-                        "flag": "verification",
-                    }[finding.category]
-                    if finding.category == "flag":
-                        task_stage = "validation"
-                    priority = 95 if kind == "exploit" else 90
-                    if finding.category == "flag":
-                        objective = (
-                            f"Validate verified Bootstrap flag finding {finding_ref}: "
-                            f"{finding.summary}. Use the assigned Evidence and do not "
-                            "repeat the same discovery branch."
-                        )
-                    else:
-                        objective = (
-                            f"Validate impact and perform the narrowest authorized "
-                            f"exploitation of verified Bootstrap finding {finding_ref}: "
-                            f"{finding.summary}. Use the assigned Evidence and do not "
-                            "repeat the same discovery branch."
-                        )
-                else:
-                    task_stage = "validation"
-                    kind = "verification"
-                    priority = 85
-                    objective = (
-                        f"Validate Bootstrap finding {finding_ref}: {finding.summary}. "
-                        "Use the assigned Evidence to confirm or reject the claim; "
-                        "do not repeat the same discovery branch."
-                    )
+                task_stage = (
+                    "validation" if current_stage == "discovery" else current_stage
+                )
+                kind = "verification" if task_stage == "validation" else "exploit"
+                priority = 95 if payload.get("urgency") == "interrupt" else 90
                 tasks.append(
                     ExecutionTaskInput(
-                        objective=objective,
-                        task_key=f"bootstrap:{finding_ref}:{task_stage}",
-                        hypothesis_key=f"finding:{finding_token}",
-                        branch_key=f"finding:{finding_ref}:{task_stage}",
+                        objective=(
+                            f"Follow the verified Execution checkpoint {report.report_id}: "
+                            f"{next_step[:3_500]}"
+                        ),
+                        task_key=f"execution-checkpoint:{report.report_id}",
+                        hypothesis_key=f"execution-checkpoint:{report.report_id}",
+                        branch_key=(
+                            f"execution-checkpoint:{report.report_id}:{task_stage}"
+                        ),
                         kind=kind,
                         task_stage=task_stage,
                         priority=priority,
                         success_criteria=[
-                            "Use the assigned finding and Evidence references as context.",
-                            "Do not create another discovery task for the same finding.",
-                            "Report verified or rejected with fresh Evidence references when available.",
+                            "Use the checkpoint report and Evidence references as context.",
+                            "Perform only the narrowest next validation or extraction step.",
+                            "Report fresh Evidence and an exact result when verified.",
                         ],
-                        context_refs=[finding_ref, *evidence_refs[:10]],
+                        context_refs=[
+                            f"report:{report.report_id}",
+                            *list(dict.fromkeys(evidence_refs))[:10],
+                        ],
                     )
                 )
-                seen_finding_refs.add(finding_ref)
+                continue
+            if payload.get("type") == "bootstrap_checkpoint":
+                route_key = payload.get("route_key")
+                next_step = payload.get("next_step")
+                task_stage = payload.get("task_stage")
+                evidence_refs = [
+                    item
+                    for item in list(payload.get("evidence_refs") or [])
+                    if isinstance(item, str)
+                ]
+                if (
+                    not isinstance(route_key, str)
+                    or not isinstance(next_step, str)
+                    or task_stage not in {"validation", "exploitation"}
+                    or not evidence_refs
+                ):
+                    continue
+                kind = "verification" if task_stage == "validation" else "exploit"
+                tasks.append(
+                    ExecutionTaskInput(
+                        objective=next_step[:4_000],
+                        task_key=f"bootstrap-checkpoint:{route_key}",
+                        hypothesis_key=f"bootstrap-route:{route_key}",
+                        branch_key=f"bootstrap:{route_key}:handoff",
+                        kind=kind,
+                        task_stage=task_stage,
+                        priority=95,
+                        success_criteria=[
+                            "Use the Bootstrap checkpoint Evidence and route as context.",
+                            "Verify the narrowest next step and report an exact candidate Flag when available.",
+                        ],
+                        context_refs=[
+                            f"report:{report.report_id}",
+                            *list(dict.fromkeys(evidence_refs))[:10],
+                        ],
+                    )
+                )
+                continue
         return tasks
 
     async def submit_report(
@@ -4563,6 +5983,638 @@ class StateService:
         return await self.finalize_execution_agent(
             run_id, agent_id, context, payload
         )
+
+    async def submit_execution_checkpoint(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        *,
+        summary: str,
+        next_step: str,
+        task_stage: str,
+        urgency: str,
+        evidence_refs: Sequence[str],
+    ) -> dict[str, Any]:
+        """Publish a bounded high-value handoff without ending an Execution."""
+
+        summary = " ".join(summary.split())
+        next_step = " ".join(next_step.split())
+        requested_refs = list(dict.fromkeys(evidence_refs))
+        if not summary or len(summary) > 2_000:
+            raise StateError(
+                "invalid_execution_checkpoint",
+                "Execution checkpoint summary must be 1-2000 characters",
+                status_code=422,
+            )
+        if not next_step or len(next_step) > 2_000:
+            raise StateError(
+                "invalid_execution_checkpoint",
+                "Execution checkpoint next_step must be 1-2000 characters",
+                status_code=422,
+            )
+        if task_stage not in {
+            "discovery",
+            "validation",
+            "exploitation",
+            "post_exploitation",
+        }:
+            raise StateError(
+                "invalid_execution_checkpoint",
+                "Execution checkpoint task_stage is invalid",
+                status_code=422,
+            )
+        if urgency not in {"interrupt", "inform"}:
+            raise StateError(
+                "invalid_execution_checkpoint",
+                "Execution checkpoint urgency is invalid",
+                status_code=422,
+            )
+        if not 1 <= len(requested_refs) <= 10 or any(
+            not isinstance(item, str) for item in requested_refs
+        ):
+            raise StateError(
+                "checkpoint_evidence_required",
+                "Execution checkpoint requires 1-10 Evidence references",
+                status_code=422,
+            )
+
+        parent_id: str | None = None
+        bootstrap_ids: list[str] = []
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                agent = await self._authorize(
+                    session, context, roles={"execution"}, agent_id=agent_id
+                )
+                if agent.kind == "bootstrap" or not agent.unique_code:
+                    raise StatePermission(
+                        "parallel_execution_required",
+                        "Only a parallel Execution Agent can submit this checkpoint",
+                    )
+                if agent.terminal_report_id is not None or agent.status in {
+                    "failed",
+                    "stopped",
+                    "completed",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    raise StateConflict(
+                        "execution_not_active",
+                        "Only an active Execution Agent can submit a checkpoint",
+                    )
+                if context.unique_code != agent.unique_code:
+                    raise StatePermission(
+                        "challenge_binding_required",
+                        "Execution checkpoint must remain bound to its Challenge",
+                    )
+                challenge = await self._require_challenge(
+                    session, run_id, agent.unique_code
+                )
+                if (
+                    challenge.work_status in {"paused", "closed", "completed"}
+                    or challenge.is_completed
+                ):
+                    raise StateConflict(
+                        "challenge_not_active",
+                        "The Challenge no longer accepts Execution checkpoints",
+                    )
+
+                warnings: list[dict[str, Any]] = []
+                accepted_refs = await self._filter_report_evidence_refs(
+                    session,
+                    run_id,
+                    agent,
+                    requested_refs,
+                    warnings,
+                    field="evidence_refs",
+                )
+                if set(accepted_refs) != set(requested_refs):
+                    raise StatePermission(
+                        "checkpoint_evidence_required",
+                        "Every Execution checkpoint Evidence reference must belong to this Challenge",
+                    )
+
+                existing_reports = list(
+                    (
+                        await session.scalars(
+                            select(ReportRecord).where(
+                                ReportRecord.run_id == run_id,
+                                ReportRecord.agent_id == agent_id,
+                                ReportRecord.report_type == "execution",
+                            )
+                        )
+                    ).all()
+                )
+                checkpoint_reports = [
+                    item
+                    for item in existing_reports
+                    if isinstance(item.payload, Mapping)
+                    and item.payload.get("type") == "execution_checkpoint"
+                ]
+                for existing_report in checkpoint_reports:
+                    existing_payload = existing_report.payload
+                    if (
+                        existing_payload.get("summary") == summary
+                        and existing_payload.get("next_step") == next_step
+                        and existing_payload.get("task_stage") == task_stage
+                        and existing_payload.get("urgency") == urgency
+                        and list(existing_payload.get("evidence_refs") or [])
+                        == accepted_refs
+                    ):
+                        return {
+                            "report_id": existing_report.report_id,
+                            "sequence": existing_report.sequence,
+                            "status": existing_report.status,
+                            "terminal": False,
+                            "idempotent": True,
+                            "urgency": urgency,
+                            "warnings": [],
+                        }
+                if len(checkpoint_reports) >= EXECUTION_CHECKPOINT_LIMIT:
+                    raise StateConflict(
+                        "execution_checkpoint_limit",
+                        f"An Execution Agent may submit at most {EXECUTION_CHECKPOINT_LIMIT} checkpoints",
+                    )
+
+                sequence = await self._next_sequence(session, run_id)
+                safe_payload = {
+                    "type": "execution_checkpoint",
+                    "status": "working",
+                    "summary": summary,
+                    "next_step": next_step,
+                    "task_stage": task_stage,
+                    "urgency": urgency,
+                    "evidence_refs": accepted_refs,
+                }
+                report = ReportRecord(
+                    report_id=f"report_{uuid4().hex}",
+                    run_id=run_id,
+                    sequence=sequence,
+                    agent_id=agent_id,
+                    parent_id=agent.parent_id,
+                    unique_code=agent.unique_code,
+                    report_type="execution",
+                    status="working",
+                    payload=redact_value(safe_payload),
+                )
+                session.add(report)
+                # A checkpoint is an evidence-backed handoff and therefore
+                # counts as real Challenge progress.  Without this update the
+                # stagnation clock continues to run from the Challenge start
+                # even while validation work has just been queued.
+                self._mark_progress(challenge)
+                agent.last_report_sequence = sequence
+                agent.last_heartbeat_at = self.clock()
+                agent.version += 1
+                parent_id = agent.parent_id
+                bootstrap_ids = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord.agent_id).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == agent.unique_code,
+                                AgentRecord.role == "execution",
+                                AgentRecord.kind == "bootstrap",
+                                AgentRecord.status.not_in(
+                                    [
+                                        "failed",
+                                        "stopped",
+                                        "completed",
+                                        "cancelled",
+                                        "interrupted",
+                                    ]
+                                ),
+                            )
+                        )
+                    ).all()
+                )
+                await self._event_with_sequence(
+                    session,
+                    run_id,
+                    sequence,
+                    "execution_checkpoint_created",
+                    {
+                        "report_id": report.report_id,
+                        "agent_id": agent_id,
+                        "urgency": urgency,
+                        "task_stage": task_stage,
+                        "evidence_ref_count": len(accepted_refs),
+                    },
+                    agent_id=agent_id,
+                    cycle_id=agent.cycle_id,
+                )
+                result = {
+                    "report_id": report.report_id,
+                    "sequence": sequence,
+                    "status": "working",
+                    "terminal": False,
+                    "idempotent": False,
+                    "urgency": urgency,
+                    "warnings": warnings,
+                }
+        if parent_id:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, parent_id), sequence
+            )
+        for bootstrap_id in bootstrap_ids:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, bootstrap_id), sequence
+            )
+        return result
+
+    async def finalize_execution_handoff(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        *,
+        checkpoint_report_id: str,
+    ) -> dict[str, Any]:
+        """End a discovery lane after its checkpoint was handed off.
+
+        The checkpoint itself remains a non-terminal report so the Challenge
+        controller can derive its deterministic follow-up.  The originating
+        Execution is then closed with a small, content-free terminal report;
+        the follow-up owns the validation/exploitation work from this point.
+        """
+
+        async with self.db.sessions() as session:
+            agent = await self._authorize(
+                session, context, roles={"execution"}, agent_id=agent_id
+            )
+            checkpoint = await session.get(ReportRecord, checkpoint_report_id)
+            if (
+                checkpoint is None
+                or checkpoint.run_id != run_id
+                or checkpoint.agent_id != agent_id
+                or checkpoint.report_type != "execution"
+                or not isinstance(checkpoint.payload, Mapping)
+                or checkpoint.payload.get("type") != "execution_checkpoint"
+            ):
+                raise StateError(
+                    "checkpoint_not_found",
+                    "Execution checkpoint was not found for this Agent",
+                    status_code=404,
+                )
+            if checkpoint.payload.get("task_stage") != "discovery":
+                return {
+                    "terminal": False,
+                    "handoff": False,
+                    "idempotent": True,
+                }
+            if agent.terminal_report_id is not None:
+                existing = await session.get(ReportRecord, agent.terminal_report_id)
+                return {
+                    "terminal": True,
+                    "handoff": True,
+                    "idempotent": True,
+                    "report_id": existing.report_id if existing is not None else agent.terminal_report_id,
+                }
+
+        result = await self.finalize_execution_agent(
+            run_id,
+            agent_id,
+            context,
+            AgentReportInput(
+                status="completed",
+                summary="Execution route handed off after a verified checkpoint.",
+                hypothesis_outcome="inconclusive",
+            ),
+            terminal_status="completed",
+            signal_quiescence=False,
+        )
+        return {
+            **result,
+            "terminal": True,
+            "handoff": True,
+            "checkpoint_report_id": checkpoint_report_id,
+        }
+
+    async def yield_bootstrap_cycle(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        *,
+        summary: str,
+    ) -> dict[str, Any]:
+        """Yield one bounded Bootstrap session while preserving its logical lane."""
+
+        summary = " ".join(summary.split())
+        if not summary or len(summary) > 2_000:
+            raise StateError(
+                "invalid_bootstrap_cycle_yield",
+                "Bootstrap cycle yield summary must be 1-2000 characters",
+                status_code=422,
+            )
+        event_sequence: int | None = None
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                agent = await self._authorize(
+                    session, context, roles={"execution"}, agent_id=agent_id
+                )
+                if agent.kind != "bootstrap" or not agent.unique_code:
+                    raise StatePermission(
+                        "bootstrap_cycle_required",
+                        "Only a Bootstrap Agent can yield a cycle",
+                    )
+                if agent.terminal_report_id is not None or agent.status in {
+                    "failed",
+                    "stopped",
+                    "completed",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    raise StateConflict(
+                        "bootstrap_not_active",
+                        "Only an active Bootstrap lane can yield a cycle",
+                    )
+                if context.unique_code != agent.unique_code:
+                    raise StatePermission(
+                        "challenge_binding_required",
+                        "Bootstrap cycle yield must remain bound to its Challenge",
+                    )
+                challenge = await self._require_challenge(
+                    session, run_id, agent.unique_code
+                )
+                if challenge.work_status in {"paused", "closed", "completed"} or challenge.is_completed:
+                    raise StateConflict(
+                        "challenge_not_active",
+                        "The Challenge no longer accepts Bootstrap cycles",
+                    )
+                cursors = dict(agent.report_cursors or {})
+                cycle_number = int(cursors.get("bootstrap_cycle", 0) or 0)
+                next_cycle = cycle_number + 1
+                cursors["bootstrap_cycle"] = next_cycle
+                agent.report_cursors = cursors
+                agent.status = "running"
+                agent.terminal_report_id = None
+                agent.final_report = None
+                agent.ended_at = None
+                agent.stop_requested_at = None
+                agent.last_heartbeat_at = self.clock()
+                agent.version += 1
+                event_sequence = await self._event(
+                    session,
+                    run_id,
+                    "bootstrap_cycle_yield",
+                    {
+                        "agent_id": agent_id,
+                        "cycle_number": cycle_number,
+                        "next_cycle": next_cycle,
+                        "summary": summary,
+                    },
+                    agent_id=agent_id,
+                    cycle_id=agent.cycle_id,
+                )
+                result = {
+                    "agent_id": agent_id,
+                    "status": "running",
+                    "cycle_number": cycle_number,
+                    "next_cycle": next_cycle,
+                    "summary": summary,
+                    "terminal": False,
+                    "cycle_yield": True,
+                }
+        if event_sequence is not None:
+            await self.notifier.notify(self.run_signal_key(run_id), event_sequence)
+        return result
+
+    async def submit_bootstrap_checkpoint(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        *,
+        route_key: str,
+        summary: str,
+        next_step: str,
+        task_stage: str,
+        evidence_refs: Sequence[str],
+    ) -> dict[str, Any]:
+        """Persist one non-terminal, evidence-backed Bootstrap handoff."""
+
+        route_key = route_key.strip()
+        summary = " ".join(summary.split())
+        next_step = " ".join(next_step.split())
+        requested_refs = list(dict.fromkeys(evidence_refs))
+        if not BOOTSTRAP_ROUTE_KEY_PATTERN.fullmatch(route_key):
+            raise StateError(
+                "invalid_bootstrap_route_key",
+                "Bootstrap checkpoint route_key must be a stable lowercase key",
+                status_code=422,
+            )
+        if not summary or len(summary) > 2_000:
+            raise StateError(
+                "invalid_bootstrap_checkpoint",
+                "Bootstrap checkpoint summary must be 1-2000 characters",
+                status_code=422,
+            )
+        if not next_step or len(next_step) > 2_000:
+            raise StateError(
+                "invalid_bootstrap_checkpoint",
+                "Bootstrap checkpoint next_step must be 1-2000 characters",
+                status_code=422,
+            )
+        if task_stage not in {"validation", "exploitation"}:
+            raise StateError(
+                "invalid_bootstrap_checkpoint",
+                "Bootstrap checkpoint task_stage must be validation or exploitation",
+                status_code=422,
+            )
+        if not 1 <= len(requested_refs) <= 10 or any(
+            not isinstance(item, str) for item in requested_refs
+        ):
+            raise StateError(
+                "checkpoint_evidence_required",
+                "Bootstrap checkpoint requires 1-10 Evidence references",
+                status_code=422,
+            )
+
+        parent_id: str | None = None
+        sibling_ids: list[str] = []
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                agent = await self._authorize(
+                    session, context, roles={"execution"}, agent_id=agent_id
+                )
+                if agent.kind != "bootstrap" or not agent.unique_code:
+                    raise StatePermission(
+                        "bootstrap_checkpoint_required",
+                        "Only a Bootstrap Agent can submit a checkpoint",
+                    )
+                if agent.terminal_report_id is not None or agent.status in {
+                    "failed",
+                    "stopped",
+                    "completed",
+                    "cancelled",
+                    "interrupted",
+                }:
+                    raise StateConflict(
+                        "bootstrap_not_active",
+                        "Only an active Bootstrap cycle can submit a checkpoint",
+                    )
+                if context.unique_code != agent.unique_code:
+                    raise StatePermission(
+                        "challenge_binding_required",
+                        "Bootstrap checkpoint must remain bound to its Challenge",
+                    )
+                challenge = await self._require_challenge(
+                    session, run_id, agent.unique_code
+                )
+                if challenge.work_status in {"paused", "closed", "completed"} or challenge.is_completed:
+                    raise StateConflict(
+                        "challenge_not_active",
+                        "The Challenge no longer accepts Bootstrap checkpoints",
+                    )
+
+                warnings: list[dict[str, Any]] = []
+                accepted_refs = await self._filter_report_evidence_refs(
+                    session,
+                    run_id,
+                    agent,
+                    requested_refs,
+                    warnings,
+                    field="evidence_refs",
+                )
+                if set(accepted_refs) != set(requested_refs):
+                    raise StatePermission(
+                        "checkpoint_evidence_required",
+                        "Every Bootstrap checkpoint Evidence reference must belong to this Challenge",
+                    )
+
+                reports = list(
+                    (
+                        await session.scalars(
+                            select(ReportRecord).where(
+                                ReportRecord.run_id == run_id,
+                                ReportRecord.unique_code == agent.unique_code,
+                                ReportRecord.report_type == "execution",
+                            )
+                        )
+                    ).all()
+                )
+                existing_route = next(
+                    (
+                        item
+                        for item in reports
+                        if isinstance(item.payload, Mapping)
+                        and item.payload.get("type") == "bootstrap_checkpoint"
+                        and item.payload.get("route_key") == route_key
+                    ),
+                    None,
+                )
+                if existing_route is not None:
+                    return {
+                        "report_id": existing_route.report_id,
+                        "sequence": existing_route.sequence,
+                        "status": existing_route.status,
+                        "idempotent": True,
+                        "route_key": route_key,
+                        "warnings": [],
+                    }
+
+                cycle_number = int(
+                    (agent.report_cursors or {}).get("bootstrap_cycle", 0) or 0
+                )
+                own_checkpoint_count = sum(
+                    1
+                    for item in reports
+                    if item.agent_id == agent.agent_id
+                    and isinstance(item.payload, Mapping)
+                    and item.payload.get("type") == "bootstrap_checkpoint"
+                    and int(item.payload.get("cycle_number", 0) or 0) == cycle_number
+                )
+                if own_checkpoint_count >= BOOTSTRAP_CHECKPOINT_LIMIT:
+                    raise StateConflict(
+                        "bootstrap_checkpoint_limit",
+                        f"A Bootstrap cycle may submit at most {BOOTSTRAP_CHECKPOINT_LIMIT} checkpoints",
+                    )
+
+                sequence = await self._next_sequence(session, run_id)
+                payload = {
+                    "type": "bootstrap_checkpoint",
+                    "status": "working",
+                    "summary": summary,
+                    "next_step": next_step,
+                    "task_stage": task_stage,
+                    "route_key": route_key,
+                    "task_key": f"bootstrap-checkpoint:{route_key}",
+                    "branch_key": f"bootstrap:{route_key}:handoff",
+                    "evidence_refs": accepted_refs,
+                    "cycle_number": cycle_number,
+                }
+                report = ReportRecord(
+                    report_id=f"report_{uuid4().hex}",
+                    run_id=run_id,
+                    sequence=sequence,
+                    agent_id=agent_id,
+                    parent_id=agent.parent_id,
+                    unique_code=agent.unique_code,
+                    report_type="execution",
+                    status="working",
+                    payload=redact_value(payload),
+                )
+                session.add(report)
+                self._mark_progress(challenge)
+                agent.last_report_sequence = sequence
+                agent.last_heartbeat_at = self.clock()
+                agent.version += 1
+                parent_id = agent.parent_id
+                sibling_ids = list(
+                    (
+                        await session.scalars(
+                            select(AgentRecord.agent_id).where(
+                                AgentRecord.run_id == run_id,
+                                AgentRecord.unique_code == agent.unique_code,
+                                AgentRecord.kind == "bootstrap",
+                                AgentRecord.status.not_in(
+                                    [
+                                        "failed",
+                                        "stopped",
+                                        "completed",
+                                        "cancelled",
+                                        "interrupted",
+                                    ]
+                                ),
+                                AgentRecord.agent_id != agent.agent_id,
+                            )
+                        )
+                    ).all()
+                )
+                await self._event_with_sequence(
+                    session,
+                    run_id,
+                    sequence,
+                    "bootstrap_checkpoint_created",
+                    {
+                        "report_id": report.report_id,
+                        "agent_id": agent_id,
+                        "route_key": route_key,
+                        "task_stage": task_stage,
+                        "evidence_ref_count": len(accepted_refs),
+                    },
+                    agent_id=agent_id,
+                )
+                result = {
+                    "report_id": report.report_id,
+                    "sequence": sequence,
+                    "status": "working",
+                    "idempotent": False,
+                    "route_key": route_key,
+                    "terminal": False,
+                    "warnings": warnings,
+                }
+        if parent_id:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, parent_id), sequence
+            )
+        for sibling_id in sibling_ids:
+            await self.notifier.notify(
+                self.agent_signal_key(run_id, sibling_id), sequence
+            )
+        return result
+
     async def _filter_report_evidence_refs(
         self,
         session: Any,
@@ -4790,6 +6842,7 @@ class StateService:
                 continue
             if existing is not None:
                 previous = existing.verification_status
+                previous_confidence = existing.confidence
                 previous_refs = list((existing.detail or {}).get("evidence_refs", []))
                 merged_refs = list(dict.fromkeys([*previous_refs, *evidence_refs]))
                 next_detail = {**parsed.detail, "evidence_refs": merged_refs}
@@ -4809,11 +6862,15 @@ class StateService:
                 if (
                     previous == "candidate"
                     and parsed.verification_status in {"verified", "rejected"}
-                    and evidence_refs
+                    and merged_refs
                 ):
                     progress_kinds.add(f"finding_{parsed.verification_status}")
-                elif set(merged_refs) - set(previous_refs):
-                    progress_kinds.add(f"finding_{parsed.verification_status}")
+                elif (
+                    previous_confidence < EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                    <= existing.confidence
+                    and merged_refs
+                ):
+                    progress_kinds.add("finding_evidence_backed")
                 saved.append(self._finding_dict(existing))
                 stats["persisted"] += 1
                 if normalized:
@@ -4834,6 +6891,14 @@ class StateService:
                 if previous_record is not None
                 else []
             )
+            previous_status = (
+                previous_record.verification_status
+                if previous_record is not None
+                else None
+            )
+            previous_confidence = (
+                previous_record.confidence if previous_record is not None else None
+            )
             item_progress, items = await self._record_findings(
                 session,
                 run_id,
@@ -4852,7 +6917,23 @@ class StateService:
                         record.detail = {**(record.detail or {}), "evidence_refs": merged_refs}
                         if previous_record is not None:
                             record.version += 1
+                    if previous_record is None and evidence_refs:
                         progress_kinds.add(f"finding_{record.verification_status}")
+                    elif (
+                        previous_record is not None
+                        and previous_status == "candidate"
+                        and record.verification_status in {"verified", "rejected"}
+                        and merged_refs
+                    ):
+                        progress_kinds.add(f"finding_{record.verification_status}")
+                    elif (
+                        previous_record is not None
+                        and previous_confidence is not None
+                        and previous_confidence < EVIDENCE_BACKED_PROGRESS_CONFIDENCE
+                        <= record.confidence
+                        and merged_refs
+                    ):
+                        progress_kinds.add("finding_evidence_backed")
                     saved.append(self._finding_dict(record))
                 else:
                     saved.extend(items)
@@ -4870,8 +6951,10 @@ class StateService:
         *,
         terminal_status: str | None,
         allow_inactive: bool,
+        signal_quiescence: bool,
     ) -> dict[str, Any]:
         parent_id: str | None = None
+        challenge_code: str | None = None
         bootstrap_ids: list[str] = []
         warnings: list[dict[str, Any]] = []
         async with self._lock:
@@ -4985,12 +7068,23 @@ class StateService:
                     payload=safe_payload,
                 )
                 session.add(report)
-                resolved_status = terminal_status or {
-                    "completed": "completed",
-                    "cancelled": "stopped",
-                    "blocked": "failed",
-                    "failed": "failed",
-                }[payload.status]
+                bootstrap_cycle_yield = (
+                    agent.kind == "bootstrap"
+                    and terminal_status is None
+                    and payload.status in {"blocked", "completed"}
+                    and payload.candidate_flag is None
+                )
+                resolved_status = (
+                    "running"
+                    if bootstrap_cycle_yield
+                    else terminal_status
+                    or {
+                        "completed": "completed",
+                        "cancelled": "stopped",
+                        "blocked": "failed",
+                        "failed": "failed",
+                    }[payload.status]
+                )
                 durable_report = {
                     "type": "execution_report",
                     "agent_id": agent_id,
@@ -4999,24 +7093,63 @@ class StateService:
                     "report_id": report.report_id,
                 }
                 agent.status = resolved_status
-                agent.final_report = redact_value(durable_report)
-                agent.terminal_report_id = report.report_id
+                if bootstrap_cycle_yield:
+                    cursors = dict(agent.report_cursors or {})
+                    cycle_number = int(cursors.get("bootstrap_cycle", 0) or 0)
+                    cursors["bootstrap_cycle"] = cycle_number + 1
+                    agent.report_cursors = cursors
+                    agent.final_report = None
+                    agent.terminal_report_id = None
+                else:
+                    agent.final_report = redact_value(durable_report)
+                    agent.terminal_report_id = report.report_id
                 agent.last_report_sequence = sequence
                 agent.last_heartbeat_at = self.clock()
-                agent.ended_at = self.clock()
+                agent.ended_at = None if bootstrap_cycle_yield else self.clock()
                 agent.version += 1
-                if agent.branch_key and agent.unique_code:
+                admission = await session.scalar(
+                    select(AdmissionRecord).where(
+                        AdmissionRecord.run_id == run_id,
+                        AdmissionRecord.agent_id == agent.agent_id,
+                    )
+                )
+                if admission is not None and not bootstrap_cycle_yield and admission.status not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "stopped",
+                    "interrupted",
+                }:
+                    admission.status = resolved_status
+                    admission.updated_at = self.clock()
+                    await self._event(
+                        session,
+                        run_id,
+                        "agent_admission_finished",
+                        {
+                            "agent_id": agent.agent_id,
+                            "admission_id": admission.admission_id,
+                            "status": resolved_status,
+                        },
+                        agent_id=agent.agent_id,
+                        cycle_id=agent.cycle_id,
+                    )
+                if agent.branch_key and agent.unique_code and not bootstrap_cycle_yield:
                     branch = await session.get(
                         ExecutionBranchRecord,
                         (run_id, agent.unique_code, agent.branch_key),
                     )
                     if branch is not None:
-                        branch.status = {
+                        terminal_branch_status = {
                             "completed": "completed",
                             "cancelled": "cancelled",
                             "blocked": "failed",
                             "failed": "failed",
                         }[payload.status]
+                        summary_text = str(payload.summary or "")
+                        if "BRANCH_EXHAUSTED" in summary_text or "ENTRY_UNREACHABLE" in summary_text:
+                            terminal_branch_status = "exhausted"
+                        branch.status = terminal_branch_status
                         branch.outcome = {
                             **branch.outcome,
                             "report_id": report.report_id,
@@ -5024,6 +7157,7 @@ class StateService:
                         }
                         branch.last_progress_at = self.clock()
                 parent_id = agent.parent_id
+                challenge_code = agent.unique_code
                 if agent.unique_code:
                     bootstrap_ids = list(
                         (
@@ -5066,7 +7200,26 @@ class StateService:
                     agent_id=agent_id,
                     cycle_id=agent.cycle_id,
                 )
-                if agent.kind == "bootstrap":
+                if agent.kind == "bootstrap" and bootstrap_cycle_yield:
+                    await self._event(
+                        session,
+                        run_id,
+                        "bootstrap_cycle_yield",
+                        {
+                            "agent_id": agent.agent_id,
+                            "cycle_number": int(
+                                (agent.report_cursors or {}).get("bootstrap_cycle", 1)
+                            ) - 1,
+                            "next_cycle": int(
+                                (agent.report_cursors or {}).get("bootstrap_cycle", 1)
+                            ),
+                            "summary": payload.summary,
+                            "source": "non_terminal_execution_report",
+                        },
+                        agent_id=agent.agent_id,
+                        cycle_id=agent.cycle_id,
+                    )
+                elif agent.kind == "bootstrap":
                     await self._event(
                         session,
                         run_id,
@@ -5084,9 +7237,12 @@ class StateService:
                     "status": payload.status,
                     "hypothesis_outcome": outcome,
                     "valid_progress": valid,
+                    "candidate_flag_present": payload.candidate_flag is not None,
                     "progress_kinds": sorted(progress_kinds),
                     "findings": findings,
                     "warnings": warnings,
+                    "terminal": not bootstrap_cycle_yield,
+                    "cycle_yield": bootstrap_cycle_yield,
                 }
                 if payload.candidate_flag is not None:
                     self._ephemeral_reports[report.report_id] = payload.candidate_flag
@@ -5098,6 +7254,8 @@ class StateService:
             await self.notifier.notify(
                 self.agent_signal_key(run_id, bootstrap_id), sequence
             )
+        if challenge_code and result.get("terminal") and signal_quiescence:
+            await self._maybe_signal_challenge_quiescence(run_id, challenge_code)
         return result
 
     async def finalize_execution_agent(
@@ -5109,6 +7267,7 @@ class StateService:
         *,
         terminal_status: str | None = None,
         allow_inactive: bool = False,
+        signal_quiescence: bool = True,
     ) -> dict[str, Any]:
         """Atomically persist exactly one terminal Execution report."""
 
@@ -5119,6 +7278,7 @@ class StateService:
             payload,
             terminal_status=terminal_status,
             allow_inactive=allow_inactive,
+            signal_quiescence=signal_quiescence,
         )
     async def list_reports(
         self,
@@ -5186,6 +7346,109 @@ class StateService:
                         cycle_id=agent.cycle_id,
                     )
         return self._agent_dict(agent)
+
+    async def claim_challenge_tool_fingerprint(
+        self,
+        run_id: str,
+        unique_code: str,
+        agent_id: str,
+        *,
+        tool_name: str,
+        digest: str,
+    ) -> dict[str, Any]:
+        """Atomically suppress an identical in-flight or successful expensive call.
+
+        Only the one-way digest is stored in the Challenge controller cursor;
+        request arguments and tool output never enter durable state.
+        """
+
+        if tool_name != "pentest_sqlmap":
+            return {"claimed": True, "duplicate": False}
+        key = f"{tool_name}:{digest}"
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await self._require_challenge(session, run_id, unique_code)
+                controller = await session.scalar(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "challenge",
+                    )
+                )
+                if controller is None:
+                    return {"claimed": True, "duplicate": False}
+                cursors = dict(controller.report_cursors or {})
+                attempts = dict(cursors.get("expensive_tool_attempts") or {})
+                existing = attempts.get(key)
+                if isinstance(existing, Mapping):
+                    status = existing.get("status")
+                    owner_id = existing.get("agent_id")
+                    if status == "success":
+                        return {
+                            "claimed": False,
+                            "duplicate": True,
+                            "reason": "already_succeeded",
+                        }
+                    if status == "running" and owner_id != agent_id:
+                        owner = await session.get(AgentRecord, owner_id)
+                        if owner is not None and owner.status not in {
+                            "failed",
+                            "stopped",
+                            "completed",
+                            "cancelled",
+                            "interrupted",
+                        }:
+                            return {
+                                "claimed": False,
+                                "duplicate": True,
+                                "reason": "already_running",
+                            }
+                attempts[key] = {"status": "running", "agent_id": agent_id}
+                while len(attempts) > 128:
+                    attempts.pop(next(iter(attempts)))
+                cursors["expensive_tool_attempts"] = attempts
+                controller.report_cursors = cursors
+                controller.version += 1
+        return {"claimed": True, "duplicate": False}
+
+    async def complete_challenge_tool_fingerprint(
+        self,
+        run_id: str,
+        unique_code: str,
+        agent_id: str,
+        *,
+        tool_name: str,
+        digest: str,
+        success: bool,
+    ) -> None:
+        """Commit or release an expensive-call digest without storing payloads."""
+
+        if tool_name != "pentest_sqlmap":
+            return
+        key = f"{tool_name}:{digest}"
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                controller = await session.scalar(
+                    select(AgentRecord).where(
+                        AgentRecord.run_id == run_id,
+                        AgentRecord.unique_code == unique_code,
+                        AgentRecord.role == "challenge",
+                    )
+                )
+                if controller is None:
+                    return
+                cursors = dict(controller.report_cursors or {})
+                attempts = dict(cursors.get("expensive_tool_attempts") or {})
+                existing = attempts.get(key)
+                if not isinstance(existing, Mapping) or existing.get("agent_id") != agent_id:
+                    return
+                if success:
+                    attempts[key] = {"status": "success"}
+                else:
+                    attempts.pop(key, None)
+                cursors["expensive_tool_attempts"] = attempts
+                controller.report_cursors = cursors
+                controller.version += 1
 
     async def record_controller_wait(
         self,
@@ -5273,6 +7536,20 @@ class StateService:
                             "next_report_sequence": through_sequence,
                             "pending_snapshot": True,
                         }
+                quiescence_through = int(
+                    (agent.report_cursors or {}).get(
+                        "challenge_quiescence_sequence", 0
+                    )
+                    or 0
+                )
+                if quiescence_through > decided_through:
+                    return {
+                        "status": "ready",
+                        "reason": "challenge_quiescence_ready",
+                        "reports_available": 0,
+                        "next_report_sequence": quiescence_through,
+                        "quiescence": True,
+                    }
                 agent.status = "waiting"
                 agent.ended_at = None
                 agent.version += 1
@@ -5453,6 +7730,17 @@ class StateService:
                             },
                             agent_id=operation.agent_id,
                         )
+                        if progress_kind == "flag_accepted":
+                            await self._event(
+                                session,
+                                run_id,
+                                "bootstrap_flag_accepted",
+                                {
+                                    "unique_code": operation.unique_code,
+                                    "correct_flag_count": challenge.correct_flag_count,
+                                },
+                                agent_id=operation.agent_id,
+                            )
                 operation.completed_sequence = await self._event(
                     session,
                     run_id,
@@ -5496,6 +7784,53 @@ class StateService:
                     run_id,
                     "operation_failed",
                     {"operation_id": operation_id, "error_code": operation.error_code, "duration_ms": operation.duration_ms},
+                    agent_id=operation.agent_id,
+                )
+        return self._operation_dict(operation)
+
+    async def mark_operation_indeterminate(
+        self,
+        run_id: str,
+        operation_id: str,
+        *,
+        error_code: str = "operation_indeterminate",
+        error_message: str = "The remote operation may have executed but could not be confirmed",
+        result_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Park one ambiguous remote operation without allowing a retry."""
+
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                operation = await session.get(OperationRecord, operation_id)
+                if operation is None or operation.run_id != run_id:
+                    raise StateNotFound("operation_not_found", "operation was not found")
+                if operation.status != "started":
+                    raise StateConflict("operation_not_started", "operation is not active")
+                operation.status = "indeterminate"
+                operation.error_code = error_code[:128]
+                operation.error_message = error_message[:512]
+                operation.result_payload = redact_value(dict(result_payload or {}))
+                operation.completed_at = self.clock()
+                operation.duration_ms = max(
+                    0,
+                    int(
+                        (
+                            aware(operation.completed_at)
+                            - aware(operation.started_at)
+                        ).total_seconds()
+                        * 1_000
+                    ),
+                )
+                operation.completed_sequence = await self._event(
+                    session,
+                    run_id,
+                    "operation_indeterminate",
+                    {
+                        "operation_id": operation.operation_id,
+                        "operation_type": operation.operation_type,
+                        "unique_code": operation.unique_code,
+                        "error_code": operation.error_code,
+                    },
                     agent_id=operation.agent_id,
                 )
         return self._operation_dict(operation)
@@ -6085,7 +8420,18 @@ class StateService:
         safe_payload = _json_value(
             redact_value(dict(payload), secrets=self.ephemeral_secrets())
         )
-        session.add(StateEventRecord(event_id=f"event_{uuid4().hex}", run_id=run_id, sequence=sequence, agent_id=agent_id, cycle_id=cycle_id, event_type=event_type, payload=safe_payload))
+        session.add(
+            StateEventRecord(
+                event_id=f"event_{uuid4().hex}",
+                run_id=run_id,
+                sequence=sequence,
+                agent_id=agent_id,
+                cycle_id=cycle_id,
+                event_type=event_type,
+                payload=safe_payload,
+                created_at=self.clock(),
+            )
+        )
         session.add(AuditOutboxRecord(run_id=run_id, sequence=sequence))
 
     async def _next_sequence(self, session: Any, run_id: str) -> int:
@@ -6823,8 +9169,68 @@ class StateService:
         return {"run_id": item.run_id, "status": item.status, "phase": item.phase, "model": item.model, "prompt": item.prompt, "context_window_tokens": item.context_window_tokens, "duration_minutes": item.duration_minutes, "started_at": _json_value(item.started_at), "deadline_at": _json_value(item.deadline_at), "current_challenge_code": item.current_challenge_code, "score_snapshot": item.score_snapshot, "last_sequence": item.last_sequence, "last_projected_sequence": item.last_projected_sequence, "stagnation_epoch": item.stagnation_epoch, "paused_at": _json_value(item.paused_at), "pause_reason": item.pause_reason}
 
     @staticmethod
-    def _challenge_dict(item: ChallengeRecord) -> dict[str, Any]:
-        return {"run_id": item.run_id, "unique_code": item.unique_code, "description": item.description, "difficulty": item.difficulty, "level": item.level, "total_score": item.total_score, "flag_count": item.flag_count, "correct_flag_count": item.correct_flag_count, "is_completed": item.is_completed, "platform_status": item.platform_status, "container_status": item.container_status, "slot_occupied": container_slot_occupied(item.container_status), "container_addr": item.container_addr, "direction": item.direction, "work_status": item.work_status, "control_state": item.control_state, "control_since": _json_value(item.control_since), "pause_reason": item.pause_reason, "evidence_root": item.evidence_root, "low_yield": item.stagnation_level > 0, "hint_eligible": item.hint_eligible, "hint_requested": item.hint_requested, "exploration_seconds": item.exploration_seconds, "active_since": _json_value(item.active_since), "last_progress_at": _json_value(item.last_progress_at)}
+    def _challenge_dict(
+        item: ChallengeRecord,
+        *,
+        run: RunRecord | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        signal: dict[str, Any] = {
+            "eligible": bool(item.hint_eligible and not item.hint_requested),
+            "reason": None,
+            "no_progress_seconds": 0,
+            "run_elapsed_seconds": 0,
+            "remaining_seconds": None,
+        }
+        if run is not None:
+            current = aware(now or utc_now())
+            signal["run_elapsed_seconds"] = max(
+                0, int((current - aware(run.started_at)).total_seconds())
+            )
+            signal["remaining_seconds"] = max(
+                0, int((aware(run.deadline_at) - current).total_seconds())
+            )
+            baseline = item.last_progress_at or item.active_since or run.started_at
+            signal["no_progress_seconds"] = max(
+                0, int((current - aware(baseline)).total_seconds())
+            )
+            if signal["eligible"]:
+                if signal["remaining_seconds"] <= 30 * 60:
+                    signal["reason"] = "final_30_minutes"
+                elif item.pause_reason == "stagnation_timeout":
+                    signal["reason"] = "hard_stagnation"
+                elif item.stagnation_level > 0:
+                    signal["reason"] = "low_yield"
+                else:
+                    signal["reason"] = "already_eligible"
+        return {
+            "run_id": item.run_id,
+            "unique_code": item.unique_code,
+            "description": item.description,
+            "difficulty": item.difficulty,
+            "level": item.level,
+            "total_score": item.total_score,
+            "flag_count": item.flag_count,
+            "correct_flag_count": item.correct_flag_count,
+            "is_completed": item.is_completed,
+            "platform_status": item.platform_status,
+            "container_status": item.container_status,
+            "slot_occupied": container_slot_occupied(item.container_status),
+            "container_addr": item.container_addr,
+            "direction": item.direction,
+            "work_status": item.work_status,
+            "control_state": item.control_state,
+            "control_since": _json_value(item.control_since),
+            "pause_reason": item.pause_reason,
+            "evidence_root": item.evidence_root,
+            "low_yield": item.stagnation_level > 0,
+            "hint_eligible": item.hint_eligible,
+            "hint_requested": item.hint_requested,
+            "hint_signal": signal,
+            "exploration_seconds": item.exploration_seconds,
+            "active_since": _json_value(item.active_since),
+            "last_progress_at": _json_value(item.last_progress_at),
+        }
 
     @staticmethod
     def _agent_dict(item: AgentRecord, *, include_runtime: bool = False) -> dict[str, Any]:
@@ -6916,11 +9322,13 @@ class StateService:
         payload = item.get("payload")
         payload_map = payload if isinstance(payload, Mapping) else {}
         projected_payload: dict[str, Any] = {
+            "type": payload_map.get("type"),
             "status": payload_map.get("status") or item.get("status"),
             "summary": _controller_text(
                 payload_map.get("summary"), CONTROLLER_SUMMARY_CHARS
             ),
             "confidence": payload_map.get("confidence"),
+            "urgency": payload_map.get("urgency"),
             "hypothesis_outcome": payload_map.get("hypothesis_outcome"),
             "evidence_refs": _controller_refs(payload_map.get("evidence_refs")),
             "next_steps": [
@@ -6929,22 +9337,55 @@ class StateService:
             ],
             "findings": [],
         }
+        for field, limit in (
+            ("route_key", 128),
+            ("task_stage", 32),
+            ("task_key", 128),
+            ("branch_key", 256),
+        ):
+            value = payload_map.get(field)
+            if isinstance(value, str) and value:
+                projected_payload[field] = value[:limit]
+        next_step = payload_map.get("next_step")
+        if isinstance(next_step, str) and next_step:
+            projected_payload["next_step"] = _controller_text(next_step, CONTROLLER_SUMMARY_CHARS)
+        projected_findings: dict[tuple[str, str], dict[str, Any]] = {}
         for raw_finding in list(payload_map.get("findings") or [])[:CONTROLLER_FINDING_LIMIT]:
             if not isinstance(raw_finding, Mapping):
                 continue
-            projected_payload["findings"].append(
-                {
-                    "finding_ref": raw_finding.get("finding_ref"),
-                    "category": raw_finding.get("category"),
-                    "summary": _controller_text(
-                        raw_finding.get("summary") or raw_finding.get("title"),
-                        CONTROLLER_SUMMARY_CHARS,
-                    ),
-                    "confidence": raw_finding.get("confidence"),
-                    "verification_status": raw_finding.get("verification_status"),
-                    "evidence_refs": _controller_refs(raw_finding.get("evidence_refs")),
-                }
-            )
+            finding_ref = raw_finding.get("finding_ref")
+            if not isinstance(finding_ref, str) or not finding_ref:
+                finding_ref = _controller_text(
+                    raw_finding.get("summary") or raw_finding.get("title"),
+                    CONTROLLER_SUMMARY_CHARS,
+                )
+            category = str(raw_finding.get("category") or "other")
+            projected = {
+                "finding_ref": raw_finding.get("finding_ref"),
+                "category": raw_finding.get("category"),
+                "summary": _controller_text(
+                    raw_finding.get("summary") or raw_finding.get("title"),
+                    CONTROLLER_SUMMARY_CHARS,
+                ),
+                "confidence": raw_finding.get("confidence"),
+                "verification_status": raw_finding.get("verification_status"),
+                "evidence_refs": _controller_refs(raw_finding.get("evidence_refs")),
+            }
+            key = (category, finding_ref)
+            previous = projected_findings.get(key)
+            if previous is None:
+                projected_findings[key] = projected
+                continue
+            try:
+                previous_confidence = float(previous.get("confidence") or 0.0)
+                current_confidence = float(projected.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                previous_confidence = current_confidence = 0.0
+            if current_confidence >= previous_confidence:
+                projected_findings[key] = projected
+        projected_payload["findings"] = list(projected_findings.values())[
+            :CONTROLLER_FINDING_LIMIT
+        ]
         candidate_flag = payload_map.get("candidate_flag")
         if isinstance(candidate_flag, str) and candidate_flag:
             projected_payload["candidate_flag"] = candidate_flag
@@ -7147,7 +9588,7 @@ class StateService:
             )
         for field in (
             "platform_status", "container_status", "work_status",
-            "hint_requested", "flag_count", "correct_flag_count", "is_completed",
+            "hint_requested", "hint_eligible", "flag_count", "correct_flag_count", "is_completed",
         ):
             if field in updates:
                 setattr(challenge, field, updates[field])

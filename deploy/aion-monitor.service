@@ -1,0 +1,34 @@
+[Unit]
+Description=AION read-only Web Monitor
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/aion/current/scripts/runtime_monitor.py
+ConditionPathExists=/etc/aion/aion.env
+ConditionPathExists=/var/lib/aion/runs
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/opt/aion/current
+EnvironmentFile=/etc/aion/aion.env
+Environment=HOME=/var/lib/aion/home
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/aion/current-venv/bin/python /opt/aion/current/scripts/runtime_monitor.py --run-root /var/lib/aion/runs --current-run-file /var/lib/aion/current-run-id --monitor-port 8765 --runtime-service aion-online.service
+Restart=always
+RestartSec=1s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=10s
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/aion
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aion-monitor
+
+[Install]
+WantedBy=multi-user.target

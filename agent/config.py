@@ -69,8 +69,22 @@ def deepseek_agent_request_options(
     role: str | None,
     bootstrap: bool = False,
     context_budget: ContextBudget | None = None,
+    report_recovery: bool = False,
 ) -> dict[str, object]:
-    """Return the fixed DeepSeek policy for a primary Agent request."""
+    """Return the fixed DeepSeek policy for a primary Agent request.
+
+    A report recovery is deliberately a small request, but it remains a
+    reasoning request because DeepSeek tool calls must include
+    ``reasoning_content``.  Normal Agent turns keep the role-specific output
+    budget.
+    """
+
+    if report_recovery:
+        return {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "max",
+            "max_tokens": 4_096,
+        }
 
     budget = context_budget or ContextBudget()
     return {
@@ -101,6 +115,11 @@ class AgentSettings(BaseSettings):
     skill_discovery_model: str | None = Field(
         default=None,
         validation_alias="AION_SKILL_DISCOVERY_MODEL",
+        description=(
+            "Optional auxiliary model for Skill Discovery. Leave unset, or use "
+            "local/disabled/off, to use the deterministic local catalog without "
+            "an extra model request."
+        ),
     )
     llm_api_key: SecretStr = Field(
         min_length=1,

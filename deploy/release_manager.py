@@ -24,6 +24,7 @@ HISTORY_FILE = APP_ROOT / "release-history.json"
 PENDING_FILE = APP_ROOT / ".release-pending.json"
 BACKUP_ROOT = APP_ROOT / "control-backups"
 SERVICE = "aion-online.service"
+MONITOR_SERVICE = "aion-monitor.service"
 RELEASE_PATTERN = re.compile(r"^[0-9]{14}-[a-f0-9]{12}$")
 HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 SOURCE_NAMES = (
@@ -180,7 +181,7 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
             str(validation_python),
             "-c",
             (
-                "import json; import agent, challenges_sdk, scripts.online_runtime, tools;"
+                "import json; import agent, challenges_sdk, scripts.online_runtime, scripts.runtime_monitor, tools;"
                 "from tools.binaries.validation import check_tool_chain;"
                 "report=check_tool_chain();"
                 "assert report['ok'], json.dumps(report, ensure_ascii=False)"
@@ -267,6 +268,7 @@ def _activate(release_id: str) -> None:
     control_files = {
         Path("/usr/local/bin/aionctl"): backup / "aionctl",
         Path("/etc/systemd/system/aion-online.service"): backup / "aion-online.service",
+        Path("/etc/systemd/system/aion-monitor.service"): backup / "aion-monitor.service",
         Path("/etc/nginx/conf.d/aion-monitor.conf"): backup / "aion-monitor.conf",
     }
     for destination, saved in control_files.items():
@@ -289,11 +291,17 @@ def _activate(release_id: str) -> None:
             0o644,
         )
         _copy_control_file(
+            release / "deploy" / "aion-monitor.service",
+            Path("/etc/systemd/system/aion-monitor.service"),
+            0o644,
+        )
+        _copy_control_file(
             release / "deploy" / "aion-monitor.conf",
             Path("/etc/nginx/conf.d/aion-monitor.conf"),
             0o644,
         )
         _run(["systemctl", "daemon-reload"])
+        _run(["systemctl", "try-restart", MONITOR_SERVICE], check=False)
         _run(["nginx", "-t"])
         _run(["systemctl", "reload", "nginx"])
     except Exception:
@@ -331,10 +339,15 @@ def _rollback_pending() -> None:
         Path("/etc/systemd/system/aion-online.service"),
     )
     _restore_file(
+        backup / "aion-monitor.service",
+        Path("/etc/systemd/system/aion-monitor.service"),
+    )
+    _restore_file(
         backup / "aion-monitor.conf",
         Path("/etc/nginx/conf.d/aion-monitor.conf"),
     )
     _run(["systemctl", "daemon-reload"])
+    _run(["systemctl", "try-restart", MONITOR_SERVICE], check=False)
     _run(["nginx", "-t"])
     _run(["systemctl", "reload", "nginx"])
     PENDING_FILE.unlink(missing_ok=True)

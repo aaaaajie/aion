@@ -43,6 +43,18 @@
       "package": "unicorn",
       "purpose": "CPU emulation",
       "required": true
+    },
+    "paramiko": {
+      "version": "5.0.0",
+      "package": "paramiko",
+      "purpose": "SSH sessions, SFTP transfer, and direct-tcpip internal channels",
+      "required": true
+    },
+    "pyelftools": {
+      "version": "0.33",
+      "package": "pyelftools",
+      "purpose": "Structured ELF metadata for Linux binary workflows",
+      "required": true
     }
   },
   "system_binaries": {
@@ -104,18 +116,18 @@
     "sqlmap": {
       "version": "1.8.6",
       "path": "bin/sqlmap",
-      "sha256": null,
+      "sha256": "13f1c027b2db8e5e97d5f388bdd755aee8d50e936869c7fbad4bda88a31c4607",
       "version_args": ["--version"],
       "purpose": "SQL injection verification",
-      "required": false
+      "required": true
     },
     "ffuf": {
       "version": "2.1.0",
       "path": "bin/ffuf",
-      "sha256": null,
+      "sha256": "b0183aeed13d3ccea5db79809ca4135b7561257406a0f5d6f982e0551abea4e7",
       "version_args": ["-V"],
       "purpose": "Directory fuzzing",
-      "required": false
+      "required": true
     }
   }
 }

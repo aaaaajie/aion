@@ -37,6 +37,7 @@ def catalog(tmp_path: Path) -> SkillCatalog:
     for category in ("common", "challenge", "execution"):
         (root / category).mkdir(parents=True)
     skill(root, "sql-injection")
+    skill(root, "sqli-sql-injection")
     skill(root, "java-deserialization")
     return SkillCatalog(root)
 
@@ -81,3 +82,49 @@ async def test_generic_http_baseline_does_not_activate_unrelated_skill(tmp_path:
     )
     assert state.values == []
     assert "<skill_candidates>" not in context.render_system_context()
+
+
+@pytest.mark.asyncio
+async def test_strong_candidate_stays_model_activated(tmp_path: Path) -> None:
+    state = SkillState()
+    context = SkillSessionContext(
+        catalog(tmp_path),
+        role="execution",
+        service=state,  # type: ignore[arg-type]
+        run_id="run",
+        agent_id="agent",
+        selection_text="login form stable 500 SQL injection sqlmap",
+        presented_candidates=[
+            {
+                "skill_id": "execution/sql-injection",
+                "match_strength": "strong",
+                "recommended": True,
+                "relevance_reason": "The task explicitly tests SQL injection.",
+            }
+        ],
+    )
+
+    assert state.values == []
+    rendered = context.render_system_context()
+    assert "match_strength" in rendered
+    assert "ranking signals, not activation commands" in rendered
+    assert "only tool call in your first" not in rendered
+    activated = await context.invoke("execution/sql-injection")
+    assert activated["activation_status"] == "activated"
+    assert state.values == ["execution/sql-injection"]
+    assert context.active_skills[0]["activation_mode"] == "model"
+
+
+@pytest.mark.asyncio
+async def test_generic_web_branch_does_not_auto_activate_sqli(tmp_path: Path) -> None:
+    state = SkillState()
+    context = SkillSessionContext(
+        catalog(tmp_path),
+        role="execution",
+        service=state,  # type: ignore[arg-type]
+        run_id="run",
+        agent_id="agent",
+        selection_text="enumerate ordinary web routes and headers",
+    )
+
+    assert state.values == []

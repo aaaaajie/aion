@@ -14,6 +14,16 @@ __pycache__/
 .playwright-cli/
 .DS_Store
 
+# Local benchmark fixtures, challenge work products, and generated packages
+benchmark_lab/
+dist/
+claude-code-source-code/
+百度agent+解题过程/
+tsecbench_session_organizer.py
+scripts/recheck_liuyan.py
+deploy/README.md
+agent/skills/execution/* copy/
+
 # VPS-specific operator credentials and host fingerprints
 deploy/vps_known_hosts
 deploy/*.pem

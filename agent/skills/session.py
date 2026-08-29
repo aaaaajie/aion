@@ -58,6 +58,10 @@ class SkillSessionContext:
     def active_skills(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._active.values())
 
+    @property
+    def presented_candidates(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(item) for item in self._presented_candidates)
+
     async def ensure_auto_activated(self) -> None:
         for skill in self.catalog.auto_skills(self.role):
             await self._activate(skill, activation_mode="auto")
@@ -122,10 +126,12 @@ class SkillSessionContext:
             if self.role == "execution":
                 sections.append(
                     "<skill_candidates>\n"
-                    "These are discovery suggestions, not active instructions. Inspect "
-                    "their boundaries. If one is genuinely relevant, call skill_invoke "
-                    "as the only tool call in that response. If none applies, start the "
-                    "technical tools immediately.\n"
+                    "These are discovery suggestions, not active instructions. When the "
+                    "Assignment clearly matches a candidate's when_to_use and its procedure "
+                    "is materially useful, activate it early with skill_invoke alone. "
+                    "Otherwise start technical work immediately. match_strength and "
+                    "recommended are ranking signals, not activation commands. Never "
+                    "activate a Skill solely for word overlap.\n"
                     f"{listing}\n"
                     "</skill_candidates>"
                 )
@@ -166,6 +172,8 @@ class SkillSessionContext:
                             "description": skill.description[:240],
                             "when_to_use": skill.when_to_use[:240],
                             "relevance_reason": reason,
+                            "match_strength": candidate.get("match_strength", "none"),
+                            "recommended": bool(candidate.get("recommended")),
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),

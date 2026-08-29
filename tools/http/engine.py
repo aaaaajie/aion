@@ -863,23 +863,39 @@ class HttpInteractionEngine:
     @staticmethod
     def _validate_expanded_url(url: str, *, case_index: int, ordinal: int) -> None:
         """Reject malformed matrix output before any Interaction is created."""
+        detail = {"case_index": case_index, "request_index": ordinal}
         if "{{" in url or "}}" in url:
-            raise HttpInteractionEngine._validation(
-                "invalid_expanded_url",
-                f"Expanded URL for case {case_index}, request {ordinal} still contains a template",
+            raise SystemToolError(
+                error_type="validation",
+                code="invalid_expanded_url",
+                message=(
+                    f"Expanded URL for case {case_index}, request {ordinal} "
+                    "still contains a template"
+                ),
+                detail=detail,
             )
         try:
             parts = urlsplit(url)
             _ = parts.port  # force validation of malformed/overflowing ports
         except ValueError as exc:
-            raise HttpInteractionEngine._validation(
-                "invalid_expanded_url",
-                f"Expanded URL for case {case_index}, request {ordinal} has an invalid port",
+            raise SystemToolError(
+                error_type="validation",
+                code="invalid_expanded_url",
+                message=(
+                    f"Expanded URL for case {case_index}, request {ordinal} "
+                    "has an invalid port"
+                ),
+                detail=detail,
             ) from exc
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-            raise HttpInteractionEngine._validation(
-                "invalid_expanded_url",
-                f"Expanded URL for case {case_index}, request {ordinal} must have an http(s) scheme and host",
+            raise SystemToolError(
+                error_type="validation",
+                code="invalid_expanded_url",
+                message=(
+                    f"Expanded URL for case {case_index}, request {ordinal} "
+                    "must have an http(s) scheme and host"
+                ),
+                detail=detail,
             )
 
     @staticmethod

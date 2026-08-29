@@ -134,7 +134,7 @@ class HypothesisInput(StrictModel):
 
 
 class ChallengeDispatchInput(StrictModel):
-    summary: str = Field(min_length=1, max_length=8_000)
+    summary: str = Field(default="runtime state update", min_length=1, max_length=8_000)
     outcome: Literal["continue", "blocked", "completed", "failed"] = "continue"
     direction: ChallengeDirection | None = None
     tasks: list[ExecutionTaskInput] = Field(default_factory=list, max_length=50)

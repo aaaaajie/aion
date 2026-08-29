@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pwd
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -99,6 +100,7 @@ class _ToolHarness:
         reap_interval_seconds: float = 60.0,
         read_only_paths: Sequence[Path] = (),
         environment: Mapping[str, str] | None = None,
+        isolated_workspace: bool = False,
     ) -> None:
         self.root = root
         self.sandbox_executable = sandbox_executable
@@ -106,6 +108,7 @@ class _ToolHarness:
         self.reap_interval_seconds = reap_interval_seconds
         self.read_only_paths = tuple(read_only_paths)
         self.environment = dict(environment or {})
+        self.isolated_workspace = isolated_workspace
         self.run_id = f"tools-{uuid4().hex}"
         self.agent_id: str | None = None
         self.service: StateService | None = None
@@ -140,8 +143,19 @@ class _ToolHarness:
             environment=self.environment,
         )
         await self.manager.initialize()
+        shared_root = (
+            self.manager.shared_workspace_root("challenge")
+            if self.isolated_workspace
+            else None
+        )
+        shell = self.manager.bind(self.agent_id, shared_root=shared_root)
         return _SystemToolClient(
-            SystemTools(root=self.root, shell=self.manager.bind(self.agent_id))
+            SystemTools(
+                root=self.root,
+                shell=shell,
+                agent_work_root=shell.agent_work_root if self.isolated_workspace else None,
+                shared_work_root=shell.shared_work_root if self.isolated_workspace else None,
+            )
         )
 
     async def __aexit__(self, *_args: object) -> None:
@@ -217,8 +231,69 @@ async def test_write_auto_creates_parents_then_list_glob_and_grep(make_tools) ->
                 "match": "needle",
             }
         ]
-
         assert (tools._filesystem.policy.root / "src/pkg").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_isolated_paths_route_agent_and_shared_outputs(make_tools) -> None:
+    async with make_tools(isolated_workspace=True) as tools:
+        relative = await tools.write_file("artifact.txt", "agent-only")
+        assert relative["ok"] is True
+        agent_work = tools.provider._agent_work_root
+        shared_work = tools.provider._shared_work_root
+        assert agent_work is not None
+        assert shared_work is not None
+        assert (agent_work / "artifact.txt").read_text(encoding="utf-8") == "agent-only"
+        assert not (tools._filesystem.policy.root / "artifact.txt").exists()
+        assert relative["data"]["file_path"] == "agent/artifact.txt"
+
+        shared = await tools.write_file("shared/result.txt", "sibling-readable")
+        assert shared["ok"] is True
+        assert (shared_work / "result.txt").read_text(encoding="utf-8") == "sibling-readable"
+        read_shared = await tools.read_file("shared/result.txt")
+        assert read_shared["data"]["content"] == "sibling-readable"
+
+        project_file = tools._filesystem.policy.root / "project-result.txt"
+        project_file.write_text("read-only target", encoding="utf-8")
+        assert (await tools.read_file("project/project-result.txt"))["data"]["content"] == "read-only target"
+        for path in (
+            "project/result.txt",
+            "../outside.txt",
+            str(tools._filesystem.policy.root / "absolute-result.txt"),
+        ):
+            rejected = await tools.write_file(path, "must-not-write")
+            assert rejected["error"]["code"] in {
+                "project_write_protected",
+                "workspace_write_rejected",
+            }
+        assert not (tools._filesystem.policy.root / "absolute-result.txt").exists()
+        assert tools.provider._shell.manager is not None
+        assert tools.provider._shell.manager.service is not None
+        events = await tools.provider._shell.manager.service.list_agent_events(
+            tools.provider._shell.manager.run_id,
+            tools.provider._shell.agent_id,
+        )
+        event_types = {event["event_type"] for event in events}
+        assert {
+            "agent_workspace_created",
+            "workspace_write_redirected",
+            "workspace_write_rejected",
+        } <= event_types
+
+
+@pytest.mark.asyncio
+async def test_agent_work_is_cleaned_but_challenge_shared_work_remains(make_tools) -> None:
+    harness = make_tools(isolated_workspace=True, reap_interval_seconds=0)
+    async with harness as tools:
+        assert harness.manager is not None
+        assert harness.agent_id is not None
+        await tools.write_file("private.txt", "private")
+        await tools.write_file("shared/persisted.txt", "shared")
+        agent_work = harness.manager.agent_work_root(harness.agent_id)
+        shared_work = harness.manager.shared_workspace_root("challenge")
+        await harness.manager.finish_agent(harness.agent_id)
+        assert not agent_work.exists()
+        assert (shared_work / "persisted.txt").read_text(encoding="utf-8") == "shared"
 
 
 @pytest.mark.asyncio
@@ -266,6 +341,46 @@ async def test_path_traversal_symlink_escape_and_root_delete_are_rejected(make_t
 
 
 @pytest.mark.asyncio
+async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(make_tools) -> None:
+    async with make_tools() as tools:
+        root = tools._filesystem.policy.root
+        (root / ".aion" / "runs").mkdir(parents=True)
+        (root / ".aion" / "runs" / "old-flag.txt").write_text(
+            "control-plane-secret", encoding="utf-8"
+        )
+        (root / ".system-tools" / "runs").mkdir(parents=True, exist_ok=True)
+        (root / ".system-tools" / "runs" / "old-output.log").write_text(
+            "control-plane-output", encoding="utf-8"
+        )
+
+        for path in (".aion", ".aion/runs/old-flag.txt", ".system-tools"):
+            rejected = await tools.read_file(path)
+            assert rejected["error"]["code"] == "project_path_protected"
+
+        listed = await tools.list_directory(".", recursive=True)
+        listed_paths = {entry["path"] for entry in listed["data"]["entries"]}
+        assert not any(
+            path == ".aion"
+            or path.startswith(".aion/")
+            or path == ".system-tools"
+            or path.startswith(".system-tools/")
+            for path in listed_paths
+        )
+
+        globbed = await tools.glob("**/*", ".")
+        assert not any(
+            path == ".aion"
+            or path.startswith(".aion/")
+            or path == ".system-tools"
+            or path.startswith(".system-tools/")
+            for path in globbed["data"]["matches"]
+        )
+
+        searched = await tools.grep("control-plane", ".")
+        assert searched["data"]["matches"] == []
+
+
+@pytest.mark.asyncio
 async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools) -> None:
     async with make_tools() as tools:
         command = await tools.shell("printf sandbox-ok; pwd")
@@ -276,7 +391,10 @@ async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools)
 
         workspace_write = await tools.shell("printf shell-write > shell-created.txt")
         assert workspace_write["data"]["exit_code"] == 0
-        assert (tools._filesystem.policy.root / "shell-created.txt").read_text(encoding="utf-8") == "shell-write"
+        agent_work = tools.provider._shell.agent_work_root
+        assert agent_work is not None
+        assert (agent_work / "shell-created.txt").read_text(encoding="utf-8") == "shell-write"
+        assert not (tools._filesystem.policy.root / "shell-created.txt").exists()
 
         environment = await tools.shell("printf '%s' \"${BENCHMARK_TOKEN-unavailable}\"")
         assert environment["data"]["output"] == "unavailable"
@@ -432,6 +550,52 @@ async def test_agent_ownership_and_persistent_temp_are_isolated(make_tools) -> N
         assert created["data"]["temp_dir"] != isolated["data"]["temp_dir"]
         denied = await second.task_output(created["data"]["task_id"])
         assert denied["error"]["code"] == "task_not_found"
+
+
+@pytest.mark.asyncio
+async def test_conventional_absolute_tmp_path_is_available_on_macos(make_tools) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("macOS sandbox-exec compatibility check")
+    marker = f"aion-tmp-{uuid4().hex}"
+    async with make_tools() as tools:
+        result = await tools.shell(
+            f"printf absolute-tmp > /tmp/{marker}; cat /tmp/{marker}; rm -f /tmp/{marker}"
+        )
+    assert result["data"]["status"] == "completed"
+    assert result["data"]["output"] == "absolute-tmp"
+
+
+@pytest.mark.asyncio
+async def test_host_container_control_is_blocked(make_tools) -> None:
+    async with make_tools() as tools:
+        for command in (
+            "docker ps",
+            "sh -c 'docker exec target cat /run/secrets/flag'",
+            "python3 -c 'open(\"/var/run/docker.sock\")'",
+            "kubectl exec target -- cat /run/secrets/flag",
+        ):
+            result = await tools.shell(command)
+            assert result["error"]["code"] == "container_control_blocked"
+
+
+@pytest.mark.asyncio
+async def test_macos_shell_cannot_connect_to_host_container_socket(make_tools) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("macOS sandbox-exec compatibility check")
+    # Build the path inside the child so this test also exercises the OS
+    # sandbox instead of the command-text denylist.
+    command = (
+        "python3 -c 'import socket; "
+        "p=chr(47)+chr(118)+chr(97)+chr(114)+chr(47)+chr(114)+chr(117)+"
+        "chr(110)+chr(47)+chr(100)+chr(111)+chr(99)+chr(107)+chr(101)+"
+        "chr(114)+chr(46)+chr(115)+chr(111)+chr(99)+chr(107); "
+        "s=socket.socket(socket.AF_UNIX); s.connect(p); print(\"connected\")'"
+    )
+    async with make_tools() as tools:
+        result = await tools.shell(command)
+    assert result["data"]["status"] == "failed"
+    assert result["data"]["exit_code"] != 0
+    assert "PermissionError" in result["data"]["output"]
 
 
 @pytest.mark.asyncio
@@ -614,7 +778,14 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
     assert backend.available is True
     persistent_tmp = tmp_path / "agent-private-tmp"
     persistent_tmp.mkdir()
-    command = backend.command("printf linux-ok", tmp_path, persistent_tmp)
+    work = tmp_path / "work"
+    work.mkdir()
+    command = backend.command(
+        "printf linux-ok",
+        work,
+        persistent_tmp,
+        write_paths=(work, persistent_tmp),
+    )
     assert command[:2] == [str(executable), "--die-with-parent"]
     assert "--ro-bind" in command
     assert "--bind" in command
@@ -626,15 +797,79 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
         "/tmp",
     ]
     chdir_index = command.index("--chdir")
-    assert command[chdir_index : chdir_index + 2] == ["--chdir", str(tmp_path)]
+    assert command[chdir_index : chdir_index + 2] == ["--chdir", str(work)]
     assert command[-4:] == ["--noprofile", "--norc", "-lc", "printf linux-ok"]
-    root_bind = command.index(str(tmp_path), command.index("--bind"))
-    skill_bind = command.index(str(read_only), root_bind + 1)
+    root_bind = command.index(str(tmp_path), command.index("--ro-bind"))
+    assert command[root_bind - 1 : root_bind + 2] == [
+        "--ro-bind",
+        str(tmp_path),
+        str(tmp_path),
+    ]
+    work_bind = command.index(str(work), root_bind + 1)
+    assert command[work_bind - 1 : work_bind + 2] == ["--bind", str(work), str(work)]
+    skill_bind = command.index(str(read_only), work_bind + 1)
     assert command[skill_bind - 1 : skill_bind + 2] == [
         "--ro-bind",
         str(read_only),
         str(read_only),
     ]
+
+
+def test_sandbox_profile_hides_runtime_control_plane_but_reopens_agent_paths(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "sandbox-exec"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | 0o111)
+    hidden = (tmp_path / ".aion", tmp_path / ".system-tools")
+    shared = tmp_path / ".aion" / "runs" / "run" / "shared" / "a-05"
+    backend = SandboxBackend(
+        tmp_path,
+        executable=str(executable),
+        platform_name="Darwin",
+        hidden_paths=hidden,
+    )
+
+    profile = backend._macos_profile(write_paths=(shared,))
+    hidden_aion = '(deny file-read* (subpath "' + str(hidden[0]) + '"))'
+    hidden_tools = '(deny file-read* (subpath "' + str(hidden[1]) + '"))'
+    shared_allow = '(allow file-read* (subpath "' + str(shared) + '"))'
+    assert hidden_aion in profile
+    assert hidden_tools in profile
+    assert "(deny network-outbound)" in profile
+    assert profile.index(hidden_aion) < profile.index(shared_allow)
+    assert profile.index(hidden_tools) < profile.index(shared_allow)
+
+
+def test_linux_container_sandbox_drops_privileges_without_namespaces(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "setpriv"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | 0o111)
+    account = pwd.getpwuid(os.getuid())
+    workspace_file = tmp_path / "artifact.bin"
+    workspace_file.write_bytes(b"artifact")
+    backend = SandboxBackend(
+        tmp_path,
+        executable=str(executable),
+        platform_name="Linux",
+        sandbox_user=account.pw_name,
+    )
+
+    backend.prepare()
+    command = backend.command("id", tmp_path)
+
+    assert backend.available is True
+    assert command[:4] == [
+        str(executable),
+        f"--reuid={account.pw_uid}",
+        f"--regid={account.pw_gid}",
+        "--clear-groups",
+    ]
+    assert "--no-new-privs" in command
+    assert "--bounding-set=-all" in command
+    assert command[-4:] == ["--noprofile", "--norc", "-lc", "id"]
 
 
 def test_windows_backend_is_reserved_without_an_unsafe_fallback(tmp_path: Path) -> None:

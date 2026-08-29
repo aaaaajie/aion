@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 
 from agent.state import CapabilityContext, ChallengeDispatchInput
 from agent.state.database import SCHEMA_VERSION, StateDatabase
 from agent.state.errors import StatePermission
+from agent.state.models import AgentRecord, CycleRecord
 from agent.state.schemas import AgentReportInput, ChallengeImport
 from agent.state.service import StateService
 from agent.subagents.models import ExecutionReport
@@ -93,6 +95,115 @@ async def test_schema_15_and_dispatch_is_append_only_and_idempotent(tmp_path: Pa
     )
     assert repeated["admissions"] == []
     assert repeated["idempotent_tasks"][0]["agent_id"] == first["admissions"][0]["agent_id"]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_dispatch_is_a_no_action(tmp_path: Path) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    first = await service.dispatch_challenge(
+        "run", "challenge-a", challenge, ChallengeDispatchInput.model_validate({})
+    )
+    second = await service.dispatch_challenge(
+        "run", "challenge-a", challenge, ChallengeDispatchInput.model_validate({})
+    )
+    assert first["no_action"] is True
+    assert second["no_action"] is True
+    async with service.db.sessions() as session:
+        cycles = await session.scalar(select(func.count()).select_from(CycleRecord))
+    assert cycles == 0
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_expensive_tool_fingerprint_is_challenge_scoped_and_retryable(
+    tmp_path: Path,
+) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    first = await service.register_agent(
+        "run",
+        agent_id="execution-one",
+        role="execution",
+        parent_id="challenge",
+        unique_code="challenge-a",
+        mission="first route",
+    )
+    second = await service.register_agent(
+        "run",
+        agent_id="execution-two",
+        role="execution",
+        parent_id="challenge",
+        unique_code="challenge-a",
+        mission="second route",
+    )
+    digest = "a" * 64
+    claimed = await service.claim_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        first["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=digest,
+    )
+    assert claimed == {"claimed": True, "duplicate": False}
+    duplicate = await service.claim_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        second["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=digest,
+    )
+    assert duplicate["duplicate"] is True
+    assert duplicate["reason"] == "already_running"
+
+    await service.complete_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        first["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=digest,
+        success=True,
+    )
+    succeeded = await service.claim_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        second["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=digest,
+    )
+    assert succeeded["duplicate"] is True
+    assert succeeded["reason"] == "already_succeeded"
+
+    retry_digest = "b" * 64
+    await service.claim_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        first["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=retry_digest,
+    )
+    await service.complete_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        first["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=retry_digest,
+        success=False,
+    )
+    retry = await service.claim_challenge_tool_fingerprint(
+        "run",
+        "challenge-a",
+        second["agent_id"],
+        tool_name="pentest_sqlmap",
+        digest=retry_digest,
+    )
+    assert retry == {"claimed": True, "duplicate": False}
+
+    async with service.db.sessions() as session:
+        controller = await session.get(AgentRecord, "challenge")
+        assert controller is not None
+        attempts = controller.report_cursors.get("expensive_tool_attempts", {})
+        assert set(attempts) == {f"pentest_sqlmap:{digest}", f"pentest_sqlmap:{retry_digest}"}
+        assert all("url" not in str(item) for item in attempts.values())
     await service.close()
 
 
@@ -287,6 +398,11 @@ async def test_controller_cannot_wait_on_consumed_but_undecided_snapshot(
         "run", "challenge-a", challenge, max_reports=20
     )
     assert snapshot["report_count"] == 1
+    events = await service.list_agent_events("run", "challenge")
+    assert sum(
+        event["event_type"] == "challenge_quiescence_ready" for event in events
+    ) == 1
+    assert await service._maybe_signal_challenge_quiescence("run", "challenge-a") is False
 
     ready = await service.record_controller_wait("run", "challenge", "too early")
     assert ready["status"] == "ready"
@@ -505,6 +621,89 @@ async def test_only_assigned_candidate_finding_ref_is_updated(tmp_path: Path) ->
     assert verified["findings"][0]["finding_ref"] == finding_ref
     assert verified["findings"][0]["verification_status"] == "verified"
     assert verified["progress_kinds"] == ["finding_verified"]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_finding_evidence_does_not_count_as_progress(
+    tmp_path: Path,
+) -> None:
+    service, _chief, challenge = await build_state(tmp_path)
+    first_dispatch = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(summary="discover", tasks=[{"objective": "discover"}]),
+    )
+    first_id = first_dispatch["admissions"][0]["agent_id"]
+    first_context = CapabilityContext(
+        run_id="run",
+        agent_id=first_id,
+        role="execution",
+        unique_code="challenge-a",
+    )
+    await service.submit_report(
+        "run",
+        first_id,
+        first_context,
+        AgentReportInput(
+            status="completed",
+            summary="candidate found",
+            findings=[
+                {
+                    "category": "vulnerability",
+                    "summary": "Candidate traversal",
+                    "verification_status": "candidate",
+                }
+            ],
+        ),
+    )
+
+    second_dispatch = await service.dispatch_challenge(
+        "run",
+        "challenge-a",
+        challenge,
+        ChallengeDispatchInput(
+            summary="collect evidence",
+            tasks=[{"objective": "collect evidence"}],
+        ),
+    )
+    second_id = second_dispatch["admissions"][0]["agent_id"]
+    second_context = CapabilityContext(
+        run_id="run",
+        agent_id=second_id,
+        role="execution",
+        unique_code="challenge-a",
+    )
+    evidence = await service.persist_evidence(
+        "run",
+        second_context,
+        evidence_type="http",
+        source="system_http_response",
+        content="same observation recorded again",
+    )
+    repeated = await service.submit_report(
+        "run",
+        second_id,
+        second_context,
+        AgentReportInput(
+            status="completed",
+            summary="same candidate revisited",
+            findings=[
+                {
+                    "category": "vulnerability",
+                    "summary": "Candidate traversal",
+                    "verification_status": "candidate",
+                    "evidence_refs": [evidence["evidence_ref"]],
+                }
+            ],
+        ),
+    )
+
+    assert repeated["progress_kinds"] == []
+    assert repeated["findings"][0]["detail"]["evidence_refs"] == [
+        evidence["evidence_ref"]
+    ]
     await service.close()
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -35,11 +36,16 @@ from .memory.context import (
     tool_result_for_model,
     truncate_text,
 )
+from .memory.blackboard import BlackboardCompactionError, BlackboardCompactor
 from .memory.models import ActiveSkillState, Checkpoint, TargetState
 from .memory.redaction import redact_text, redact_tool_payload, redact_value
 from .memory.summarizer import SessionMemorySummarizer
 from .state import (
     AgentStateStore,
+    BOOTSTRAP_MAX_ROUNDS,
+    BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
+    BOOTSTRAP_REPORT_ONLY_ROUND,
+    BOOTSTRAP_TARGETED_ROUND,
     CapabilityContext,
     StateService,
     checkpoint_target_status,
@@ -47,7 +53,14 @@ from .state import (
     container_slot_occupied,
 )
 from .state.clock import aware
-from .tooling import ToolExecutor, ToolRegistry, ToolResultStore, tool_error
+from .state.blackboard import blackboard_content_digest
+from .tooling import (
+    ToolExecutor,
+    ToolRegistry,
+    ToolResultStore,
+    serialize_tool_arguments,
+    tool_error,
+)
 
 
 class AgentRunnerError(RuntimeError):
@@ -85,6 +98,45 @@ EVIDENCE_RESULT_TOOLS = frozenset(
         "system_http_response",
         "system_network_discovery",
         "system_network_output",
+        "pwn_process_open",
+        "pwn_tcp_open",
+        "pwn_session_io",
+        "pentest_ssh_open",
+        "pentest_ssh_exec",
+        "pentest_ssh_transfer",
+        "pentest_ssh_pivot_open",
+        "pentest_channel_io",
+    }
+)
+BOOTSTRAP_BROAD_DISCOVERY_TOOLS = frozenset(
+    {
+        "system_http_probe",
+        "system_web_path_probe",
+        "system_network_discovery",
+        "skill_search",
+    }
+)
+BOOTSTRAP_REPORT_TOOLS = frozenset(
+    {
+        "execution_report",
+        "bootstrap_checkpoint",
+        "bootstrap_cycle_yield",
+        "evidence_read",
+        # Recovery may finish one already-proven extraction path. Discovery
+        # tools remain disabled, so this does not reopen broad exploration.
+        "system_http_request",
+        "system_http_response",
+        "system_http_output",
+    }
+)
+HTTP_REPLAY_TOOLS = frozenset(
+    {
+        "system_http_request",
+        "system_http_probe",
+        "system_http_response",
+        "system_http_output",
+        "system_web_path_probe",
+        "system_web_fingerprint",
     }
 )
 
@@ -126,11 +178,16 @@ class AgentRunner:
         live_context_ack: Callable[[Mapping[str, Any]], Any] | None = None,
         bootstrap_mode: bool = False,
         require_structured_report: bool = False,
+        session_timeout_seconds: float | None = None,
         state_service: StateService,
     ) -> None:
         self.settings = settings
         self.registry = registry
-        self.max_rounds = max_rounds
+        self.max_rounds = (
+            BOOTSTRAP_MAX_ROUNDS
+            if bootstrap_mode and max_rounds is None
+            else max_rounds
+        )
         self.run_root = run_root or settings.run_root
         self.role = role
         self.agent_id = agent_id
@@ -141,6 +198,7 @@ class AgentRunner:
         self.live_context_ack = live_context_ack
         self.bootstrap_mode = bootstrap_mode
         self.require_structured_report = require_structured_report
+        self._session_timeout_seconds = session_timeout_seconds
         self.state_service = state_service
         self._tool_executor = ToolExecutor(registry, max_concurrency=10)
         self._http_client = http_client
@@ -149,17 +207,34 @@ class AgentRunner:
         self._summary_task: asyncio.Task[bool] | None = None
         self._structured_report_seen = False
         self._forced_report_recovery_used = False
+        self._report_recovery_used = False
         self._probe_argument_failure_streak = 0
         self._probe_recovery_exhausted = False
+        self._probe_recovery_notice_emitted = False
+        self._probe_invalid_argument_digest: str | None = None
         self._challenge_dispatch_argument_failure_streak = 0
-        self._challenge_dispatch_recovery_exhausted = False
-        self._challenge_dispatch_recovery_notice_emitted = False
+        self._challenge_dispatch_correction_notice_emitted = False
+        self._challenge_dispatch_correction_pending = False
+        self._challenge_dispatch_invalid_argument_digest: str | None = None
+        self._disabled_tool_names: set[str] = set()
         self._force_context_compaction = False
         self._soft_limit_bypass_tokens: int | None = None
         self._prompt_calibration_ratio = REQUEST_PROMPT_CALIBRATION_INITIAL
         self._run_deadline_monotonic: float | None = None
+        self._agent_deadline_monotonic: float | None = None
         self._unique_code: str | None = None
         self._pending_live_context: Mapping[str, Any] | None = None
+        self._last_bootstrap_content_digest: str | None = None
+        self._blackboard_compaction_cache: dict[str, Mapping[str, Any]] = {}
+        self._current_round_number = 0
+        self._bootstrap_targeted_notice_emitted = False
+        self._bootstrap_report_only_notice_emitted = False
+        self._http_result_cache: dict[str, dict[str, Any]] = {}
+        self._last_tool_yield_reason: str | None = None
+        self._checkpoint_nudge_count = 0
+        self._persisted_evidence_total = 0
+        self._last_checkpoint_nudge_evidence_total = 0
+        self._claimed_challenge_tool_digests: dict[str, str] = {}
 
     async def close(self) -> None:
         if self._summary_task is not None:
@@ -178,15 +253,36 @@ class AgentRunner:
     ) -> AgentSessionResult:
         self._structured_report_seen = False
         self._forced_report_recovery_used = False
+        self._report_recovery_used = False
         self._probe_argument_failure_streak = 0
         self._probe_recovery_exhausted = False
+        self._probe_recovery_notice_emitted = False
+        self._probe_invalid_argument_digest = None
         self._challenge_dispatch_argument_failure_streak = 0
-        self._challenge_dispatch_recovery_exhausted = False
-        self._challenge_dispatch_recovery_notice_emitted = False
+        self._challenge_dispatch_correction_notice_emitted = False
+        self._challenge_dispatch_correction_pending = False
+        self._challenge_dispatch_invalid_argument_digest = None
+        self._disabled_tool_names = set()
         self._force_context_compaction = False
         self._soft_limit_bypass_tokens = None
         self._prompt_calibration_ratio = REQUEST_PROMPT_CALIBRATION_INITIAL
+        self._agent_deadline_monotonic = (
+            asyncio.get_running_loop().time() + self._session_timeout_seconds
+            if self._session_timeout_seconds is not None
+            else None
+        )
         self._pending_live_context = None
+        self._last_bootstrap_content_digest = None
+        self._blackboard_compaction_cache = {}
+        self._current_round_number = 0
+        self._bootstrap_targeted_notice_emitted = False
+        self._bootstrap_report_only_notice_emitted = False
+        self._http_result_cache = {}
+        self._last_tool_yield_reason = None
+        self._checkpoint_nudge_count = 0
+        self._persisted_evidence_total = 0
+        self._last_checkpoint_nudge_evidence_total = 0
+        self._claimed_challenge_tool_digests = {}
         runtime = await self.state_service.get_agent_runtime(
             store.run_id, store.agent_id
         )
@@ -274,37 +370,80 @@ class AgentRunner:
                 round_number = 0
                 while self.max_rounds is None or round_number < self.max_rounds:
                     round_number += 1
+                    self._current_round_number = round_number
+                    await self._apply_bootstrap_phase(
+                        store, messages, round_number
+                    )
+                    await self._activate_deadline_report_recovery_if_needed(
+                        store, messages, round_number
+                    )
+                    active_tool_definitions = self._active_tool_definitions(
+                        tool_definitions
+                    )
                     if self.bootstrap_mode and self.live_context_provider is not None:
                         try:
                             update = self.live_context_provider()
                             if inspect.isawaitable(update):
                                 update = await update
                             if isinstance(update, Mapping):
-                                through = update.get("through_sequence")
-                                self._replace_live_context_message(messages, update)
-                                await store.append_event(
-                                    "bootstrap_shared_snapshot_injected",
-                                    {
-                                        "through_sequence": through,
-                                        "report_count": len(update.get("reports") or []),
-                                        "replayed": bool(update.get("replayed")),
-                                    },
+                                raw_update = update
+                                through = raw_update.get("through_sequence")
+                                digest = raw_update.get("content_digest")
+                                if not isinstance(digest, str) or not digest:
+                                    digest = blackboard_content_digest(raw_update)
+                                compacted_update = await self._maybe_compact_bootstrap_update(
+                                    raw_update, store=store
                                 )
-                                if update.get("replayed"):
-                                    await store.append_event(
-                                        "bootstrap_shared_snapshot_replayed",
-                                        {"through_sequence": through},
+                                already_injected = (
+                                    digest == self._last_bootstrap_content_digest
+                                )
+                                if not already_injected or not raw_update.get("replayed"):
+                                    self._replace_live_context_message(
+                                        messages, compacted_update
                                     )
+                                if not already_injected:
+                                    content_chars = len(
+                                        json.dumps(
+                                            dict(compacted_update),
+                                            ensure_ascii=False,
+                                            default=str,
+                                        )
+                                    )
+                                    await store.append_event(
+                                        "bootstrap_shared_snapshot_injected",
+                                        {
+                                            "through_sequence": through,
+                                            "report_count": len(
+                                                raw_update.get("reports") or []
+                                            ),
+                                            "replayed": bool(raw_update.get("replayed")),
+                                            "content_digest": digest,
+                                            "content_chars": content_chars,
+                                        },
+                                    )
+                                if update.get("replayed"):
+                                    if not already_injected:
+                                        await store.append_event(
+                                            "bootstrap_shared_snapshot_replayed",
+                                            {
+                                                "through_sequence": through,
+                                                "content_digest": digest,
+                                            },
+                                        )
                                 if isinstance(store.checkpoint.authoritative_view, dict):
                                     store.checkpoint.authoritative_view[
                                         "bootstrap_shared"
                                     ] = {
                                         "through_sequence": through,
-                                        "report_count": len(update.get("reports") or []),
-                                        "hint_count": len(update.get("hints") or []),
+                                        "report_count": len(
+                                            raw_update.get("reports") or []
+                                        ),
+                                        "hint_count": len(raw_update.get("hints") or []),
+                                        "content_digest": digest,
                                     }
                                     await store.save_checkpoint()
-                                self._pending_live_context = update
+                                self._last_bootstrap_content_digest = digest
+                                self._pending_live_context = compacted_update
                         except Exception as exc:
                             await store.append_event(
                                 "bootstrap_shared_snapshot_failed",
@@ -463,6 +602,7 @@ class AgentRunner:
                         client,
                         messages,
                         tool_definitions=active_tool_definitions,
+                        report_recovery=self._report_recovery_used,
                     )
                     payload = await request
                     if self.bootstrap_mode and isinstance(
@@ -538,9 +678,33 @@ class AgentRunner:
                             {
                                 "round": round_number,
                                 "reason": "length",
-                                "recoverable": self.role in {"chief", "challenge"},
+                                "recoverable": (
+                                    self.role in {"chief", "challenge"}
+                                    or self.require_structured_report
+                                ),
                             },
                         )
+                        if self.require_structured_report and not self._report_recovery_used:
+                            self._report_recovery_used = True
+                            active_tool_definitions = self._report_only_definitions(
+                                tool_definitions
+                            )
+                            self._force_context_compaction = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "The previous response was truncated. Preserve the work already completed, "
+                                        "do not call any other tool, and call execution_report now with the "
+                                        "required structured terminal result."
+                                    ),
+                                }
+                            )
+                            await store.append_event(
+                                "llm_length_report_recovery",
+                                {"round": round_number, "attempt": 1},
+                            )
+                            continue
                         raise AgentRunnerError(
                             "DeepSeek completion reached its output limit",
                             code="llm_completion_truncated",
@@ -666,45 +830,47 @@ class AgentRunner:
                     tool_messages, yield_session = await self._execute_tool_calls(
                         store, tool_calls, round_number=round_number
                     )
+                    tool_yield_reason = self._last_tool_yield_reason
                     messages.extend(tool_messages)
-                    if self._probe_recovery_exhausted and self.require_structured_report:
-                        active_tool_definitions = [
-                            definition
-                            for definition in tool_definitions
-                            if definition.get("function", {}).get("name")
-                            == "execution_report"
-                        ]
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "The system_http_probe argument correction budget is exhausted. "
-                                    "Do not call system_http_probe again; call execution_report now "
-                                    "with the valid terminal result."
-                                ),
-                            }
+                    if self._probe_recovery_exhausted:
+                        self._disabled_tool_names.add("system_http_probe")
+                        active_tool_definitions = self._active_tool_definitions(
+                            tool_definitions
                         )
-                        await store.append_event(
-                            "probe_argument_recovery_exhausted",
-                            {"round": round_number, "tool": "system_http_probe"},
-                        )
+                        if not self._probe_recovery_notice_emitted:
+                            self._probe_recovery_notice_emitted = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "system_http_probe is disabled for this session after repeated invalid "
+                                        "arguments. Continue with system_http_request or other available tools; "
+                                        "submit execution_report only when the task is actually complete or blocked."
+                                    ),
+                                }
+                            )
+                            await store.append_event(
+                                "probe_argument_recovery_exhausted",
+                                {"round": round_number, "tool": "system_http_probe"},
+                            )
                     if (
-                        self._challenge_dispatch_recovery_exhausted
-                        and not self._challenge_dispatch_recovery_notice_emitted
+                        self._challenge_dispatch_correction_pending
+                        and not self._challenge_dispatch_correction_notice_emitted
                     ):
-                        self._challenge_dispatch_recovery_notice_emitted = True
+                        self._challenge_dispatch_correction_pending = False
+                        self._challenge_dispatch_correction_notice_emitted = True
                         messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "The challenge_dispatch argument correction budget is exhausted. "
-                                    "Do not retry malformed arguments; use the canonical dispatch shape, "
-                                    "record an empty decision, or wait for a new report."
+                                    "challenge_dispatch needs a canonical argument object. Use {} for a "
+                                    "deterministic checkpoint follow-up or provide only the documented "
+                                    "top-level fields; do not hand-write stable task, hypothesis, or branch keys."
                                 ),
                             }
                         )
                         await store.append_event(
-                            "challenge_dispatch_recovery_exhausted",
+                            "challenge_dispatch_argument_correction",
                             {"round": round_number, "tool": "challenge_dispatch"},
                         )
                     tool_calls_since_summary += len(tool_calls)
@@ -738,7 +904,7 @@ class AgentRunner:
                         tool_calls_since_summary = 0
 
                     if yield_session:
-                        yield_reason = "controller_wait"
+                        yield_reason = tool_yield_reason or "controller_wait"
                         break
 
                     over_soft_requires_compaction = (
@@ -799,11 +965,33 @@ class AgentRunner:
                         tool_calls_since_summary = 0
 
                 else:
-                    raise AgentRunnerError(
-                        "maximum Agent rounds exceeded",
-                        code="invalid_llm_response",
-                        recoverable=self.role in {"chief", "challenge"},
-                    )
+                    if self.bootstrap_mode:
+                        await store.append_event(
+                            "bootstrap_cycle_round_limit",
+                            {"round": round_number, "max_rounds": self.max_rounds},
+                        )
+                        await self.state_service.yield_bootstrap_cycle(
+                            store.run_id,
+                            store.agent_id,
+                            CapabilityContext(
+                                run_id=store.run_id,
+                                agent_id=store.agent_id,
+                                role="execution",
+                                unique_code=self._unique_code,
+                            ),
+                            summary="Bootstrap cycle reached its round budget; resume the same lane with persisted context.",
+                        )
+                        yield_reason = "bootstrap_cycle_yield"
+                        final_content = ""
+                        # The supervisor resumes this same logical lane with a
+                        # fresh bounded session and the persisted memory/context.
+                        pass
+                    else:
+                        raise AgentRunnerError(
+                            "maximum Agent rounds exceeded",
+                            code="invalid_llm_response",
+                            recoverable=self.role in {"chief", "challenge"},
+                        )
 
             final = truncate_text(redact_text(final_content), 8_000)
             await store.append_event(
@@ -822,6 +1010,34 @@ class AgentRunner:
                 yield_reason=yield_reason,
             )
         except Exception as exc:
+            if self.bootstrap_mode and isinstance(exc, AgentRunnerError) and exc.code == "bootstrap_cycle_yield":
+                await self.state_service.yield_bootstrap_cycle(
+                    store.run_id,
+                    store.agent_id,
+                    CapabilityContext(
+                        run_id=store.run_id,
+                        agent_id=store.agent_id,
+                        role="execution",
+                        unique_code=self._unique_code,
+                    ),
+                    summary="Bootstrap cycle reached its time budget; resume the same lane with persisted context.",
+                )
+                final = ""
+                await store.append_event(
+                    "agent_session_yielded",
+                    {
+                        "final": final,
+                        "structured_report_seen": False,
+                        "yield_reason": "bootstrap_cycle_yield",
+                    },
+                )
+                return AgentSessionResult(
+                    run_id=store.manifest.run_id,
+                    final=final,
+                    last_event_sequence=store.checkpoint.last_event_sequence,
+                    structured_report_seen=False,
+                    yield_reason="bootstrap_cycle_yield",
+                )
             safe_message = self._safe_error_message(exc)
             failure = {"message": safe_message}
             if isinstance(exc, AgentRunnerError):
@@ -858,6 +1074,8 @@ class AgentRunner:
         prepared = self._tool_executor.prepare(tool_calls)
         self._apply_probe_recovery_budget(prepared)
         self._apply_challenge_dispatch_recovery_budget(prepared)
+        self._apply_http_replay_cache(prepared)
+        await self._apply_challenge_expensive_tool_dedup(prepared, run_id=store.run_id)
         result_store = ToolResultStore(store.run_dir, store.agent_id)
         call_events: list[dict[str, Any]] = []
         for item in prepared:
@@ -872,12 +1090,15 @@ class AgentRunner:
                 }
                 arguments = redact_tool_payload(
                     item.name,
-                    item.arguments.model_dump(
-                        mode="json",
+                    serialize_tool_arguments(
+                        item.arguments,
                         exclude_unset=compact_arguments,
                         exclude_none=compact_arguments,
                     ),
                     secrets=self._secrets(),
+                )
+                arguments = self._redact_candidate_arguments_for_event(
+                    item.name, arguments
                 )
             call_events.append(
                 {
@@ -894,9 +1115,16 @@ class AgentRunner:
             )
         await store.append_events(call_events)
         prepared = await self._tool_executor.execute_prepared(prepared)
+        await self._complete_challenge_expensive_tool_dedup(prepared, run_id=store.run_id)
         tool_messages: list[dict[str, Any]] = []
         result_events: list[dict[str, Any]] = []
         yield_session = False
+        yield_reason: str | None = None
+        evidence_persisted = 0
+        checkpoint_called = any(
+            item.name == "execution_checkpoint" for item in prepared
+        )
+        checkpoint_succeeded = False
         for item in prepared:
             result = item.result or {
                 "ok": False,
@@ -907,6 +1135,8 @@ class AgentRunner:
                 self._structured_report_seen = self._structured_report_seen or bool(
                     isinstance(data, Mapping) and data.get("terminal")
                 )
+            if item.name == "execution_checkpoint" and result.get("ok"):
+                checkpoint_succeeded = True
             internal_evidence = item.evidence_payload
             result_for_model = dict(result)
             safe_result = redact_tool_payload(
@@ -917,6 +1147,7 @@ class AgentRunner:
                 and item.name in EVIDENCE_RESULT_TOOLS
                 and safe_result.get("ok") is True
                 and self.agent_id is not None
+                and not item.replayed
             ):
                 try:
                     evidence_content = (
@@ -978,6 +1209,7 @@ class AgentRunner:
                         content=evidence_content,
                         metadata=evidence_metadata,
                     )
+                    evidence_persisted += 1
                     data = safe_result.get("data")
                     if isinstance(data, Mapping):
                         safe_result = {
@@ -1002,6 +1234,21 @@ class AgentRunner:
                         }
                     )
                     safe_result = {**safe_result, "warnings": warnings}
+            if (
+                item.name in HTTP_REPLAY_TOOLS
+                and not item.replayed
+                and safe_result.get("ok") is True
+            ):
+                cache_key = self._http_replay_key(item)
+                if cache_key is not None:
+                    encoded = json.dumps(
+                        safe_result,
+                        ensure_ascii=False,
+                        default=str,
+                        separators=(",", ":"),
+                    )
+                    if len(encoded) <= 50_000:
+                        self._http_result_cache[cache_key] = json.loads(encoded)
             safe_projection = (
                 redact_tool_payload(
                     item.name, item.result_projection, secrets=self._secrets()
@@ -1035,6 +1282,7 @@ class AgentRunner:
                         "error_code": (
                             error.get("code") if isinstance(error, Mapping) else None
                         ),
+                        "replayed": bool(item.replayed),
                     },
                 },
             )
@@ -1043,9 +1291,227 @@ class AgentRunner:
                 self._tool_message(tool_calls[item.index], model_result)
             )
             yield_session = yield_session or item.yield_session
+            if (
+                item.yield_session
+                and isinstance(result.get("data"), Mapping)
+                and result["data"].get("cycle_yield")
+            ):
+                yield_reason = "bootstrap_cycle_yield"
+            elif (
+                item.yield_session
+                and isinstance(result.get("data"), Mapping)
+                and result["data"].get("handoff_terminal")
+            ):
+                yield_reason = "execution_checkpoint_handoff"
+        # Models sometimes continue broad probing after a useful response even
+        # though the Execution contract requires an immediate checkpoint.  A
+        # bounded, content-free nudge makes the handoff decision explicit while
+        # leaving value classification to the model and preserving Evidence
+        # isolation.  Cap it per session so routine recon does not dominate the
+        # context or create artificial turns.
+        self._persisted_evidence_total += evidence_persisted
+        if checkpoint_succeeded:
+            self._checkpoint_nudge_count = 0
+            self._last_checkpoint_nudge_evidence_total = (
+                self._persisted_evidence_total
+            )
+        new_evidence_frontier = self._persisted_evidence_total
+        if (
+            self.role == "execution"
+            and not self.bootstrap_mode
+            and evidence_persisted
+            and not checkpoint_called
+            and new_evidence_frontier > self._last_checkpoint_nudge_evidence_total
+            and self._checkpoint_nudge_count < 2
+        ):
+            self._checkpoint_nudge_count += 1
+            self._last_checkpoint_nudge_evidence_total = new_evidence_frontier
+            tool_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Runtime checkpoint review: the preceding technical action produced "
+                        "persisted Evidence. If it verifies a vulnerability, credential, "
+                        "privilege, attack path, or concrete extraction route, call "
+                        "execution_checkpoint now with its Evidence reference before any "
+                        "further broad exploration; otherwise continue with one narrow "
+                        "discriminating action."
+                    ),
+                }
+            )
+            await store.append_event(
+                "execution_checkpoint_nudge",
+                {"round": round_number, "evidence_count": evidence_persisted},
+            )
         await store.append_events(result_events)
         await store.save_checkpoint()
+        self._last_tool_yield_reason = yield_reason
         return tool_messages, yield_session
+
+    async def _apply_bootstrap_phase(
+        self,
+        store: AgentStateStore,
+        messages: list[dict[str, Any]],
+        round_number: int,
+    ) -> None:
+        """Turn Bootstrap's flag-first contract into runtime-enforced phases."""
+
+        if not self.bootstrap_mode:
+            return
+        if (
+            round_number >= BOOTSTRAP_TARGETED_ROUND
+            and not self._bootstrap_targeted_notice_emitted
+        ):
+            self._bootstrap_targeted_notice_emitted = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Bootstrap is entering targeted exploitation. Broad discovery tools "
+                        "are now disabled. Use the strongest Evidence and the narrowest "
+                        "Flag-producing request; call bootstrap_checkpoint or execution_report."
+                    ),
+                }
+            )
+            await store.append_event(
+                "bootstrap_targeted_phase_started",
+                {"round": round_number, "tool_count_reduced": True},
+            )
+        if (
+            round_number >= BOOTSTRAP_REPORT_ONLY_ROUND
+            and not self._bootstrap_report_only_notice_emitted
+        ):
+            self._bootstrap_report_only_notice_emitted = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Bootstrap cycle budget is nearly exhausted. Finish the current narrow route "
+                        "if it can produce an exact candidate; otherwise call bootstrap_cycle_yield "
+                        "with a concise progress summary. Do not submit a meaningless terminal blocked "
+                        "report or start broad reconnaissance."
+                    ),
+                }
+            )
+            await store.append_event(
+                "bootstrap_report_only_phase_started",
+                {"round": round_number, "report_round": BOOTSTRAP_REPORT_ONLY_ROUND},
+            )
+
+    def _apply_http_replay_cache(self, prepared: Sequence[Any]) -> None:
+        """Replay exact successful HTTP calls instead of paying for another request."""
+
+        for item in prepared:
+            if item.result is not None or item.name not in HTTP_REPLAY_TOOLS:
+                continue
+            cache_key = self._http_replay_key(item)
+            if cache_key is None:
+                continue
+            cached = self._http_result_cache.get(cache_key)
+            if cached is None:
+                continue
+            item.result = json.loads(
+                json.dumps(cached, ensure_ascii=False, default=str)
+            )
+            item.replayed = True
+
+    async def _apply_challenge_expensive_tool_dedup(
+        self, prepared: Sequence[Any], *, run_id: str
+    ) -> None:
+        """Guard cross-Agent repeats of successful high-cost tool calls."""
+
+        if self.role != "execution" or not self._unique_code:
+            return
+        for item in prepared:
+            if item.name != "pentest_sqlmap" or item.arguments is None or item.result is not None:
+                continue
+            try:
+                encoded = json.dumps(
+                    {
+                        "tool": item.name,
+                        "arguments": serialize_tool_arguments(
+                            item.arguments, exclude_none=True
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                continue
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            try:
+                decision = await self.state_service.claim_challenge_tool_fingerprint(
+                    run_id,
+                    self._unique_code,
+                    self.agent_id or "",
+                    tool_name=item.name,
+                    digest=digest,
+                )
+            except Exception:
+                # Deduplication is an optimization.  A transient state-store
+                # failure must not prevent the assigned technical action.
+                continue
+            if decision.get("duplicate"):
+                item.result = tool_error(
+                    "execution",
+                    "duplicate_expensive_request",
+                    "An identical SQLMap request already succeeded or is running; consume the shared Evidence instead of repeating it.",
+                    retry_allowed=False,
+                    retry_action="none",
+                    retry_tool=None,
+                    details={"tool": item.name, "reason": decision.get("reason")},
+                )
+                continue
+            if decision.get("claimed"):
+                self._claimed_challenge_tool_digests[item.tool_call_id] = digest
+
+    async def _complete_challenge_expensive_tool_dedup(
+        self, prepared: Sequence[Any], *, run_id: str
+    ) -> None:
+        if self.role != "execution" or not self._unique_code:
+            return
+        for item in prepared:
+            digest = self._claimed_challenge_tool_digests.pop(item.tool_call_id, None)
+            if digest is None:
+                continue
+            try:
+                await self.state_service.complete_challenge_tool_fingerprint(
+                    run_id,
+                    self._unique_code,
+                    self.agent_id or "",
+                    tool_name=item.name,
+                    digest=digest,
+                    success=bool(
+                        isinstance(item.result, Mapping)
+                        and item.result.get("ok") is True
+                    ),
+                )
+            except Exception:
+                # The durable attempt marker is best effort and contains no
+                # payload; never turn tool completion into an Agent failure.
+                continue
+
+    @staticmethod
+    def _http_replay_key(item: Any) -> str | None:
+        if getattr(item, "arguments", None) is None:
+            return None
+        try:
+            arguments = serialize_tool_arguments(
+                item.arguments,
+                exclude_none=True,
+            )
+            encoded = json.dumps(
+                {"tool": item.name, "arguments": arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _apply_probe_recovery_budget(
         self, prepared: Sequence[Any]
@@ -1060,28 +1526,49 @@ class AgentRunner:
                 and error.get("code") in {"invalid_json", "invalid_arguments"}
             )
             if is_argument_error:
+                same_arguments = (
+                    getattr(item, "raw_arguments_digest", None) is not None
+                    and getattr(item, "raw_arguments_digest", None)
+                    == getattr(self, "_probe_invalid_argument_digest", None)
+                )
                 self._probe_argument_failure_streak += 1
-                if self._probe_argument_failure_streak > 1:
+                if same_arguments or self._probe_argument_failure_streak > 1:
                     item.result = tool_error(
                         str(error.get("stage") or "schema"),
                         "probe_argument_recovery_exhausted",
-                        "system_http_probe received a second invalid argument shape in this session; use system_http_request or submit execution_report",
+                        (
+                            "system_http_probe repeated the same invalid arguments; do not retry them"
+                            if same_arguments
+                            else "system_http_probe received a second invalid argument shape in this session"
+                        )
+                        + "; use system_http_request or continue with the available tools",
                         retry_allowed=False,
                         retry_action="none",
                         details={
                             "recovery_budget": 1,
                             "previous_error_code": error.get("code"),
                             "canonical_tool": "system_http_request",
+                            "same_arguments": same_arguments,
                         },
                     )
                     self._probe_recovery_exhausted = True
+                else:
+                    self._probe_invalid_argument_digest = getattr(
+                        item, "raw_arguments_digest", None
+                    )
             elif item.arguments is not None:
                 self._probe_argument_failure_streak = 0
+                self._probe_invalid_argument_digest = None
 
     def _apply_challenge_dispatch_recovery_budget(
         self, prepared: Sequence[Any]
     ) -> None:
-        """Allow one compact correction for malformed controller dispatches."""
+        """Keep malformed controller dispatches recoverable within the session.
+
+        The dispatch tool remains available after an argument error.  Runtime
+        correction is intentionally bounded to a single prompt notice, while
+        each malformed call receives a structured, retryable error.
+        """
 
         if self.role != "challenge":
             return
@@ -1095,22 +1582,33 @@ class AgentRunner:
                 and error.get("code") in {"invalid_json", "invalid_arguments"}
             )
             if is_argument_error:
-                self._challenge_dispatch_argument_failure_streak += 1
-                if self._challenge_dispatch_argument_failure_streak > 1:
-                    item.result = tool_error(
-                        str(error.get("stage") or "schema"),
-                        "challenge_dispatch_recovery_exhausted",
-                        "challenge_dispatch received a second invalid argument shape in this session; record an empty decision or wait for a new report",
-                        retry_allowed=False,
-                        retry_action="none",
-                        details={
-                            "recovery_budget": 1,
-                            "previous_error_code": error.get("code"),
-                        },
+                same_arguments = (
+                    getattr(item, "raw_arguments_digest", None) is not None
+                    and getattr(item, "raw_arguments_digest", None)
+                    == getattr(
+                        self, "_challenge_dispatch_invalid_argument_digest", None
                     )
-                    self._challenge_dispatch_recovery_exhausted = True
+                )
+                self._challenge_dispatch_argument_failure_streak += 1
+                item.result = tool_error(
+                    str(error.get("stage") or "schema"),
+                    "challenge_dispatch_invalid_arguments",
+                    "rewrite the dispatch as {} or use the documented top-level fields",
+                    retry_allowed=True,
+                    retry_action="rewrite_arguments",
+                    details={
+                        "previous_error_code": error.get("code"),
+                        "same_arguments": same_arguments,
+                        "argument_failure_streak": self._challenge_dispatch_argument_failure_streak,
+                    },
+                )
+                self._challenge_dispatch_correction_pending = True
+                self._challenge_dispatch_invalid_argument_digest = getattr(
+                    item, "raw_arguments_digest", None
+                )
             elif item.arguments is not None:
                 self._challenge_dispatch_argument_failure_streak = 0
+                self._challenge_dispatch_invalid_argument_digest = None
 
     @staticmethod
     def _evidence_type(tool_name: str) -> str:
@@ -1393,6 +1891,7 @@ class AgentRunner:
         messages: Sequence[Mapping[str, Any]],
         *,
         tool_definitions: Sequence[Mapping[str, Any]],
+        report_recovery: bool = False,
     ) -> dict[str, Any]:
         estimated_prompt_tokens = request_token_count(messages, tool_definitions)
         calibrated_prompt_tokens = int(
@@ -1432,7 +1931,11 @@ class AgentRunner:
                 if remaining is not None and remaining <= 0:
                     raise AgentRunnerError(
                         "The Run deadline has expired",
-                        code="llm_temporarily_unavailable",
+                        code=(
+                            "bootstrap_cycle_yield"
+                            if self.bootstrap_mode
+                            else "llm_temporarily_unavailable"
+                        ),
                         recoverable=self.role in {"chief", "challenge"},
                         details={
                             "attempts": attempts,
@@ -1457,6 +1960,7 @@ class AgentRunner:
                             role=self.role,
                             bootstrap=self.bootstrap_mode,
                             context_budget=self.settings.context_budget,
+                            report_recovery=report_recovery,
                         ),
                     },
                 )
@@ -1504,6 +2008,8 @@ class AgentRunner:
                         code=(
                             "context_capacity_deferred"
                             if context_rejected
+                            else "bootstrap_cycle_yield"
+                            if self.bootstrap_mode and isinstance(exc, asyncio.TimeoutError)
                             else "llm_temporarily_unavailable"
                             if retryable
                             else "llm_request_failed"
@@ -1529,7 +2035,11 @@ class AgentRunner:
                 if remaining is not None and remaining <= delay:
                     raise AgentRunnerError(
                         "LLM retry would exceed the remaining Run deadline",
-                        code="llm_temporarily_unavailable",
+                        code=(
+                            "bootstrap_cycle_yield"
+                            if self.bootstrap_mode
+                            else "llm_temporarily_unavailable"
+                        ),
                         recoverable=self.role in {"chief", "challenge"},
                         details={
                             "attempts": attempts,
@@ -1565,11 +2075,80 @@ class AgentRunner:
         return payload
 
     def _remaining_run_seconds(self) -> float | None:
-        if self._run_deadline_monotonic is None:
+        deadlines = [
+            deadline
+            for deadline in (
+                self._run_deadline_monotonic,
+                getattr(self, "_agent_deadline_monotonic", None),
+            )
+            if deadline is not None
+        ]
+        if not deadlines:
             return None
-        return max(
-            0.0,
-            self._run_deadline_monotonic - asyncio.get_running_loop().time(),
+        return max(0.0, min(deadlines) - asyncio.get_running_loop().time())
+
+    @staticmethod
+    def _report_only_definitions(
+        definitions: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(definition)
+            for definition in definitions
+            if definition.get("function", {}).get("name") == "execution_report"
+        ]
+
+    def _active_tool_definitions(
+        self, definitions: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if self._report_recovery_used:
+            return self._report_only_definitions(definitions)
+        disabled = set(self._disabled_tool_names)
+        if self.bootstrap_mode:
+            if self._current_round_number >= BOOTSTRAP_REPORT_ONLY_ROUND:
+                return [
+                    dict(definition)
+                    for definition in definitions
+                    if definition.get("function", {}).get("name")
+                    in BOOTSTRAP_REPORT_TOOLS
+                ]
+            if self._current_round_number >= BOOTSTRAP_TARGETED_ROUND:
+                disabled.update(BOOTSTRAP_BROAD_DISCOVERY_TOOLS)
+        return [
+            dict(definition)
+            for definition in definitions
+            if definition.get("function", {}).get("name")
+            not in disabled
+        ]
+
+    async def _activate_deadline_report_recovery_if_needed(
+        self,
+        store: AgentStateStore,
+        messages: list[dict[str, Any]],
+        round_number: int,
+    ) -> None:
+        if (
+            not self.require_structured_report
+            or self._report_recovery_used
+            or self._session_timeout_seconds is None
+        ):
+            return
+        remaining = self._remaining_run_seconds()
+        if remaining is None or remaining > BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS:
+            return
+        self._report_recovery_used = True
+        self._force_context_compaction = True
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "The execution deadline is near. Preserve completed work, do not call any other tool, "
+                    "and call execution_report now with the required structured terminal result."
+                ),
+            }
+        )
+        await store.append_event(
+            "execution_deadline_report_recovery",
+            {"round": round_number, "remaining_seconds": int(remaining)},
         )
 
     @staticmethod
@@ -1659,14 +2238,79 @@ class AgentRunner:
             for item in messages
             if marker not in str(item.get("content") or "")
         ]
+        visible_update = {
+            key: value
+            for key, value in update.items()
+            if key not in {"content_digest", "authority_digest", "compacted"}
+        }
         messages.append(
             {
                 "role": "user",
                 "content": marker
                 + "\n"
-                + json.dumps(dict(update), ensure_ascii=False, default=str),
+                + json.dumps(visible_update, ensure_ascii=False, default=str),
             }
         )
+
+    async def _maybe_compact_bootstrap_update(
+        self,
+        update: Mapping[str, Any],
+        *,
+        store: AgentStateStore,
+    ) -> Mapping[str, Any]:
+        """Compress only large safe projections; never alter authority fields."""
+
+        digest = update.get("content_digest")
+        if not isinstance(digest, str) or not digest:
+            digest = blackboard_content_digest(update)
+        encoded_length = len(
+            json.dumps(dict(update), ensure_ascii=False, default=str)
+        )
+        if encoded_length < 6_000 or not list(update.get("reports") or []):
+            return update
+        cached = self._blackboard_compaction_cache.get(digest)
+        if cached is not None:
+            return cached
+        compactor = BlackboardCompactor(
+            self.settings,
+            client=await self._get_http_client(),
+        )
+        try:
+            compacted = await compactor.compact(
+                update,
+                deadline_monotonic=(
+                    self._agent_deadline_monotonic
+                    or self._run_deadline_monotonic
+                ),
+            )
+        except BlackboardCompactionError as exc:
+            await store.append_event(
+                "blackboard_compaction_fallback",
+                {
+                    "content_digest": digest,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return update
+        await store.append_event(
+            "blackboard_compacted",
+            {
+                "content_digest": digest,
+                "report_count": len(update.get("reports") or []),
+                "input_chars": encoded_length,
+                "output_chars": len(
+                    json.dumps(dict(compacted), ensure_ascii=False, default=str)
+                ),
+                "latency_ms": compactor.last_metrics.get("latency_ms"),
+            },
+        )
+        compacted["content_digest"] = digest
+        compacted["authority_digest"] = update.get("authority_digest")
+        self._blackboard_compaction_cache[digest] = compacted
+        if len(self._blackboard_compaction_cache) > 8:
+            oldest = next(iter(self._blackboard_compaction_cache))
+            self._blackboard_compaction_cache.pop(oldest, None)
+        return compacted
 
     @staticmethod
     def _tool_names(tool_calls: Any) -> list[str]:
@@ -1679,6 +2323,24 @@ class AgentRunner:
                 if isinstance(name, str):
                     names.append(name)
         return names
+
+    @staticmethod
+    def _redact_candidate_arguments_for_event(
+        tool_name: str, arguments: Any
+    ) -> Any:
+        """Keep exact candidate values out of durable tool-call events."""
+
+        if tool_name not in {"execution_report", "challenge_submit_flag"}:
+            return arguments
+        if not isinstance(arguments, Mapping):
+            return arguments
+        safe = dict(arguments)
+        field = "candidate_flag" if tool_name == "execution_report" else "flag"
+        value = safe.pop(field, None)
+        if isinstance(value, str) and value:
+            safe[f"{field}_present"] = True
+            safe[f"{field}_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return safe
 
     def _recovered_event_context(
         self,

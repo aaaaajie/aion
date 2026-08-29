@@ -19,6 +19,8 @@ def test_all_production_prompt_resources_are_available() -> None:
         "execution_system.txt",
         "challenge_agent.txt",
         "execution_agent.txt",
+        "bootstrap_agent.txt",
+        "bootstrap_system.txt",
         "session_memory_system.txt",
         "exploration_mission.txt",
     )
@@ -33,6 +35,9 @@ def test_default_chief_prompt_is_centrally_managed() -> None:
     assert "chief_wait" in prompt
     assert "restart_required" in prompt
     assert "stagnation_paused" in prompt
+    assert "easy challenges before medium or hard" in prompt
+    assert "priority overrides any Web-category" in prompt
+    assert "preference during early" in prompt
 
 
 @pytest.mark.parametrize("role", ["chief", "challenge", "execution"])
@@ -42,6 +47,13 @@ def test_role_system_prompts_include_shared_base_prompt(role: str) -> None:
 
     assert role_prompt.endswith("\n\n" + base)
     assert role_prompt.startswith(load_prompt(f"{role}_system.txt"))
+
+
+def test_chief_system_prompt_prioritizes_difficulty_during_early_phase() -> None:
+    prompt = system_prompt("chief")
+
+    assert "During the early phase, difficulty takes priority over category" in prompt
+    assert "Do not let Web preference override this early-phase ordering" in prompt
 
 
 def test_challenge_prompt_requires_a_lightweight_report_loop() -> None:
@@ -84,8 +96,45 @@ def test_execution_prompt_starts_work_without_management_rounds() -> None:
     prompt = system_prompt("execution")
     assert "first request already contains" in prompt
     assert "Start useful technical work immediately" in prompt
+    assert "ranking signals, not activation commands" in prompt
+    assert "solo first-turn" not in prompt
+    assert "requires a solo" not in prompt
     assert "execution_report" in prompt
     assert "evidence_refs" in prompt
+    assert "AION_AGENT_WORKDIR" in prompt
+    assert "AION_SHARED_WORKDIR" in prompt
+    assert "screenshot.png" in prompt
+
+
+def test_bootstrap_prompt_is_flag_first_and_checkpoint_aware() -> None:
+    prompt = load_prompt("bootstrap_agent.txt")
+    system = system_prompt("bootstrap")
+
+    assert "240 seconds" in prompt
+    assert "final 30 seconds" in prompt
+    assert "candidate_flag" in prompt
+    assert "bootstrap_checkpoint" in prompt
+    assert "Generic reconnaissance" in prompt
+    assert "Do not stop or restart solely" not in prompt
+    assert "bootstrap_checkpoint" in system
+    assert "AION_AGENT_WORKDIR" in prompt
+    assert "AION_SHARED_WORKDIR" in system
+    assert "captcha.png" in prompt
+
+
+def test_execution_prompt_prioritizes_bounded_sqlmap_for_exact_parameters() -> None:
+    system = system_prompt("execution")
+    agent = load_prompt("execution_agent.txt")
+
+    for prompt in (system, agent):
+        assert "pentest_sqlmap" in prompt
+        assert "exact" in prompt
+        assert "Do not repeat" in prompt or "repeat the same arguments" in prompt
+        assert "level=1" in prompt
+        assert "risk=1" in prompt
+
+    assert "bare landing page" in system
+    assert "capture it with the HTTP tools first" in agent
 
 
 def test_prompt_loader_rejects_missing_templates() -> None:

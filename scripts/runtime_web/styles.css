@@ -503,6 +503,16 @@ body.is-resizing * {
   mask-image: url("/assets/Chief.svg");
 }
 
+.agent-icon-bootstrap {
+  -webkit-mask-image: url("/assets/gongji.svg");
+  mask-image: url("/assets/gongji.svg");
+}
+
+.agent-icon-exploration {
+  -webkit-mask-image: url("/assets/yewutansuo.svg");
+  mask-image: url("/assets/yewutansuo.svg");
+}
+
 .agent-icon.status-active {
   color: var(--green);
   filter: drop-shadow(0 0 5px rgba(89, 201, 155, .36));

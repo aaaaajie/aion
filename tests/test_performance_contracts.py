@@ -33,7 +33,7 @@ def test_role_prompts_are_small() -> None:
 
 def test_execution_surface_is_bounded_and_has_no_cleanup_tools() -> None:
     tools = AgentPolicy("execution").allowed_tools
-    assert len(tools) <= 50
+    assert len(tools) <= 64
     assert not any(name.endswith("cleanup") for name in tools)
     assert "system_create_directory" not in tools
     assert "system_delete_path" not in tools

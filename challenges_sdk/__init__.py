@@ -15,6 +15,12 @@ from .models import (
     ChallengeStartResponse,
     SubmitFlagResponse,
 )
+from .recovery import (
+    BenchmarkOperationContract,
+    ContractRecoveryContext,
+    ResponseRecoveryContext,
+    ResponseRecoveryDecision,
+)
 
 __all__ = [
     "Challenge",
@@ -27,5 +33,9 @@ __all__ = [
     "ChallengesSDKError",
     "ChallengesSettings",
     "ChallengesTransportError",
+    "BenchmarkOperationContract",
+    "ContractRecoveryContext",
+    "ResponseRecoveryContext",
+    "ResponseRecoveryDecision",
     "SubmitFlagResponse",
 ]

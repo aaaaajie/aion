@@ -286,17 +286,18 @@ def test_release_catalog_replay_avoids_known_misselections_and_keeps_matches() -
     assert "execution/api-recon-and-docs" in ids(
         "Enumerate undocumented API routes and OpenAPI documentation"
     )
-    assert ids("Investigate an exposed .git repository and recover source") & {
-        "execution/code-auditor",
-        "execution/source-code-audit",
-        "execution/recon-js-analysis",
-    }
+    assert "execution/src-audit-workflow" in ids(
+        "Investigate an exposed .git repository and recover source"
+    )
     assert "execution/path-traversal-lfi" in ids(
         "Validate local file inclusion and path traversal"
+    )
+    assert "execution/path-traversal-lfi" in ids(
+        "公司下载接口的 filename 文件名参数直接拼进文件路径，验证路径穿越和任意文件读取"
     )
     assert "execution/php-file-upload-audit" in ids(
         "Exploit a confirmed PHP multipart upload endpoint and deploy a web shell"
     )
-    assert "execution/src-hunter" in ids(
+    assert "execution/internal-network-recon" in ids(
         "Use an established PHP foothold for internal-network tunneling"
     )

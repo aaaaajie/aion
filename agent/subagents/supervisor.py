@@ -16,6 +16,7 @@ import httpx
 
 from agent.config import AgentSettings, PROJECT_ROOT
 from agent.memory.models import AgentNode
+from agent.memory.blackboard import BlackboardCompactionError, BlackboardCompactor
 from agent.memory.redaction import redact_value
 from agent.prompts import load_prompt, render_prompt, system_prompt
 from agent.runner import AgentRunner, AgentRunnerError, AgentSessionResult, ToolRegistry
@@ -28,7 +29,14 @@ from agent.skills import (
 )
 from agent.state import (
     AgentStateStore,
+    BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
+    BOOTSTRAP_MAX_ROUNDS,
+    BOOTSTRAP_MISSION,
+    BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
+    BOOTSTRAP_SUCCESS_CRITERIA,
     CapabilityRegistry,
+    BOOTSTRAP_SCALE_INTERVAL_SECONDS as STATE_BOOTSTRAP_SCALE_INTERVAL_SECONDS,
+    MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE,
     MAX_CHALLENGE_SLOTS as DEFAULT_MAX_CHALLENGE_SLOTS,
     ResourceController,
     StateService,
@@ -37,10 +45,12 @@ from agent.state import (
 )
 from agent.state.errors import StateError
 from agent.state.clock import aware, utc_now
+from agent.state.blackboard import blackboard_content_digest
 from agent.state.schemas import (
     AgentReportInput,
     CapabilityContext,
     ChallengeDispatchInput,
+    ExecutionTaskInput,
 )
 from agent.state.scheduling import ChallengeScheduler
 from agent.tooling import (
@@ -53,7 +63,8 @@ from agent.tooling import (
 from tools.http import HttpProbeManager, HttpTools
 from tools.network import NetworkDiscoveryManager, NetworkTools
 from tools.binary import BinaryTools
-from tools.binaries import toolchain_for
+from tools.artifact import ArtifactTools
+from tools.binaries import default_toolchain_root, toolchain_for
 from tools.pentest import PentestTools
 from tools.system import ShellTaskManager, SystemTools
 from tools.system.policy import WorkspacePolicy
@@ -85,6 +96,13 @@ class AgentSupervisor:
     CONTROLLER_SAFETY_WAKE_SECONDS = 300.0
     HEARTBEAT_INTERVAL_SECONDS = 30.0
     HEARTBEAT_EVENT_INTERVAL_SECONDS = 300.0
+    BOOTSTRAP_SCALE_INTERVAL_SECONDS = STATE_BOOTSTRAP_SCALE_INTERVAL_SECONDS
+    EXECUTION_TIMEOUT_FLOORS = {
+        "discovery": 900,
+        "validation": 1_800,
+        "exploitation": 1_800,
+        "post_exploitation": 1_800,
+    }
     TERMINAL_AGENT_STATES = {
         "completed",
         "failed",
@@ -118,8 +136,10 @@ class AgentSupervisor:
         self.settings = settings
         self.benchmark = benchmark
         self.project_root = project_root.resolve()
-        self.toolchain_root = self.project_root / "tools" / "binaries"
-        self.run_root = (run_root or settings.run_root).resolve()
+        self.toolchain_root = default_toolchain_root()
+        self.run_root = (
+            run_root or self.project_root / ".aion" / "runs"
+        ).resolve()
         self.runner_factory = runner_factory
         self.max_challenge_slots = max_challenge_slots
         self.catalog_reconcile_interval_seconds = catalog_reconcile_interval_seconds
@@ -141,7 +161,9 @@ class AgentSupervisor:
         self._poll_task: asyncio.Task[None] | None = None
         self._challenge_completion_tasks: dict[str, asyncio.Task[Any]] = {}
         self._container_operation_lock = asyncio.Lock()
+        self._bootstrap_scale_lock = asyncio.Lock()
         self._hint_locks: dict[str, asyncio.Lock] = {}
+        self._benchmark_unavailable: set[str] = set()
         # Keep this in the Supervisor so the requirement survives Runner and
         # Tool wrapper reconstruction while a controller is waiting.
         self._pausing = False
@@ -151,6 +173,7 @@ class AgentSupervisor:
         self._model_http_client: httpx.AsyncClient | None = None
         self._skill_discovery: SkillDiscovery | None = None
         self._skill_discovery_bootstrap_tasks: set[asyncio.Task[None]] = set()
+        self._blackboard_compaction_cache: dict[str, Mapping[str, Any]] = {}
 
     async def run_chief(
         self,
@@ -240,15 +263,17 @@ class AgentSupervisor:
         runtime_python = runtime_prefix / "bin" / Path(sys.executable).name
         if not runtime_python.is_file():
             runtime_python = Path(sys.executable).resolve()
-        toolchain = toolchain_for(
-            self.toolchain_root if self.toolchain_root.is_dir() else None
-        )
+        toolchain = toolchain_for(self.toolchain_root)
         self._shell_tasks = ShellTaskManager(
             WorkspacePolicy(self.project_root),
             service,
             run_id,
             clock=service.clock,
-            read_only_paths=(self.skill_catalog.root, runtime_prefix),
+            read_only_paths=(
+                self.skill_catalog.root,
+                runtime_prefix,
+                self.toolchain_root,
+            ),
             environment={
                 "AION_SKILLS_ROOT": str(self.skill_catalog.root),
                 "AION_PYTHON": str(runtime_python),
@@ -267,6 +292,8 @@ class AgentSupervisor:
                 if self.resource_controller is not None
                 else None
             ),
+            disk_reserve_bytes=self.settings.disk_reserve_bytes,
+            disk_reserve_percent=self.settings.disk_reserve_percent,
         )
         await self._http_interactions.initialize(resume=resume)
         self._network_discovery = NetworkDiscoveryManager(
@@ -467,13 +494,54 @@ class AgentSupervisor:
                 observed_status,
                 reason,
             )
-            close_result = await self._execute_operation(
-                caller_id=caller_id,
-                tool_name="benchmark_close_challenge",
-                arguments={"unique_code": unique_code},
-                unique_code=unique_code,
+            close_result: dict[str, Any] = self._error(
+                "container_release_unconfirmed",
+                "Completed challenge container release was not confirmed",
+                error_type="internal",
             )
-            synced = await self._sync_challenge_catalog()
+            synced: dict[str, Any] = self._error(
+                "catalog_sync_failed",
+                "Completed challenge container release could not be confirmed",
+                error_type="internal",
+            )
+            attempts = 0
+            for attempt in range(1, 4):
+                attempts = attempt
+                try:
+                    close_result = await self._execute_operation(
+                        caller_id=caller_id,
+                        tool_name="benchmark_close_challenge",
+                        arguments={"unique_code": unique_code},
+                        unique_code=unique_code,
+                    )
+                    synced = await self._sync_challenge_catalog()
+                except Exception:
+                    LOGGER.warning(
+                        "completed_container_release_operation_failed run_id=%s unique_code=%s attempt=%s",
+                        self._run_id(),
+                        unique_code,
+                        attempt,
+                        exc_info=True,
+                    )
+                    close_result = self._error(
+                        "benchmark_error",
+                        "Completed challenge container release failed",
+                        error_type="internal",
+                    )
+                    synced = self._error(
+                        "catalog_sync_failed",
+                        "Completed challenge container release could not be confirmed",
+                        error_type="internal",
+                    )
+                current = await self._challenge_record(unique_code)
+                if synced.get("ok") is True and not current["slot_occupied"]:
+                    break
+                if attempt < 3 and self._is_transient_release_failure(
+                    close_result, synced
+                ):
+                    await asyncio.sleep(0.5 if attempt == 1 else 1.0)
+                    continue
+                break
             current = await self._challenge_record(unique_code)
             released = synced.get("ok") is True and not current["slot_occupied"]
             duration_ms = int(
@@ -495,6 +563,7 @@ class AgentSupervisor:
                 "observed_container_status": observed_status,
                 "container_status": current["container_status"],
                 "reason": reason,
+                "attempts": attempts,
                 "duration_ms": duration_ms,
             }
             if error_code is not None:
@@ -516,6 +585,134 @@ class AgentSupervisor:
             )
             return {
                 "released": released,
+                "container_status": current["container_status"],
+                "error_code": error_code,
+                "attempts": attempts,
+            }
+
+    async def release_paused_container(
+        self,
+        unique_code: str,
+        *,
+        reason: str = "stagnation_timeout",
+        caller_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a paused target and count a slot free only after confirmation."""
+
+        async with self._container_operation_lock:
+            challenge = await self._challenge_record(unique_code)
+            if challenge["work_status"] != "paused" or challenge["is_completed"]:
+                return {"released": False, "skipped": True, "reason": "challenge_not_paused"}
+            if not challenge["slot_occupied"]:
+                return {
+                    "released": True,
+                    "skipped": True,
+                    "container_status": challenge["container_status"],
+                }
+            owner = caller_id or self.chief_agent_id or ""
+            started = asyncio.get_running_loop().time()
+            await self._service().append_agent_event(
+                self._run_id(),
+                owner,
+                "paused_container_release_started",
+                {
+                    "unique_code": unique_code,
+                    "reason": reason,
+                    "observed_container_status": challenge["container_status"],
+                },
+            )
+            close_result: dict[str, Any] = self._error(
+                "container_release_unconfirmed",
+                "Paused challenge container release was not confirmed",
+                error_type="internal",
+            )
+            synced: dict[str, Any] = self._error(
+                "catalog_sync_failed",
+                "Paused challenge container release could not be confirmed",
+                error_type="internal",
+            )
+            attempts = 0
+            for attempt in range(1, 4):
+                attempts = attempt
+                try:
+                    close_result = await self._execute_operation(
+                        caller_id=owner,
+                        tool_name="benchmark_close_challenge",
+                        arguments={"unique_code": unique_code},
+                        unique_code=unique_code,
+                    )
+                    synced = await self._sync_challenge_catalog()
+                except Exception:
+                    LOGGER.warning(
+                        "paused_container_release_operation_failed run_id=%s unique_code=%s attempt=%s",
+                        self._run_id(),
+                        unique_code,
+                        attempt,
+                        exc_info=True,
+                    )
+                    close_result = self._error(
+                        "benchmark_error",
+                        "Paused challenge container release failed",
+                        error_type="internal",
+                    )
+                    synced = self._error(
+                        "catalog_sync_failed",
+                        "Paused challenge container release could not be confirmed",
+                        error_type="internal",
+                    )
+                current = await self._challenge_record(unique_code)
+                if synced.get("ok") is True and not current["slot_occupied"]:
+                    break
+                if attempt < 3 and self._is_transient_release_failure(
+                    close_result, synced
+                ):
+                    await asyncio.sleep(0.5 if attempt == 1 else 1.0)
+                    continue
+                break
+            current = await self._challenge_record(unique_code)
+            released = synced.get("ok") is True and not current["slot_occupied"]
+            error_code = None
+            if not released:
+                error_code = self._error_code(close_result)
+                if error_code is None and not synced.get("ok"):
+                    error_code = self._error_code(synced) or "catalog_sync_failed"
+                error_code = error_code or "container_release_unconfirmed"
+            event_type = (
+                "paused_container_release_succeeded"
+                if released
+                else "paused_container_release_failed"
+            )
+            payload: dict[str, Any] = {
+                "unique_code": unique_code,
+                "attempts": attempts,
+                "reason": reason,
+                "container_status": current["container_status"],
+                "duration_ms": int((asyncio.get_running_loop().time() - started) * 1_000),
+            }
+            if error_code is not None:
+                payload["error_code"] = error_code
+            await self._service().append_agent_event(
+                self._run_id(), owner, event_type, payload
+            )
+            if not released:
+                await self._service().publish_challenge_report(
+                    self._run_id(),
+                    sender_id=owner,
+                    unique_code=unique_code,
+                    report_type="challenge_status",
+                    status="paused_container_release_failed",
+                    payload={
+                        "type": "paused_container_release_failed",
+                        "unique_code": unique_code,
+                        "attempts": attempts,
+                        "error_code": error_code,
+                        "slot_occupied": current["slot_occupied"],
+                    },
+                )
+            return {
+                "released": released,
+                "retry_exhausted": attempts >= 3 and not released,
+                "attempts": attempts,
                 "container_status": current["container_status"],
                 "error_code": error_code,
             }
@@ -606,6 +803,13 @@ class AgentSupervisor:
                 existing["agent_id"],
                 reason="challenge_start_existing",
             )
+            initial_executions = [
+                item
+                for item in overview["agents"]
+                if item.get("role") == "execution"
+                and item.get("unique_code") == unique_code
+                and item.get("task_key") == "initial-recon"
+            ]
             return self._ok(
                 {
                     "agent_id": existing["agent_id"],
@@ -614,6 +818,7 @@ class AgentSupervisor:
                     "status": existing["status"],
                     "idempotent": True,
                     "bootstrap": bootstrap_result,
+                    "initial_executions": initial_executions,
                 }
             )
         challenge_state = next(
@@ -646,10 +851,25 @@ class AgentSupervisor:
 
         agent_id = f"challenge_{uuid4().hex}"
         bootstrap_agent_id = f"execution_{uuid4().hex}"
-        prompt = self._challenge_prompt(challenge, start_result)
-        bootstrap_prompt = self._bootstrap_prompt(challenge, start_result)
+        bootstrap_agent_ids: list[str] = []
+        initial_execution_ids: list[str] = []
+        prior_context = await self._service().get_challenge_context(
+            self._run_id(), unique_code, compact=True
+        )
+        prior_hints = prior_context.get("hints") if isinstance(prior_context, Mapping) else []
+        prompt = self._challenge_prompt(
+            challenge,
+            start_result,
+            hints=prior_hints,
+        )
+        bootstrap_prompt = self._bootstrap_prompt(
+            challenge,
+            start_result,
+            hints=prior_hints,
+        )
+        initial_execution = self._initial_execution_task(challenge)
         try:
-            record = await self._service().register_challenge_with_bootstrap(
+            record = await self._service().register_challenge_workgroup(
                 self._run_id(),
                 challenge_agent_id=agent_id,
                 bootstrap_agent_id=bootstrap_agent_id,
@@ -657,19 +877,56 @@ class AgentSupervisor:
                 unique_code=unique_code,
                 challenge_prompt=prompt,
                 bootstrap_prompt=bootstrap_prompt,
+                initial_execution=initial_execution,
                 bootstrap_enabled=bool(
                     getattr(self.settings, "bootstrap_enabled", True)
                 ),
             )
-            bootstrap = record.get("bootstrap") if isinstance(record, Mapping) else None
+            bootstrap_entries = (
+                record.get("bootstraps")
+                if isinstance(record, Mapping)
+                else None
+            )
+            if not isinstance(bootstrap_entries, list):
+                bootstrap_entries = [
+                    record.get("bootstrap") if isinstance(record, Mapping) else None
+                ]
+            bootstrap_agent_ids = [
+                str(item["agent_id"])
+                for item in bootstrap_entries
+                if isinstance(item, Mapping) and item.get("agent_id")
+            ]
             self._state_capabilities[agent_id] = self.capability_registry.issue(
                 self._run_id(), agent_id, "challenge", unique_code
             ).context
-            if isinstance(bootstrap, Mapping) and bootstrap.get("agent_id"):
-                self._state_capabilities[str(bootstrap["agent_id"])] = self.capability_registry.issue(
-                    self._run_id(), str(bootstrap["agent_id"]), "execution", unique_code
+            for bootstrap_id in bootstrap_agent_ids:
+                self._state_capabilities[bootstrap_id] = self.capability_registry.issue(
+                    self._run_id(), bootstrap_id, "execution", unique_code
+                ).context
+            initial_entries = (
+                record.get("initial_executions")
+                if isinstance(record, Mapping)
+                else None
+            )
+            if not isinstance(initial_entries, list):
+                initial_entries = []
+            initial_execution_ids = [
+                str(item["agent_id"])
+                for item in initial_entries
+                if isinstance(item, Mapping) and item.get("agent_id")
+            ]
+            for initial_id in initial_execution_ids:
+                self._state_capabilities[initial_id] = self.capability_registry.issue(
+                    self._run_id(), initial_id, "execution", unique_code
                 ).context
             await self._sync_nodes()
+            for initial_id in initial_execution_ids:
+                task = asyncio.create_task(
+                    self._prefetch_execution_skill(initial_id),
+                    name=f"skill-discovery-initial-{initial_id}",
+                )
+                self._skill_discovery_bootstrap_tasks.add(task)
+                task.add_done_callback(self._skill_discovery_bootstrap_tasks.discard)
             await self._launch_agent(agent_id)
         except Exception:
             try:
@@ -679,26 +936,28 @@ class AgentSupervisor:
             except Exception:
                 pass
             try:
-                bootstrap_record = await self._service().get_agent_runtime(
-                    self._run_id(), bootstrap_agent_id
-                )
-                if bootstrap_record["agent"]["status"] not in self.TERMINAL_AGENT_STATES:
-                    live_bootstrap = self._tasks.get(bootstrap_agent_id)
-                    if live_bootstrap is not None and not live_bootstrap.done():
-                        await self._stop_agent(bootstrap_agent_id)
+                for execution_id in bootstrap_agent_ids + initial_execution_ids or [bootstrap_agent_id]:
+                    bootstrap_record = await self._service().get_agent_runtime(
+                        self._run_id(), execution_id
+                    )
+                    if bootstrap_record["agent"]["status"] in self.TERMINAL_AGENT_STATES:
+                        continue
+                    live_execution = self._tasks.get(execution_id)
+                    if live_execution is not None and not live_execution.done():
+                        await self._stop_agent(execution_id)
                     else:
                         await self._service().finalize_execution_agent(
                             self._run_id(),
-                            bootstrap_agent_id,
+                            execution_id,
                             CapabilityContext(
                                 run_id=self._run_id(),
-                                agent_id=bootstrap_agent_id,
+                                agent_id=execution_id,
                                 role="execution",
                                 unique_code=unique_code,
                             ),
                             AgentReportInput(
                                 status="failed",
-                                summary="Bootstrap Agent could not be started",
+                                summary="Challenge workgroup Execution could not be started",
                                 hypothesis_outcome="inconclusive",
                             ),
                             terminal_status="failed",
@@ -718,6 +977,8 @@ class AgentSupervisor:
                 "unique_code": unique_code,
                 "status": "running",
                 "bootstrap": record.get("bootstrap", {"enabled": False}),
+                "bootstraps": record.get("bootstraps", []),
+                "initial_executions": record.get("initial_executions", []),
                 "start": start_result.get("data", {}),
             }
         )
@@ -857,6 +1118,12 @@ class AgentSupervisor:
         """Request a Hint using only remote hard rules and idempotency."""
 
         self._require_role(caller_id, "chief")
+        if "get_hint" in self._benchmark_unavailable:
+            return self._error(
+                "hint_unavailable",
+                "The benchmark does not expose a usable Hint operation",
+                error_type="conflict",
+            )
         challenge = await self._challenge_record(unique_code)
         if challenge["is_completed"] or challenge["work_status"] == "closed":
             return self._error(
@@ -864,8 +1131,33 @@ class AgentSupervisor:
                 "Hint cannot be requested for an inactive challenge",
                 error_type="permission",
             )
+        if challenge["hint_requested"]:
+            return self._error(
+                "hint_already_requested",
+                "Only one hint may be requested for a challenge",
+                error_type="conflict",
+            )
+        if not challenge["hint_eligible"]:
+            return self._error(
+                "hint_not_eligible",
+                "The runtime has not granted a hint signal for this challenge",
+                error_type="conflict",
+            )
         lock = self._hint_locks.setdefault(unique_code, asyncio.Lock())
         async with lock:
+            challenge = await self._challenge_record(unique_code)
+            if challenge["hint_requested"]:
+                return self._error(
+                    "hint_already_requested",
+                    "Only one hint may be requested for a challenge",
+                    error_type="conflict",
+                )
+            if not challenge["hint_eligible"]:
+                return self._error(
+                    "hint_not_eligible",
+                    "The runtime has not granted a hint signal for this challenge",
+                    error_type="conflict",
+                )
             result = await self._execute_operation(
                 caller_id=caller_id,
                 tool_name="benchmark_get_hint",
@@ -873,6 +1165,20 @@ class AgentSupervisor:
                 unique_code=unique_code,
             )
         if result.get("ok"):
+            hint_payload = {
+                "type": "hint_received",
+                "unique_code": unique_code,
+                "reason": reason,
+                "hint": (result.get("data") or {}).get("hint"),
+            }
+            await self._service().publish_challenge_report(
+                self._run_id(),
+                sender_id=caller_id,
+                unique_code=unique_code,
+                report_type="hint",
+                status="received",
+                payload=hint_payload,
+            )
             challenge_agent = await self._find_agent(
                 "challenge", unique_code=unique_code
             )
@@ -884,12 +1190,7 @@ class AgentSupervisor:
                     unique_code=unique_code,
                     report_type="hint",
                     status="received",
-                    payload={
-                        "type": "hint_received",
-                        "unique_code": unique_code,
-                        "reason": reason,
-                        "hint": (result.get("data") or {}).get("hint"),
-                    },
+                    payload=hint_payload,
                 )
             bootstrap_agents = [
                 item
@@ -907,12 +1208,7 @@ class AgentSupervisor:
                     unique_code=unique_code,
                     report_type="hint",
                     status="received",
-                    payload={
-                        "type": "hint_received",
-                        "unique_code": unique_code,
-                        "reason": reason,
-                        "hint": (result.get("data") or {}).get("hint"),
-                    },
+                    payload=hint_payload,
                 )
         return result
 
@@ -1035,7 +1331,138 @@ class AgentSupervisor:
             self._state_context(caller_id),
             max_reports=max_reports,
         )
+        observed = await self._maybe_compact_challenge_observation(
+            caller_id, observed
+        )
         return self._ok(observed)
+
+    async def _maybe_compact_challenge_observation(
+        self, caller_id: str, observed: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Shorten large safe report projections without touching authority."""
+
+        encoded_length = len(
+            json.dumps(dict(observed), ensure_ascii=False, default=str)
+        )
+        reports = list(observed.get("reports") or [])
+        if encoded_length < 6_000 or not reports:
+            return dict(observed)
+        digest = blackboard_content_digest(observed)
+        cached = self._blackboard_compaction_cache.get(digest)
+        if cached is not None:
+            return dict(cached)
+        compactor = BlackboardCompactor(
+            self.settings,
+            client=self._shared_model_http_client(),
+        )
+        try:
+            compacted = await compactor.compact(observed)
+        except BlackboardCompactionError as exc:
+            await self._service().append_agent_event(
+                self._run_id(),
+                caller_id,
+                "blackboard_compaction_fallback",
+                {
+                    "content_digest": digest,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return dict(observed)
+        await self._service().append_agent_event(
+            self._run_id(),
+            caller_id,
+            "blackboard_compacted",
+            {
+                "content_digest": digest,
+                "report_count": len(reports),
+                "input_chars": encoded_length,
+                "output_chars": len(
+                    json.dumps(dict(compacted), ensure_ascii=False, default=str)
+                ),
+                "latency_ms": compactor.last_metrics.get("latency_ms"),
+            },
+        )
+        compacted.pop("compacted", None)
+        self._blackboard_compaction_cache[digest] = compacted
+        if len(self._blackboard_compaction_cache) > 8:
+            oldest = next(iter(self._blackboard_compaction_cache))
+            self._blackboard_compaction_cache.pop(oldest, None)
+        return compacted
+
+    async def request_secondary_bootstrap(
+        self,
+        caller_id: str,
+        route_a: str,
+        route_b: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Temporarily open one extra Bootstrap lane for two distinct routes."""
+
+        node = self._require_role(caller_id, "challenge")
+        if not node.unique_code:
+            return self._error(
+                "missing_challenge",
+                "Challenge Agent is not bound to a challenge",
+            )
+        route_a = route_a.strip()
+        route_b = route_b.strip()
+        reason = reason.strip()
+        if not route_a or not route_b or not reason:
+            return self._error(
+                "invalid_secondary_bootstrap_request",
+                "Two non-empty independent routes and a reason are required",
+            )
+        if route_a.casefold() == route_b.casefold():
+            return self._error(
+                "duplicate_secondary_bootstrap_route",
+                "The two Bootstrap routes must be materially different",
+            )
+        challenge = await self._challenge_record(node.unique_code)
+        capacity = await self._service().set_bootstrap_capacity(
+            self._run_id(),
+            node.unique_code,
+            parent_id=node.agent_id,
+            target_count=2,
+            reason="secondary_independent_routes",
+        )
+        target_count = int(capacity.get("target_count") or 0)
+        if target_count < 1:
+            return self._error(
+                "challenge_stopped",
+                "The Challenge is no longer active",
+                error_type="conflict",
+            )
+        result = await self._ensure_bootstrap_agent(
+            node.unique_code,
+            node.agent_id,
+            reason="secondary_independent_routes",
+            bootstrap_count=target_count,
+            route_scope=(
+                f"Do not repeat route A: {route_a[:800]}. "
+                f"Explore route B only: {route_b[:800]}."
+            ),
+        )
+        await self._service().append_agent_event(
+            self._run_id(),
+            caller_id,
+            "bootstrap_secondary_requested",
+            {
+                "unique_code": node.unique_code,
+                "route_a": route_a[:800],
+                "route_b": route_b[:800],
+                "reason": reason[:1_000],
+                "bootstrap_count": target_count,
+            },
+        )
+        await self._project()
+        return self._ok(
+            {
+                "unique_code": node.unique_code,
+                "challenge_status": challenge.get("work_status"),
+                "bootstrap_count": len(result.get("bootstraps") or []),
+                "bootstraps": result.get("bootstraps") or [],
+            }
+        )
 
     async def dispatch_challenge(
         self,
@@ -1048,16 +1475,33 @@ class AgentSupervisor:
                 "missing_challenge",
                 "Challenge Agent is not bound to a challenge",
             )
+        if payload.outcome == "blocked" and not payload.tasks:
+            overview = await self._service().get_overview(self._run_id())
+            active_children = [
+                item["agent_id"]
+                for item in overview["agents"]
+                if item["role"] == "execution"
+                and item.get("unique_code") == node.unique_code
+                and item["status"] not in self.TERMINAL_AGENT_STATES
+            ]
+            if active_children:
+                return self._error(
+                    "active_work_requires_wait",
+                    "Active Execution work is still running; use challenge_wait instead of recording a blocked decision",
+                    error_type="conflict",
+                    detail={"active_agent_ids": active_children},
+                )
         result = await self._service().dispatch_challenge(
             self._run_id(),
             node.unique_code,
             self._state_context(caller_id),
             payload,
         )
-        await self._register_dispatch_admissions(
-            node.unique_code, result.get("admissions", [])
-        )
-        if self.chief_agent_id is not None:
+        if not result.get("no_action"):
+            await self._register_dispatch_admissions(
+                node.unique_code, result.get("admissions", [])
+            )
+        if self.chief_agent_id is not None and not result.get("no_action"):
             await self._service().publish_control_report(
                 self._run_id(),
                 sender_id=caller_id,
@@ -1191,6 +1635,16 @@ class AgentSupervisor:
         saved = await self._service().submit_report(
             self._run_id(), caller_id, self._state_context(caller_id), payload
         )
+        if (
+            saved.get("terminal", True)
+            and self._report_has_high_value_progress(saved)
+        ):
+            node = self.nodes[caller_id]
+            await self._stop_competing_executions(
+                unique_code=node.unique_code or "",
+                exclude_agent_id=caller_id,
+                discovery_only=True,
+            )
         await self._project()
         await self._sync_nodes()
         return {
@@ -1202,12 +1656,225 @@ class AgentSupervisor:
                 "hypothesis_outcome": saved.get(
                     "hypothesis_outcome", "inconclusive"
                 ),
-                "terminal": True,
+                "terminal": bool(saved.get("terminal", True)),
+                "cycle_yield": bool(saved.get("cycle_yield", False)),
                 "report_id": saved.get("report_id"),
                 "idempotent": saved.get("idempotent", False),
             },
             "warnings": saved.get("warnings", []),
         }
+
+    @staticmethod
+    def _report_has_high_value_progress(saved: Mapping[str, Any]) -> bool:
+        """Recognize only evidence-backed progress suitable for lane pruning."""
+
+        if saved.get("candidate_flag_present"):
+            return True
+        findings = saved.get("findings")
+        if not isinstance(findings, list):
+            return False
+        categories = {"vulnerability", "credential", "privilege", "attack_path", "flag"}
+        for finding in findings:
+            if not isinstance(finding, Mapping):
+                continue
+            if finding.get("category") not in categories:
+                continue
+            if finding.get("verification_status") == "rejected":
+                continue
+            refs = finding.get("evidence_refs")
+            if not isinstance(refs, list) or not any(
+                isinstance(ref, str) and ref.startswith("evidence:") for ref in refs
+            ):
+                continue
+            if finding.get("verification_status") == "verified":
+                return True
+            try:
+                confidence = float(finding.get("confidence"))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence >= 0.8:
+                return True
+        return False
+
+    async def report_bootstrap_checkpoint(
+        self,
+        caller_id: str,
+        *,
+        route_key: str,
+        summary: str,
+        next_step: str,
+        task_stage: str,
+        evidence_refs: list[str],
+    ) -> dict[str, Any]:
+        self._require_role(caller_id, "execution")
+        saved = await self._service().submit_bootstrap_checkpoint(
+            self._run_id(),
+            caller_id,
+            self._state_context(caller_id),
+            route_key=route_key,
+            summary=summary,
+            next_step=next_step,
+            task_stage=task_stage,
+            evidence_refs=evidence_refs,
+        )
+        if not saved.get("idempotent"):
+            # A Bootstrap checkpoint is already a verified route handoff. Stop
+            # stale discovery lanes so the Challenge-created follow-up is the
+            # next piece of work instead of competing with old reconnaissance.
+            await self._stop_competing_executions(
+                unique_code=self.nodes[caller_id].unique_code or "",
+                exclude_agent_id=caller_id,
+                discovery_only=True,
+            )
+        await self._project()
+        await self._sync_nodes()
+        return {
+            "ok": True,
+            "data": {
+                "agent_id": caller_id,
+                "sequence": saved["sequence"],
+                "status": saved["status"],
+                "terminal": False,
+                "report_id": saved["report_id"],
+                "route_key": saved["route_key"],
+                "idempotent": saved.get("idempotent", False),
+            },
+            "warnings": saved.get("warnings", []),
+        }
+
+    async def yield_bootstrap_cycle(
+        self,
+        caller_id: str,
+        *,
+        summary: str,
+    ) -> dict[str, Any]:
+        self._require_role(caller_id, "execution")
+        saved = await self._service().yield_bootstrap_cycle(
+            self._run_id(),
+            caller_id,
+            self._state_context(caller_id),
+            summary=summary,
+        )
+        await self._project()
+        await self._sync_nodes()
+        return {
+            "ok": True,
+            "data": {
+                **saved,
+                "terminal": False,
+                "cycle_yield": True,
+            },
+            "warnings": [],
+        }
+
+    async def report_execution_checkpoint(
+        self,
+        caller_id: str,
+        *,
+        summary: str,
+        next_step: str,
+        task_stage: str,
+        urgency: str,
+        evidence_refs: list[str],
+    ) -> dict[str, Any]:
+        self._require_role(caller_id, "execution")
+        saved = await self._service().submit_execution_checkpoint(
+            self._run_id(),
+            caller_id,
+            self._state_context(caller_id),
+            summary=summary,
+            next_step=next_step,
+            task_stage=task_stage,
+            urgency=urgency,
+            evidence_refs=evidence_refs,
+        )
+        # An interrupt checkpoint is an explicit verified handoff: preserve the
+        # checkpointing lane and the persistent Bootstrap lane, but stop only
+        # discovery Executions that would otherwise continue stale exploration.
+        # Informational checkpoints only wake consumers.
+        if not saved.get("idempotent") and urgency == "interrupt":
+            await self._stop_competing_executions(
+                unique_code=self.nodes[caller_id].unique_code or "",
+                exclude_agent_id=caller_id,
+                discovery_only=True,
+            )
+        handoff = False
+        # A discovery interrupt is a verified handoff to the deterministic
+        # validation follow-up.  End this broad lane after the checkpoint is
+        # durable so it cannot continue probing while the follow-up runs.
+        if (
+            not saved.get("idempotent")
+            and urgency == "interrupt"
+            and task_stage == "discovery"
+        ):
+            handoff_result = await self._service().finalize_execution_handoff(
+                self._run_id(),
+                caller_id,
+                self._state_context(caller_id),
+                checkpoint_report_id=saved["report_id"],
+            )
+            handoff = bool(handoff_result.get("handoff"))
+        await self._project()
+        await self._sync_nodes()
+        return {
+            "ok": True,
+            "data": {
+                "agent_id": caller_id,
+                "sequence": saved["sequence"],
+                "status": saved["status"],
+                "terminal": False,
+                "report_id": saved["report_id"],
+                "urgency": saved["urgency"],
+                "idempotent": saved.get("idempotent", False),
+                "handoff": handoff,
+                "handoff_terminal": handoff,
+            },
+            "warnings": saved.get("warnings", []),
+        }
+
+    async def _stop_competing_executions(
+        self,
+        *,
+        unique_code: str,
+        exclude_agent_id: str,
+        discovery_only: bool = True,
+    ) -> None:
+        """Stop stale sibling discovery Executions after a verified handoff."""
+
+        if not unique_code:
+            return
+        overview = await self._service().get_overview(self._run_id())
+        candidates = [
+            item
+            for item in overview.get("agents", [])
+            if item.get("role") == "execution"
+            and item.get("kind") != "bootstrap"
+            and item.get("unique_code") == unique_code
+            and item.get("agent_id") != exclude_agent_id
+            and item.get("status") not in self.TERMINAL_AGENT_STATES
+            and (
+                not discovery_only
+                or (item.get("task_stage") or "discovery") == "discovery"
+            )
+        ]
+        if not candidates:
+            return
+        await asyncio.gather(
+            *(self._stop_agent(item["agent_id"]) for item in candidates)
+        )
+        await self._service().append_agent_event(
+            self._run_id(),
+            exclude_agent_id,
+            "execution_checkpoint_siblings_stopped",
+            {
+                "unique_code": unique_code,
+                "stopped_count": len(candidates),
+                "discovery_only": discovery_only,
+                "stopped_task_stages": sorted(
+                    {item.get("task_stage") or "discovery" for item in candidates}
+                ),
+            },
+        )
 
     async def read_evidence(
         self,
@@ -1405,6 +2072,9 @@ class AgentSupervisor:
             await self._service().transition_agent(
                 self._run_id(), agent_id, "running"
             )
+            await self._service().mark_execution_branch_running(
+                self._run_id(), agent_id
+            )
             if agent.get("kind") == "bootstrap":
                 await self._service().append_agent_event(
                     self._run_id(),
@@ -1537,6 +2207,38 @@ class AgentSupervisor:
                         controller_recovery_attempt = 0
                         controller_recovery_started = None
                     if role == "execution":
+                        if (
+                            agent.get("kind") == "bootstrap"
+                            and isinstance(result, AgentSessionResult)
+                            and result.yield_reason == "bootstrap_cycle_yield"
+                        ):
+                            # A cycle boundary is not a terminal report. Keep
+                            # the same logical lane and resume with durable
+                            # memory/context instead of creating a replacement
+                            # Agent or entering missing-report recovery.
+                            session_resume = True
+                            wake_sequence = max(
+                                wake_sequence,
+                                await self._service().notifier.current(
+                                    self._service().agent_signal_key(
+                                        self._run_id(), agent_id
+                                    )
+                                ),
+                            )
+                            continue
+                        if (
+                            agent.get("kind") == "bootstrap"
+                            and isinstance(result, AgentSessionResult)
+                            and not result.structured_report_seen
+                        ):
+                            await self._service().yield_bootstrap_cycle(
+                                self._run_id(),
+                                agent_id,
+                                self._state_context(agent_id),
+                                summary="Bootstrap session ended without a terminal candidate; resume the same lane.",
+                            )
+                            session_resume = True
+                            continue
                         return result
                     terminal = await self._settle_controller(agent_id, role, result)
                     if terminal:
@@ -1720,10 +2422,27 @@ class AgentSupervisor:
                 selection_text = await self._skill_selection_text(role, agent)
                 presented_candidates: list[dict[str, Any]] = []
                 discovery_result = None
+                execution_direction: str | None = None
                 if role == "execution":
+                    execution_direction = str(
+                        agent.get("direction")
+                        or (await self._challenge_record(agent.get("unique_code"))).get(
+                            "direction"
+                        )
+                        or "unknown"
+                    )
+                    selection_text = " ".join(
+                        (
+                            selection_text,
+                            f"direction: {execution_direction}",
+                            f"task_key: {agent.get('task_key') or ''}",
+                            f"branch_key: {agent.get('branch_key') or ''}",
+                        )
+                    )
                     discovery_result = await self._skill_discovery_service().candidates_for(
                         agent_id,
                         objective=str(agent.get("mission") or ""),
+                        direction=execution_direction,
                         task_stage=(
                             str(agent["task_stage"])
                             if agent.get("task_stage") is not None
@@ -1765,6 +2484,16 @@ class AgentSupervisor:
                             **skill_context.listing_metrics,
                             "candidate_ids": [
                                 item["skill_id"] for item in presented_candidates
+                            ],
+                            "strong_match_ids": [
+                                item["skill_id"]
+                                for item in presented_candidates
+                                if item.get("match_strength") == "strong"
+                            ],
+                            "recommended_ids": [
+                                item["skill_id"]
+                                for item in presented_candidates
+                                if item.get("recommended") is True
                             ],
                             "source": discovery_result.source,
                             "discovery_latency_ms": discovery_result.latency_ms,
@@ -1816,19 +2545,31 @@ class AgentSupervisor:
                 or self._network_discovery is None
             ):
                 raise SubagentError("Execution task managers are not initialized")
+            shell_client = self._shell_tasks.bind(
+                agent_id,
+                shared_root=self._shell_tasks.shared_workspace_root(
+                    str(agent["unique_code"])
+                ),
+            )
             wrappers = [
                 result_tools,
                 SkillTools(skill_context),
                 SystemTools(
                     root=self.project_root,
-                    shell=self._shell_tasks.bind(agent_id),
+                    shell=shell_client,
+                    agent_work_root=shell_client.agent_work_root,
+                    shared_work_root=shell_client.shared_work_root,
                 ),
                 HttpTools(self._http_interactions.bind(agent_id)),
                 NetworkTools(self._network_discovery.bind(agent_id)),
                 BinaryTools(self.project_root, toolchain_root=self.toolchain_root),
-                PentestTools(toolchain_root=self.toolchain_root),
+                ArtifactTools(self.project_root),
+                PentestTools(root=self.project_root, toolchain_root=self.toolchain_root),
                 ExecutionAgentTools(
-                    self, agent_id=agent_id, unique_code=agent["unique_code"]
+                    self,
+                    agent_id=agent_id,
+                    unique_code=agent["unique_code"],
+                    bootstrap_mode=bootstrap_mode,
                 ),
             ]
         live_context_provider = None
@@ -1846,11 +2587,24 @@ class AgentSupervisor:
                 "live_context_provider": live_context_provider,
                 "live_context_ack": live_context_ack,
                 "bootstrap_mode": True,
+                "session_timeout_seconds": float(
+                    self._effective_execution_timeout(agent)
+                ),
+            }
+        elif role == "execution":
+            runner_options = {
+                "session_timeout_seconds": float(
+                    self._effective_execution_timeout(agent)
+                ),
             }
         runner = self.runner_factory(
             self.settings,
             ToolRegistry(wrappers, allowed_tools=AgentPolicy(role).allowed_tools),
-            max_rounds=None if bootstrap_mode else (200 if role == "execution" else 1_000),
+            max_rounds=(
+                BOOTSTRAP_MAX_ROUNDS
+                if bootstrap_mode
+                else (200 if role == "execution" else 1_000)
+            ),
             run_root=self.run_root,
             role=role,
             agent_id=agent_id,
@@ -1861,7 +2615,7 @@ class AgentSupervisor:
             system_context_provider=(
                 skill_context.render_system_context if skill_context is not None else None
             ),
-            require_structured_report=role == "execution",
+                require_structured_report=role == "execution" and not bootstrap_mode,
             state_service=self._service(),
             http_client=self._shared_model_http_client(),
             **runner_options,
@@ -1875,17 +2629,54 @@ class AgentSupervisor:
         try:
             operation = runner.run_session(prompt, store=store, resume=resume)
             timeout = (
-                agent["timeout_seconds"]
-                if role == "execution" and not bootstrap_mode
+                self._effective_execution_timeout(agent)
+                if role == "execution"
                 else None
             )
-            return await asyncio.wait_for(operation, timeout=timeout) if timeout else await operation
+            try:
+                return (
+                    await asyncio.wait_for(operation, timeout=timeout)
+                    if timeout
+                    else await operation
+                )
+            except asyncio.TimeoutError:
+                if not bootstrap_mode:
+                    raise
+                await self._service().yield_bootstrap_cycle(
+                    self._run_id(),
+                    agent_id,
+                    self._state_context(agent_id),
+                    summary="Bootstrap cycle reached its time budget; resume the same lane with persisted context.",
+                )
+                return AgentSessionResult(
+                    run_id=self._run_id(),
+                    final="",
+                    last_event_sequence=int(store.checkpoint.last_event_sequence),
+                    structured_report_seen=False,
+                    yield_reason="bootstrap_cycle_yield",
+                )
         finally:
             self._runners.pop(agent_id, None)
             try:
                 await runner.close()
             except Exception:
                 pass
+
+    @classmethod
+    def _effective_execution_timeout(cls, agent: Mapping[str, Any]) -> int:
+        """Apply the competition timeout floor to persisted and new tasks."""
+
+        if agent.get("kind") == "bootstrap":
+            value = agent.get("timeout_seconds")
+            if not isinstance(value, int) or isinstance(value, bool):
+                value = BOOTSTRAP_CYCLE_TIMEOUT_SECONDS
+            return min(BOOTSTRAP_CYCLE_TIMEOUT_SECONDS, max(60, value))
+        stage = str(agent.get("task_stage") or "discovery")
+        floor = cls.EXECUTION_TIMEOUT_FLOORS.get(stage, 1_800)
+        value = agent.get("timeout_seconds")
+        if not isinstance(value, int) or isinstance(value, bool):
+            value = 1_800
+        return min(3_600, max(floor, value))
 
     async def _skill_selection_text(
         self, role: AgentRole, agent: Mapping[str, Any]
@@ -1944,6 +2735,11 @@ class AgentSupervisor:
             self._skill_discovery_service().prefetch(
                 agent_id,
                 objective=str(agent.get("mission") or ""),
+                direction=str(
+                    agent.get("direction")
+                    or (await self._challenge_record(agent.get("unique_code"))).get("direction")
+                    or "unknown"
+                ),
                 task_stage=(
                     str(agent["task_stage"])
                     if agent.get("task_stage") is not None
@@ -2125,6 +2921,17 @@ class AgentSupervisor:
         arguments: dict[str, Any],
         unique_code: str,
     ) -> dict[str, Any]:
+        before = None
+        if tool_name in {
+            "benchmark_start_challenge",
+            "benchmark_get_hint",
+            "benchmark_submit_flag",
+            "benchmark_close_challenge",
+        }:
+            try:
+                before = await self._challenge_record(unique_code)
+            except StateError:
+                before = None
         operations = await self._service().list_operations(self._run_id())
         if any(
             item["status"] == "indeterminate"
@@ -2160,7 +2967,54 @@ class AgentSupervisor:
                 "Benchmark operation failed",
                 error_type="internal",
             )
+        await self._record_benchmark_events(result)
+        if not result.get("ok") and self._is_ambiguous_benchmark_response(result):
+            if tool_name == "benchmark_get_hint":
+                # A successful Hint request may already have consumed score even
+                # when its response cannot be decoded. Never request it again.
+                await self._service().complete_operation(
+                    self._run_id(),
+                    operation_id,
+                    result_code="hint_response_unavailable",
+                    result_payload=result,
+                    challenge_updates={
+                        "hint_requested": True,
+                        "hint_eligible": False,
+                    },
+                )
+                return self._error(
+                    "hint_response_unavailable",
+                    "The Hint request may have succeeded but its response could not be decoded",
+                    error_type="execution",
+                    detail={"retry_allowed": False},
+                )
+            reconciled = await self._reconcile_ambiguous_operation(
+                tool_name,
+                unique_code,
+                before,
+            )
+            if reconciled is not None:
+                result = reconciled
+            else:
+                await self._service().mark_operation_indeterminate(
+                    self._run_id(),
+                    operation_id,
+                    result_payload=result,
+                )
+                await self._append_benchmark_event(
+                    "benchmark_operation_indeterminate",
+                    unique_code=unique_code,
+                    operation=tool_name,
+                )
+                return self._error(
+                    "operation_indeterminate",
+                    "The remote operation may have executed but could not be confirmed",
+                    error_type="conflict",
+                    detail={"retry_allowed": False},
+                )
         if not result.get("ok"):
+            if self._is_benchmark_capability_unavailable(result):
+                await self._mark_benchmark_capability_unavailable(tool_name)
             code = self._error_code(result) or "benchmark_rejected"
             message = self._error_message(result) or "Benchmark operation was rejected"
             operation_secrets = (
@@ -2194,6 +3048,135 @@ class AgentSupervisor:
         )
         return result
 
+    @staticmethod
+    def _is_ambiguous_benchmark_response(result: Mapping[str, Any]) -> bool:
+        if result.get("ok") is not False:
+            return False
+        error = result.get("error")
+        if not isinstance(error, Mapping) or error.get("code") != "invalid_response":
+            return False
+        details = error.get("details")
+        if not isinstance(details, Mapping):
+            return False
+        status_code = details.get("status_code")
+        return isinstance(status_code, int) and 200 <= status_code < 300
+
+    @staticmethod
+    def _is_benchmark_capability_unavailable(result: Mapping[str, Any]) -> bool:
+        if result.get("ok") is not False:
+            return False
+        error = result.get("error")
+        if not isinstance(error, Mapping):
+            return False
+        details = error.get("details")
+        status_code = (
+            details.get("status_code")
+            if isinstance(details, Mapping)
+            else None
+        )
+        return status_code in {404, 405, 501}
+
+    async def _mark_benchmark_capability_unavailable(self, tool_name: str) -> None:
+        operation = tool_name.removeprefix("benchmark_")
+        self._benchmark_unavailable.add(operation)
+        if operation == "get_hint":
+            await self._service().disable_hint_eligibility(
+                self._run_id(), reason="benchmark_endpoint_unavailable"
+            )
+
+    def benchmark_capability_available(self, operation: str) -> bool:
+        return operation not in self._benchmark_unavailable
+
+    async def _reconcile_ambiguous_operation(
+        self,
+        tool_name: str,
+        unique_code: str,
+        before: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Use bounded read-only catalog sync to confirm a malformed 2xx write."""
+
+        for attempt in range(3):
+            synced = await self._sync_challenge_catalog()
+            if synced.get("ok"):
+                after = await self._challenge_record(unique_code)
+                if tool_name == "benchmark_start_challenge" and container_slot_occupied(
+                    after.get("container_status")
+                ):
+                    return self._ok(
+                        {
+                            "unique_code": unique_code,
+                            "container_addr": list(after.get("container_addr") or []),
+                            "reconciled": True,
+                        }
+                    )
+                if tool_name == "benchmark_close_challenge" and not container_slot_occupied(
+                    after.get("container_status")
+                ):
+                    return self._ok(
+                        {
+                            "unique_code": unique_code,
+                            "closed": True,
+                            "reconciled": True,
+                        }
+                    )
+                if tool_name == "benchmark_submit_flag" and before is not None:
+                    before_count = int(before.get("correct_flag_count") or 0)
+                    after_count = int(after.get("correct_flag_count") or 0)
+                    if after_count > before_count or (
+                        bool(after.get("is_completed"))
+                        and not bool(before.get("is_completed"))
+                    ):
+                        return self._ok(
+                            {
+                                "accepted": True,
+                                "correct": True,
+                                "awarded": 0,
+                                "cumulative_score": 0,
+                                "correct_flag_count": after_count,
+                                "total_flag_count": int(after.get("flag_count") or 0),
+                                "challenge_completed": bool(after.get("is_completed")),
+                                "reconciled": True,
+                            }
+                        )
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return None
+
+    async def _append_benchmark_event(self, event_type: str, **payload: Any) -> None:
+        """Expose adapter recovery metadata without making it authoritative."""
+
+        if self.run_id is None or self.chief_agent_id is None:
+            return
+        await self._service().append_agent_event(
+            self._run_id(), self.chief_agent_id, event_type, payload
+        )
+
+    async def _record_benchmark_events(self, result: Mapping[str, Any]) -> None:
+        """Persist adapter metadata without persisting untrusted response bodies."""
+
+        warnings = result.get("warnings")
+        if not isinstance(warnings, list):
+            error = result.get("error")
+            details = error.get("details") if isinstance(error, Mapping) else None
+            warnings = (
+                details.get("benchmark_events")
+                if isinstance(details, Mapping)
+                else None
+            )
+        if not isinstance(warnings, list):
+            return
+        for warning in warnings:
+            if not isinstance(warning, Mapping):
+                continue
+            event_type = warning.get("code")
+            details = warning.get("details")
+            if not isinstance(event_type, str) or not event_type.startswith(
+                "benchmark_"
+            ):
+                continue
+            payload = dict(details) if isinstance(details, Mapping) else {}
+            await self._append_benchmark_event(event_type, **payload)
+
     async def _operation_challenge_updates(
         self,
         tool_name: str,
@@ -2209,7 +3192,7 @@ class AgentSupervisor:
                 "container_addr": list(data.get("container_addr") or []),
             }
         if tool_name == "benchmark_get_hint":
-            return {"hint_requested": True}
+            return {"hint_requested": True, "hint_eligible": False}
         if tool_name == "benchmark_close_challenge":
             current = await self._challenge_record(unique_code)
             return {
@@ -2217,6 +3200,8 @@ class AgentSupervisor:
                 "container_status": "release_pending",
                 "work_status": (
                     "completed" if current["is_completed"] else "closed"
+                    if current["work_status"] != "paused"
+                    else "paused"
                 ),
             }
         if tool_name == "benchmark_submit_flag":
@@ -2265,7 +3250,9 @@ class AgentSupervisor:
                 "benchmark_error", "Benchmark operation failed", error_type="internal"
             )
         if isinstance(result, Mapping):
-            return dict(result)
+            normalized = dict(result)
+            await self._record_benchmark_events(normalized)
+            return normalized
         return self._error(
             "invalid_response",
             "Benchmark operation returned invalid data",
@@ -2415,17 +3402,18 @@ class AgentSupervisor:
     ) -> None:
         cancelled = failure_code == "cancelled"
         evidence_refs: list[str] = []
-        if failure_code.startswith("bootstrap"):
-            try:
-                evidence_refs = [
-                    str(item["evidence_ref"])
-                    for item in await self._service().list_evidence_metadata(
-                        self._run_id(), self._state_context(agent_id), limit=20
-                    )
-                    if isinstance(item, Mapping) and item.get("evidence_ref")
-                ][:20]
-            except Exception:
-                evidence_refs = []
+        try:
+            evidence_refs = [
+                str(item["evidence_ref"])
+                for item in await self._service().list_evidence_metadata(
+                    self._run_id(), self._state_context(agent_id), limit=20
+                )
+                if isinstance(item, Mapping) and item.get("evidence_ref")
+            ][:20]
+        except Exception:
+            # A missing evidence snapshot must not mask the original Agent
+            # failure or prevent the terminal state from being persisted.
+            evidence_refs = []
         payload = AgentReportInput(
             status="cancelled" if cancelled else "failed",
             summary=(
@@ -2772,8 +3760,15 @@ class AgentSupervisor:
         parent_id: str,
         *,
         reason: str,
+        bootstrap_count: int | None = None,
+        route_scope: str | None = None,
     ) -> dict[str, Any]:
-        """Keep exactly one active Bootstrap for an unfinished Challenge."""
+        """Ensure the durable Bootstrap capacity without shrinking existing lanes."""
+
+        if bootstrap_count is not None and not 1 <= bootstrap_count <= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
+            raise ValueError(
+                f"bootstrap_count must be between 1 and {MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE}"
+            )
 
         if not bool(getattr(self.settings, "bootstrap_enabled", True)):
             return {"enabled": False, "agent_id": None, "status": None}
@@ -2789,38 +3784,87 @@ class AgentSupervisor:
                         "container_addr": challenge.get("container_addr") or [],
                     }
                 },
+                restart_reason=reason,
+                route_scope=route_scope,
             ),
             bootstrap_priority=100,
+            bootstrap_count=bootstrap_count,
         )
-        bootstrap_id = result.get("agent_id")
-        if not isinstance(bootstrap_id, str) or not bootstrap_id:
-            return result
-        self._state_capabilities[bootstrap_id] = self.capability_registry.issue(
-            self._run_id(), bootstrap_id, "execution", unique_code
-        ).context
+        bootstrap_entries = result.get("bootstraps")
+        if not isinstance(bootstrap_entries, list):
+            bootstrap_entries = [result]
         await self._sync_nodes()
-        existing_task = self._tasks.get(bootstrap_id)
-        # Newly created Bootstraps are already queued in the authoritative
-        # Admission table.  Let Runtime's admission loop reserve resources
-        # and start them; launching here would race that loop and leave a
-        # queued admission attached to an already-running Agent.
-        should_resume = result.get("status") not in {
-            "queued",
-            "pending",
-            "starting",
-        }
-        if should_resume and (existing_task is None or existing_task.done()):
-            await self._launch_agent(
-                bootstrap_id,
-                resume=True,
-            )
-            await self._service().append_agent_event(
-                self._run_id(),
-                bootstrap_id,
-                "bootstrap_activated",
-                {"reason": reason, "idempotent": bool(result.get("idempotent"))},
-            )
+        for bootstrap in bootstrap_entries:
+            if not isinstance(bootstrap, Mapping):
+                continue
+            bootstrap_id = bootstrap.get("agent_id")
+            if not isinstance(bootstrap_id, str) or not bootstrap_id:
+                continue
+            self._state_capabilities[bootstrap_id] = self.capability_registry.issue(
+                self._run_id(), bootstrap_id, "execution", unique_code
+            ).context
+            existing_task = self._tasks.get(bootstrap_id)
+            # Newly created Bootstraps are already queued in the authoritative
+            # Admission table. Let Runtime's admission loop reserve resources
+            # and start them; launching here would race that loop.
+            should_resume = bootstrap.get("status") not in {
+                "queued",
+                "pending",
+                "starting",
+            }
+            if should_resume and (existing_task is None or existing_task.done()):
+                await self._launch_agent(bootstrap_id, resume=True)
+                await self._service().append_agent_event(
+                    self._run_id(),
+                    bootstrap_id,
+                    "bootstrap_activated",
+                    {
+                        "reason": reason,
+                        "idempotent": bool(bootstrap.get("idempotent")),
+                    },
+                )
         return result
+
+    async def scale_bootstraps(self) -> list[dict[str, Any]]:
+        """Add at most one Bootstrap lane per productive 15-minute window."""
+
+        if self.run_id is None:
+            return []
+        async with self._bootstrap_scale_lock:
+            overview = await self._service().get_overview(self._run_id())
+            results: list[dict[str, Any]] = []
+            for challenge_agent in overview.get("agents", []):
+                if challenge_agent.get("role") != "challenge":
+                    continue
+                unique_code = challenge_agent.get("unique_code")
+                parent_id = challenge_agent.get("agent_id")
+                if not isinstance(unique_code, str) or not isinstance(parent_id, str):
+                    continue
+                decision = await self._service().maybe_scale_bootstrap_capacity(
+                    self._run_id(), unique_code, parent_id=parent_id
+                )
+                target_count = decision.get("target_count")
+                if (
+                    not decision.get("should_ensure")
+                    or not isinstance(target_count, int)
+                    or target_count < 1
+                ):
+                    continue
+                ensured = await self._ensure_bootstrap_agent(
+                    unique_code,
+                    parent_id,
+                    reason=str(decision.get("reason") or "bootstrap_capacity_sync"),
+                    bootstrap_count=target_count,
+                )
+                results.append(
+                    {
+                        "unique_code": unique_code,
+                        "reason": decision.get("reason"),
+                        "target_count": target_count,
+                        "bootstraps": ensured.get("bootstraps") or [],
+                    }
+                )
+            return results
 
     @staticmethod
     async def _ignore_cancel(task: asyncio.Task[Any]) -> None:
@@ -2830,7 +3874,11 @@ class AgentSupervisor:
             pass
 
     def _challenge_prompt(
-        self, challenge: Mapping[str, Any], start_result: Mapping[str, Any]
+        self,
+        challenge: Mapping[str, Any],
+        start_result: Mapping[str, Any],
+        *,
+        hints: Any = (),
     ) -> str:
         start_data = start_result.get("data") if isinstance(start_result.get("data"), Mapping) else {}
         data = {
@@ -2840,10 +3888,39 @@ class AgentSupervisor:
             "difficulty": challenge.get("difficulty"),
             "level": challenge.get("level"),
             "container_addr": start_data.get("container_addr") or challenge.get("container_addr") or [],
+            "hints": list(hints or [])[:4],
         }
         return render_prompt(
             "challenge_agent.txt",
             challenge_data=json.dumps(data, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _initial_execution_task(challenge: Mapping[str, Any]) -> ExecutionTaskInput:
+        direction = str(challenge.get("direction") or "unknown")
+        objective = (
+            "Perform one bounded independent reconnaissance pass for this Challenge. "
+            f"Focus on the {direction} surface when known; identify one verified, "
+            "high-value fact that can shorten the path to the final result. "
+            "Start with a discriminating technical action, avoid repeating the "
+            "Bootstrap's full route, and submit an execution_checkpoint immediately "
+            "when a credential, vulnerability, access primitive, or concrete result "
+            "path is verified. Finish with a concise execution_report."
+        )
+        return ExecutionTaskInput(
+            objective=objective,
+            task_key="initial-recon",
+            hypothesis_key="initial-surface-recon",
+            branch_key="initial-recon:discovery",
+            kind="recon",
+            task_stage="discovery",
+            priority=90,
+            success_criteria=[
+                "Produce one verified high-value fact or a concrete negative result.",
+                "Use Evidence references for any checkpoint or final finding.",
+                "Do not repeat the Bootstrap route or perform unbounded reconnaissance.",
+            ],
+            timeout_seconds=900,
         )
 
     @staticmethod
@@ -2858,7 +3935,13 @@ class AgentSupervisor:
         )
 
     def _bootstrap_prompt(
-        self, challenge: Mapping[str, Any], start_result: Mapping[str, Any]
+        self,
+        challenge: Mapping[str, Any],
+        start_result: Mapping[str, Any],
+        *,
+        hints: Any = (),
+        restart_reason: str | None = None,
+        route_scope: str | None = None,
     ) -> str:
         start_data = (
             start_result.get("data")
@@ -2888,7 +3971,15 @@ class AgentSupervisor:
             "remaining_flags": max(0, flag_count - correct_flag_count),
             "direction": challenge.get("direction", "unknown"),
             "evidence_root": challenge.get("evidence_root"),
-            "hints": [],
+            "hints": list(hints or [])[:4],
+            "restart_reason": restart_reason,
+            "route_scope": route_scope,
+            "bootstrap_contract": {
+                "mission": BOOTSTRAP_MISSION,
+                "success_criteria": list(BOOTSTRAP_SUCCESS_CRITERIA),
+                "cycle_timeout_seconds": BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
+                "report_only_grace_seconds": BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
+            },
         }
         return render_prompt(
             "bootstrap_agent.txt",
@@ -2938,6 +4029,39 @@ class AgentSupervisor:
             code = result["error"].get("code")
             return code if isinstance(code, str) else None
         return None
+
+    @classmethod
+    def _is_transient_release_failure(
+        cls,
+        close_result: Mapping[str, Any],
+        sync_result: Mapping[str, Any],
+    ) -> bool:
+        """Bound retries to transport/service failures for an idempotent close."""
+
+        transient_codes = {
+            "transport_error",
+            "benchmark_error",
+            "catalog_sync_failed",
+        }
+        for result in (close_result, sync_result):
+            code = cls._error_code(result)
+            error = result.get("error") if isinstance(result, Mapping) else None
+            details = error.get("details") if isinstance(error, Mapping) else None
+            status_code = (
+                details.get("status_code")
+                if isinstance(details, Mapping)
+                else None
+            )
+            if code in transient_codes or status_code in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }:
+                return True
+        return False
 
     @staticmethod
     def _error_message(result: Any) -> str | None:

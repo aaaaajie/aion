@@ -13,11 +13,15 @@ from .models import (
     AgentRole,
     ChallengeDispatchArguments,
     ControllerWaitArguments,
+    BootstrapCheckpointArguments,
+    BootstrapCycleYieldArguments,
     EmptyArguments,
     EvidenceReadArguments,
+    ExecutionCheckpointArguments,
     ExecutionReport,
     LaunchChallengesArguments,
     ReportQueryArguments,
+    SecondaryBootstrapArguments,
     SimpleHintArguments,
     SubmitFlagArguments,
 )
@@ -38,6 +42,12 @@ _EXECUTION_KINDS = {
     "exploration",
 }
 _TASK_STAGES = {"discovery", "validation", "exploitation", "post_exploitation"}
+_TASK_TIMEOUT_FLOORS = {
+    "discovery": 900,
+    "validation": 1_800,
+    "exploitation": 1_800,
+    "post_exploitation": 1_800,
+}
 
 
 def _normalize_dispatch_tasks(
@@ -107,6 +117,10 @@ def _normalize_dispatch_tasks(
         ):
             timeout_seconds = 1_800
             changed_fields.append("timeout_seconds")
+        timeout_floor = _TASK_TIMEOUT_FLOORS[task_stage]
+        if timeout_seconds < timeout_floor:
+            timeout_seconds = timeout_floor
+            changed_fields.append("timeout_seconds")
 
         normalized: dict[str, Any] = {
             "objective": objective.strip()[:4_000],
@@ -164,10 +178,12 @@ class AgentControlTools:
         *,
         agent_id: str,
         unique_code: str | None = None,
+        bootstrap_mode: bool = False,
     ) -> None:
         self.supervisor = supervisor
         self.agent_id = agent_id
         self.unique_code = unique_code
+        self.bootstrap_mode = bootstrap_mode
         self.policy = AgentPolicy(self.ROLE)
 
     def tool_specs(self) -> list[ToolSpec]:
@@ -178,14 +194,42 @@ class AgentControlTools:
             "chief_request_hint": self.chief_request_hint,
             "challenge_observe": self.challenge_observe,
             "challenge_dispatch": self.challenge_dispatch,
+            "challenge_request_secondary_bootstrap": self.challenge_request_secondary_bootstrap,
             "challenge_wait": self.challenge_wait,
             "challenge_submit_flag": self.challenge_submit_flag,
             "challenge_close": self.challenge_close,
             "execution_report": self.execution_report,
+            "bootstrap_checkpoint": self.bootstrap_checkpoint,
+            "bootstrap_cycle_yield": self.bootstrap_cycle_yield,
+            "execution_checkpoint": self.execution_checkpoint,
             "evidence_read": self.evidence_read,
         }
         specs: list[ToolSpec] = []
         role_tools = self._TOOLS
+        if self.ROLE == "execution" and self.bootstrap_mode:
+            role_tools = role_tools + (
+                (
+                    "bootstrap_checkpoint",
+                    BootstrapCheckpointArguments,
+                    "bootstrap_checkpoint",
+                    "Persist one verified, non-terminal route handoff and continue solving toward the exact Flag.",
+                ),
+                (
+                    "bootstrap_cycle_yield",
+                    BootstrapCycleYieldArguments,
+                    "bootstrap_cycle_yield",
+                    "Yield this bounded Bootstrap cycle without ending the logical lane; the same Agent will resume with its state and context.",
+                ),
+            )
+        elif self.ROLE == "execution":
+            role_tools = role_tools + (
+                (
+                    "execution_checkpoint",
+                    ExecutionCheckpointArguments,
+                    "execution_checkpoint",
+                    "Persist one high-value, Evidence-backed non-terminal handoff for Bootstrap and the Challenge controller.",
+                ),
+            )
         if self.ROLE in {"challenge", "execution"}:
             role_tools = role_tools + (
                 (
@@ -366,6 +410,8 @@ class AgentControlTools:
                 next_steps=arguments.next_steps,
             ),
         )
+        if not result.get("ok"):
+            return ToolDispatchOutcome(result)
         if normalization_warnings and isinstance(result, Mapping):
             result = {
                 **dict(result),
@@ -378,6 +424,16 @@ class AgentControlTools:
         return ToolDispatchOutcome(
             result,
             yield_session=bool(result.get("ok")) and not all_supplied_tasks_dropped,
+        )
+
+    async def challenge_request_secondary_bootstrap(
+        self, arguments: SecondaryBootstrapArguments
+    ) -> dict[str, Any]:
+        return await self.supervisor.request_secondary_bootstrap(
+            self.agent_id,
+            arguments.route_a,
+            arguments.route_b,
+            arguments.reason,
         )
 
     async def challenge_wait(
@@ -409,7 +465,58 @@ class AgentControlTools:
     ) -> ToolDispatchOutcome:
         payload = AgentReportInput.model_validate(arguments, from_attributes=True)
         result = await self.supervisor.report_execution_payload(self.agent_id, payload)
+        data = result.get("data") if isinstance(result, Mapping) else None
+        return ToolDispatchOutcome(
+            result,
+            yield_session=bool(
+                result.get("ok")
+                and isinstance(data, Mapping)
+                and (data.get("terminal") or data.get("cycle_yield"))
+            ),
+        )
+
+    async def bootstrap_checkpoint(
+        self, arguments: BootstrapCheckpointArguments
+    ) -> ToolDispatchOutcome:
+        result = await self.supervisor.report_bootstrap_checkpoint(
+            self.agent_id,
+            route_key=arguments.route_key,
+            summary=arguments.summary,
+            next_step=arguments.next_step,
+            task_stage=arguments.task_stage,
+            evidence_refs=arguments.evidence_refs,
+        )
+        return ToolDispatchOutcome(result, yield_session=False)
+
+    async def bootstrap_cycle_yield(
+        self, arguments: BootstrapCycleYieldArguments
+    ) -> ToolDispatchOutcome:
+        result = await self.supervisor.yield_bootstrap_cycle(
+            self.agent_id,
+            summary=arguments.summary,
+        )
         return ToolDispatchOutcome(result, yield_session=bool(result.get("ok")))
+
+    async def execution_checkpoint(
+        self, arguments: ExecutionCheckpointArguments
+    ) -> ToolDispatchOutcome:
+        result = await self.supervisor.report_execution_checkpoint(
+            self.agent_id,
+            summary=arguments.summary,
+            next_step=arguments.next_step,
+            task_stage=arguments.task_stage,
+            urgency=arguments.urgency,
+            evidence_refs=arguments.evidence_refs,
+        )
+        data = result.get("data") if isinstance(result, Mapping) else None
+        return ToolDispatchOutcome(
+            result,
+            yield_session=bool(
+                result.get("ok")
+                and isinstance(data, Mapping)
+                and data.get("handoff_terminal")
+            ),
+        )
 
     async def evidence_read(self, arguments: EvidenceReadArguments) -> dict[str, Any]:
         return await self.supervisor.read_evidence(
@@ -464,6 +571,12 @@ class ChallengeAgentTools(AgentControlTools):
             ChallengeDispatchArguments,
             "challenge_dispatch",
             "Atomically record one decision and enqueue useful independent tasks. Arguments are top-level, never wrapped in arguments. Minimal JSON: {\"summary\":\"test the exposed HTTP surface\",\"tasks\":[{\"objective\":\"collect one HTTP baseline\"}]}.",
+        ),
+        (
+            "challenge_request_secondary_bootstrap",
+            SecondaryBootstrapArguments,
+            "challenge_request_secondary_bootstrap",
+            "Temporarily add one Bootstrap lane only when two durable, non-overlapping routes are explicitly justified.",
         ),
         (
             "challenge_wait",

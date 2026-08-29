@@ -22,7 +22,7 @@ from .models import (
     ResourceWorkRecord,
 )
 from .resources import challenge_work_active
-from .service import StateService, derive_phase
+from .service import ACTIVE_EXECUTION_STATUSES, StateService, derive_phase
 
 
 DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2}
@@ -452,9 +452,11 @@ class ResourceController:
                 admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
                 if admission is None:
                     return {"ok": False, "code": "admission_not_found"}
+                changed = admission.status != status
                 admission.status = status
                 admission.updated_at = self.clock()
-                event_sequence = await self.service._event(session, self.run_id, "agent_admission_finished", {"agent_id": agent_id, "status": status})
+                if changed:
+                    event_sequence = await self.service._event(session, self.run_id, "agent_admission_finished", {"agent_id": agent_id, "status": status})
                 result = {"ok": True, "status": status, "admission_id": admission.admission_id}
             if event_sequence is not None:
                 await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
@@ -510,7 +512,32 @@ class StagnationManager:
                             "elapsed_seconds": elapsed,
                             "action": "none",
                         }
-                    elif elapsed >= self.PAUSE_SECONDS and challenge.stagnation_level < 2:
+                    narrow_work_active = False
+                    if elapsed >= self.PAUSE_SECONDS and challenge.stagnation_level < 2:
+                        narrow_work_active = (
+                            await session.scalar(
+                                select(AgentRecord.agent_id)
+                                .where(
+                                    AgentRecord.run_id == run_id,
+                                    AgentRecord.unique_code == unique_code,
+                                    AgentRecord.role == "execution",
+                                    AgentRecord.kind != "bootstrap",
+                                    AgentRecord.task_stage.in_(
+                                        ["validation", "exploitation", "post_exploitation"]
+                                    ),
+                                    AgentRecord.status.in_(
+                                        sorted(ACTIVE_EXECUTION_STATUSES)
+                                    ),
+                                )
+                                .limit(1)
+                            )
+                            is not None
+                        )
+                    if (
+                        elapsed >= self.PAUSE_SECONDS
+                        and challenge.stagnation_level < 2
+                        and not narrow_work_active
+                    ):
                         self.service._freeze_exploration(challenge)
                         challenge.stagnation_level = 2
                         challenge.work_status = "paused"
@@ -626,19 +653,32 @@ class ChallengeScheduler:
             ]
             paused = [item for item in unfinished if item.work_status == "paused"]
             restart_required = not runnable and bool(paused)
-            challenges = paused if restart_required else runnable
             phase = derive_phase(run.started_at, run.deadline_at, self.clock())
+            remaining_seconds = max(
+                0,
+                int((aware(run.deadline_at) - aware(self.clock())).total_seconds()),
+            )
+            late_rotation = remaining_seconds <= 90 * 60
+            if late_rotation:
+                challenges = [*runnable, *paused]
+            else:
+                challenges = paused if restart_required else runnable
             if phase == "early":
                 selected = self._early(challenges, limit)
-            elif phase == "mid":
+            elif phase == "mid" and not late_rotation:
                 selected = sorted(challenges, key=self._mid_key, reverse=True)[:limit]
             else:
                 candidate_codes = set((await session.scalars(select(FindingRecord.unique_code).where(FindingRecord.run_id == run_id, FindingRecord.category == "flag", FindingRecord.verification_status.in_(["candidate", "verified"])))).all())
                 selected = sorted(challenges, key=lambda item: self._late_key(item, candidate_codes), reverse=True)[:limit]
-            result = [self.service._challenge_dict(item) for item in selected]
-            if restart_required:
-                for item in result:
-                    item["restart_required"] = True
+            result = [
+                self.service._challenge_dict(item, run=run, now=self.clock())
+                for item in selected
+            ]
+            for item in result:
+                item["restart_required"] = bool(
+                    item["work_status"] == "paused"
+                    and (restart_required or late_rotation)
+                )
             return result
 
     async def choose_one(self, run_id: str) -> dict[str, Any] | None:
@@ -646,18 +686,15 @@ class ChallengeScheduler:
         return values[0] if values else None
 
     def _early(self, values: list[ChallengeRecord], limit: int) -> list[ChallengeRecord]:
-        ordered = sorted(values, key=lambda item: (DIFFICULTY_RANK.get(item.difficulty, 99), item.unique_code))
-        result: list[ChallengeRecord] = []
-        for item in ordered:
-            if DIFFICULTY_RANK.get(item.difficulty, 99) == 0 and len([x for x in result if DIFFICULTY_RANK.get(x.difficulty, 99) == 0]) < 2:
-                result.append(item)
-        high_value = sorted((item for item in values if item not in result and DIFFICULTY_RANK.get(item.difficulty, 99) >= 1), key=lambda item: (-item.total_score, -DIFFICULTY_RANK.get(item.difficulty, 99), item.unique_code))
-        if high_value and len(result) < limit:
-            result.append(high_value[0])
-        for item in ordered:
-            if item not in result and len(result) < limit:
-                result.append(item)
-        return result[:limit]
+        ordered = sorted(
+            values,
+            key=lambda item: (
+                DIFFICULTY_RANK.get(item.difficulty, 99),
+                -item.total_score,
+                item.unique_code,
+            ),
+        )
+        return ordered[:limit]
 
     @staticmethod
     def _mid_key(item: ChallengeRecord) -> tuple[Any, ...]:

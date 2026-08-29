@@ -21,13 +21,16 @@ from urllib.request import urlopen
 
 
 SERVICE_NAME = "aion-online.service"
+MONITOR_SERVICE_NAME = "aion-monitor.service"
 APP_ROOT = Path("/opt/aion")
 RUN_ROOT = Path("/var/lib/aion/runs")
 CURRENT_RUN_FILE = Path("/var/lib/aion/current-run-id")
 RUNTIME_DIRECTORY = Path("/run/aion")
 TOKEN_FILE = RUNTIME_DIRECTORY / "benchmark-token"
 LAUNCH_FILE = RUNTIME_DIRECTORY / "launch.json"
-MONITOR_URL = "https://vps.example.invalid:8443/"
+MONITOR_URL = os.environ.get("AION_MONITOR_URL", "http://127.0.0.1:8765/")
+MONITOR_HOST = os.environ.get("AION_MONITOR_HOST", "127.0.0.1")
+MONITOR_PORT = int(os.environ.get("AION_MONITOR_PORT", "8765"))
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -180,6 +183,8 @@ def _start(mode: str, requested_run_id: str | None) -> None:
             json.dumps({"mode": mode, "run_id": run_id}, separators=(",", ":")),
         )
         _run(["systemctl", "start", SERVICE_NAME])
+        _wait_for_run_ready(run_id)
+        _restart_monitor()
     finally:
         token = ""
         TOKEN_FILE.unlink(missing_ok=True)
@@ -202,6 +207,56 @@ def _wait_until_inactive(timeout_seconds: float = 50.0) -> None:
     raise ControlError("AION did not stop before the timeout")
 
 
+def _wait_for_run_ready(run_id: str, timeout_seconds: float = 90.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    database = RUN_ROOT / run_id / "state.sqlite3"
+    while time.monotonic() < deadline:
+        if not _is_active():
+            state = _run(
+                [
+                    "systemctl",
+                    "show",
+                    SERVICE_NAME,
+                    "--no-pager",
+                    "--property=ActiveState,ExecMainStatus",
+                ],
+                check=False,
+                capture_output=True,
+            ).stdout
+            properties = dict(
+                line.split("=", 1) for line in state.splitlines() if "=" in line
+            )
+            if properties.get("ActiveState") == "failed":
+                raise ControlError(
+                    f"AION failed before Run became ready: {run_id}"
+                )
+        try:
+            marker = CURRENT_RUN_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            marker = ""
+        if marker == run_id and database.is_file():
+            return
+        time.sleep(0.25)
+    raise ControlError(f"AION Run did not become ready: {run_id}")
+
+
+def _wait_for_monitor(timeout_seconds: float = 20.0, mode: str | None = None) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        snapshot = _monitor_snapshot()
+        if snapshot is not None and (mode is None or snapshot.get("mode") == mode):
+            return
+        time.sleep(0.25)
+    if mode is None:
+        raise ControlError("AION Web Monitor did not become reachable")
+    raise ControlError(f"AION Web Monitor did not reach mode={mode}")
+
+
+def _restart_monitor(mode: str | None = None) -> None:
+    _run(["systemctl", "restart", MONITOR_SERVICE_NAME])
+    _wait_for_monitor(mode=mode)
+
+
 def _pause() -> None:
     if not _is_active():
         raise ControlError("AION is not active")
@@ -215,6 +270,10 @@ def _pause() -> None:
         ]
     )
     _wait_until_inactive()
+    if not _monitor_reachable():
+        _restart_monitor(mode="frozen")
+    else:
+        _wait_for_monitor(mode="frozen")
     print("AION paused with persistent run state preserved")
 
 
@@ -222,6 +281,10 @@ def _stop() -> None:
     _run(["systemctl", "stop", SERVICE_NAME])
     TOKEN_FILE.unlink(missing_ok=True)
     LAUNCH_FILE.unlink(missing_ok=True)
+    if not _monitor_reachable():
+        _restart_monitor(mode="frozen")
+    else:
+        _wait_for_monitor(mode="frozen")
     print("AION stopped")
 
 
@@ -232,7 +295,7 @@ def _release_id() -> str | None:
 
 def _monitor_reachable() -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", 8765), timeout=0.5):
+        with socket.create_connection((MONITOR_HOST, MONITOR_PORT), timeout=0.5):
             return True
     except OSError:
         return False
@@ -241,7 +304,7 @@ def _monitor_reachable() -> bool:
 def _monitor_snapshot() -> dict[str, Any] | None:
     try:
         with urlopen(
-            "http://127.0.0.1:8765/api/health", timeout=0.5
+            f"http://{MONITOR_HOST}:{MONITOR_PORT}/api/health", timeout=0.5
         ) as response:
             value = json.loads(response.read(1_000_000))
     except (OSError, ValueError, json.JSONDecodeError):
@@ -274,6 +337,22 @@ def _status(as_json: bool) -> None:
         for line in properties.splitlines()
         if "=" in line
     )
+    monitor_properties = _run(
+        [
+            "systemctl",
+            "show",
+            MONITOR_SERVICE_NAME,
+            "--no-pager",
+            "--property=ActiveState,SubState,MainPID,ExecMainStatus",
+        ],
+        check=False,
+        capture_output=True,
+    ).stdout
+    monitor_systemd = dict(
+        line.split("=", 1)
+        for line in monitor_properties.splitlines()
+        if "=" in line
+    )
     monitor_snapshot = _monitor_snapshot()
     monitor_state = monitor_snapshot
     active = systemd.get("ActiveState") == "active"
@@ -290,6 +369,7 @@ def _status(as_json: bool) -> None:
     data = {
         "release_id": _release_id(),
         "service": systemd,
+        "monitor_service": monitor_systemd,
         "run": record,
         "monitor_backend_reachable": _monitor_reachable(),
         "runtime_state": runtime_state,
@@ -305,6 +385,12 @@ def _status(as_json: bool) -> None:
         "service: "
         f"{systemd.get('ActiveState', 'unknown')}/{systemd.get('SubState', 'unknown')} "
         f"pid={systemd.get('MainPID', '0')}"
+    )
+    print(
+        "monitor_service: "
+        f"{monitor_systemd.get('ActiveState', 'unknown')}/"
+        f"{monitor_systemd.get('SubState', 'unknown')} "
+        f"pid={monitor_systemd.get('MainPID', '0')}"
     )
     print(f"runtime_state: {runtime_state}")
     if record:

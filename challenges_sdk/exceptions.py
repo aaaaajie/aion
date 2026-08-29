@@ -43,8 +43,21 @@ class ChallengesTransportError(ChallengesSDKError):
 class ChallengesResponseError(ChallengesSDKError):
     """A successful response did not match the documented response model."""
 
-    def __init__(self, *, operation: str, errors: Any) -> None:
+    def __init__(
+        self,
+        *,
+        operation: str,
+        errors: Any,
+        status_code: int | None = None,
+        response_size: int | None = None,
+        recovery_attempted: bool = False,
+        requires_reconciliation: bool = False,
+    ) -> None:
         self.operation = operation
         self.errors = errors
+        self.status_code = status_code
+        self.response_size = response_size
+        self.recovery_attempted = recovery_attempted
+        self.requires_reconciliation = requires_reconciliation
         # Keep response payloads out of the exception string and logs.
         super().__init__(f"invalid response received for {operation}")

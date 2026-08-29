@@ -27,6 +27,12 @@ def _settings() -> AgentSettings:
     )
 
 
+def test_runtime_default_state_root_tracks_custom_workspace(tmp_path: Path) -> None:
+    runtime = AgentRuntime(_settings(), project_root=tmp_path)
+
+    assert runtime.run_root == (tmp_path / ".aion" / "runs").resolve()
+
+
 class _Network:
     def __init__(
         self,

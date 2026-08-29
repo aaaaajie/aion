@@ -332,6 +332,88 @@ async def test_request_persists_full_body_and_runs_analysis_on_demand(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_disk_pressure_reclaims_old_terminal_bodies_but_keeps_metadata(
+    tmp_path: Path,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=f"body:{request.url.path}")
+
+    run_root = tmp_path / "runs"
+    service = StateService(
+        run_root / "run-1" / "state.sqlite3", run_root=run_root
+    )
+    await service.create_run("run-1")
+    agent = await service.register_agent(
+        "run-1", role="chief", initial_prompt="reclaim test"
+    )
+    policy = WorkspacePolicy(tmp_path)
+    manager = HttpProbeManager(
+        policy,
+        service,
+        "run-1",
+        engine=HttpInteractionEngine(
+            policy, transport=httpx.MockTransport(handler)
+        ),
+        disk_reserve_bytes=10**30,
+        disk_reserve_percent=0,
+    )
+    await manager.initialize()
+    install_resource_runtime(manager, service, "run-1", root=tmp_path)
+
+    first = await manager.start_request(
+        agent["agent_id"],
+        request=HttpRequestSpec(
+            request_intent="first", url="https://target.test/first"
+        ),
+        wait_seconds=None,
+    )
+    first_response = first["results"][0]
+    first_body = (
+        manager._response_dir(agent["agent_id"], first["interaction_id"])
+        / first_response["body_file"]
+    )
+    assert first_body.is_file()
+
+    second = await manager.start_request(
+        agent["agent_id"],
+        request=HttpRequestSpec(
+            request_intent="second", url="https://target.test/second"
+        ),
+        wait_seconds=None,
+    )
+    assert not first_body.exists()
+    assert second["request_catalog"][0]["response_available"] is True
+
+    first_output = await manager.output(
+        agent["agent_id"], interaction_id=first["interaction_id"]
+    )
+    assert first_output["results"][0]["body_sha256"] == first_response["body_sha256"]
+    assert first_output["request_catalog"][0]["response_available"] is False
+    first_row = await service.get_http_interaction(
+        "run-1", agent["agent_id"], first["interaction_id"]
+    )
+    assert first_row["output_cleaned_at"] is None
+
+    with pytest.raises(SystemToolError) as caught:
+        await manager.response(
+            agent["agent_id"],
+            interaction_id=first["interaction_id"],
+            request_id=first_response["request_id"],
+        )
+    assert caught.value.code == "http_response_body_reclaimed"
+
+    with pytest.raises(SystemToolError) as caught:
+        await manager.analyze(
+            agent["agent_id"],
+            interaction_id=first["interaction_id"],
+            wait_seconds=None,
+        )
+    assert caught.value.code == "http_response_body_reclaimed"
+    await manager.finish_run()
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_template_matrix_file_range_and_typed_json(tmp_path: Path) -> None:
     (tmp_path / "paths.txt").write_text("a\nb\n", encoding="utf-8")
     seen: list[tuple[str, object]] = []
@@ -770,6 +852,8 @@ def test_http_tool_contract_and_plaintext_audit(tmp_path: Path) -> None:
         if item["function"]["name"] == "system_http_probe"
     )
     assert "variables/combine" in probe_definition["description"]
+    assert "top-level cases value is an array" in probe_definition["description"]
+    assert "JSON encoded as a string" in probe_definition["description"]
     assert "ordered multi-step protocols" in probe_definition["description"]
     assert "variables" not in probe_definition["parameters"]["properties"]
     assert "session_id" not in probe_definition["parameters"]["properties"]
@@ -840,6 +924,41 @@ def test_zip_expansion_and_unresolved_variables_are_validated(tmp_path: Path) ->
             [unresolved], id_factory=lambda: "fixed", default_group_id="group"
         )
     assert caught.value.code == "unknown_template_variable"
+
+
+def test_probe_path_encoding_preserves_separators_and_rejects_bad_ports(
+    tmp_path: Path,
+) -> None:
+    engine = HttpInteractionEngine(WorkspacePolicy(tmp_path))
+    case = HttpProbeCase(
+        request=HttpRequestSpec(
+            request_intent="path",
+            url="http://target.test{{path}}",
+        ),
+        variables={
+            "path": HttpVariableSource(
+                values=["/druid/index.html"], encoding="path"
+            )
+        },
+    )
+    expanded = engine.expand_cases(
+        [case], id_factory=lambda: "fixed", default_group_id="group"
+    )
+    assert expanded[0].spec.url == "http://target.test/druid/index.html"
+
+    invalid = HttpProbeCase(
+        request=HttpRequestSpec(
+            request_intent="bad-port",
+            url="http://target.test:{{port}}/",
+        ),
+        variables={"port": HttpVariableSource(values=["not-a-port"])},
+    )
+    with pytest.raises(SystemToolError) as caught:
+        engine.expand_cases(
+            [invalid], id_factory=lambda: "fixed", default_group_id="group"
+        )
+    assert caught.value.code == "invalid_expanded_url"
+    assert caught.value.detail == {"case_index": 0, "request_index": 1}
 
 
 @pytest.mark.asyncio

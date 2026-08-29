@@ -31,10 +31,22 @@ class FileSnapshot:
 
 
 class FileSystemService:
-    """Perform filesystem operations while keeping a per-session read state."""
+    """Perform workspace operations while hiding Runtime control-plane paths."""
 
-    def __init__(self, policy: WorkspacePolicy) -> None:
+    def __init__(
+        self,
+        policy: WorkspacePolicy,
+        *,
+        blocked_roots: tuple[Path, ...] = (),
+        allowed_roots: tuple[Path, ...] = (),
+    ) -> None:
         self.policy = policy
+        self._blocked_roots = tuple(
+            Path(path).expanduser().resolve(strict=False) for path in blocked_roots
+        )
+        self._allowed_roots = tuple(
+            Path(path).expanduser().resolve(strict=False) for path in allowed_roots
+        )
         self._read_state: dict[Path, FileSnapshot] = {}
 
     async def read_file(
@@ -68,8 +80,10 @@ class FileSystemService:
     async def evidence_snapshot(self, file_path: str) -> str:
         """Read the exact final UTF-8 file while the caller still owns its lock."""
 
+        path = self.policy.resolve(file_path, must_exist=True)
+        self._ensure_visible(path)
         return await asyncio.to_thread(
-            self.policy.resolve(file_path).read_text, encoding="utf-8"
+            path.read_text, encoding="utf-8"
         )
 
     async def create_directory(self, path: str, parents: bool = True) -> dict[str, Any]:
@@ -123,6 +137,7 @@ class FileSystemService:
         limit_chars: int | None,
     ) -> dict[str, Any]:
         path = self.policy.resolve(file_path, must_exist=True)
+        self._ensure_visible(path)
         if not path.is_file():
             raise self._error("validation", "not_a_file", "Path is not a regular file")
 
@@ -227,6 +242,7 @@ class FileSystemService:
 
     def _write_file(self, file_path: str, content: str) -> dict[str, Any]:
         path = self.policy.resolve(file_path)
+        self._ensure_visible(path)
         existed = path.exists()
         previous_content: str | None = None
 
@@ -264,6 +280,7 @@ class FileSystemService:
             raise self._error("validation", "no_changes", "old_string and new_string are identical")
 
         path = self.policy.resolve(file_path)
+        self._ensure_visible(path)
         existed = path.exists()
         if not existed:
             if old_string != "":
@@ -332,6 +349,7 @@ class FileSystemService:
 
     def _create_directory(self, path_value: str, parents: bool) -> dict[str, Any]:
         path = self.policy.resolve(path_value)
+        self._ensure_visible(path)
         if path.exists():
             if path.is_dir():
                 return {"path": self.policy.relative(path), "created": False}
@@ -350,12 +368,14 @@ class FileSystemService:
 
     def _delete_path(self, path_value: str, recursive: bool) -> dict[str, Any]:
         lexical = self._lexical_path(path_value)
+        self._ensure_visible(lexical)
         is_symlink = lexical.is_symlink()
         path = self.policy.resolve(
             path_value,
             must_exist=not is_symlink,
             allow_root=False,
         )
+        self._ensure_visible(path)
         try:
             if is_symlink:
                 lexical.unlink()
@@ -388,6 +408,7 @@ class FileSystemService:
         max_entries: int,
     ) -> dict[str, Any]:
         path = self.policy.resolve(path_value, must_exist=True)
+        self._ensure_visible(path)
         try:
             exists = path.exists()
             is_directory = path.is_dir() if exists else False
@@ -425,10 +446,14 @@ class FileSystemService:
                 if child.name.endswith(".system-tools.tmp"):
                     continue
                 try:
+                    if self._is_blocked(child):
+                        continue
                     if child.is_symlink():
                         entry_type = "symlink"
                         size = None
-                        self.policy.resolve(child, must_exist=True)
+                        resolved = self.policy.resolve(child, must_exist=True)
+                        if self._is_blocked(resolved):
+                            continue
                     elif child.is_dir():
                         entry_type = "directory"
                         size = None
@@ -471,6 +496,7 @@ class FileSystemService:
     def _glob(self, pattern: str, path_value: str, max_results: int) -> dict[str, Any]:
         self.policy.validate_pattern(pattern)
         base = self.policy.resolve(path_value, must_exist=True)
+        self._ensure_visible(base)
         if not base.is_dir():
             raise self._error("validation", "not_a_directory", "Search base is not a directory")
 
@@ -484,6 +510,8 @@ class FileSystemService:
             try:
                 resolved = self.policy.resolve(candidate, must_exist=True)
             except SystemToolError:
+                continue
+            if self._is_blocked(candidate) or self._is_blocked(resolved):
                 continue
             relative = self.policy.relative_lexical(candidate)
             if relative not in matches:
@@ -512,6 +540,7 @@ class FileSystemService:
             raise self._error("validation", "invalid_regex", "Invalid regular expression") from exc
 
         base = self.policy.resolve(path_value, must_exist=True)
+        self._ensure_visible(base)
         if base.is_file():
             candidates = [base]
         elif base.is_dir():
@@ -574,11 +603,35 @@ class FileSystemService:
             if not candidate.is_file() or candidate.is_symlink():
                 continue
             try:
-                self.policy.resolve(candidate, must_exist=True)
+                resolved = self.policy.resolve(candidate, must_exist=True)
             except SystemToolError:
+                continue
+            if self._is_blocked(candidate) or self._is_blocked(resolved):
                 continue
             candidates.append(candidate)
         return sorted(candidates)
+
+    def _ensure_visible(self, path: Path) -> None:
+        if self._is_blocked(path):
+            raise self._error(
+                "permission",
+                "project_path_protected",
+                "Runtime control-plane paths are not available to Agents",
+            )
+
+    def _is_blocked(self, path: Path) -> bool:
+        candidate = Path(os.path.abspath(os.path.normpath(path)))
+        if any(self._is_within(candidate, allowed) for allowed in self._allowed_roots):
+            return False
+        return any(self._is_within(candidate, blocked) for blocked in self._blocked_roots)
+
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
 
     def _read_current_text(self, path: Path) -> tuple[str, FileSnapshot]:
         try:

@@ -6,8 +6,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent.config import AgentSettings
 from agent.tooling import AccessClaim, ToolSpec
 from challenges_sdk import ChallengesClient
+from .recovery import BenchmarkLLMRecovery
 
 
 class _Arguments(BaseModel):
@@ -36,35 +38,88 @@ class _SubmitFlagArguments(_UniqueCodeArguments):
 class BenchmarkTools:
     """Expose benchmark operations through the shared ToolExecutor."""
 
-    def __init__(self, client: ChallengesClient) -> None:
+    def __init__(
+        self,
+        client: ChallengesClient,
+        *,
+        response_recoverer: BenchmarkLLMRecovery | None = None,
+    ) -> None:
         self._client = client
+        self._response_recoverer = response_recoverer
 
     @classmethod
-    def from_env(cls, **client_kwargs: Any) -> "BenchmarkTools":
-        return cls(ChallengesClient.from_env(**client_kwargs))
+    def from_env(
+        cls,
+        *,
+        agent_settings: AgentSettings | None = None,
+        **client_kwargs: Any,
+    ) -> "BenchmarkTools":
+        recoverer = (
+            BenchmarkLLMRecovery(agent_settings)
+            if agent_settings is not None
+            else None
+        )
+        client = ChallengesClient.from_env(
+            response_recoverer=recoverer,
+            contract_recoverer=recoverer,
+            **client_kwargs,
+        )
+        return cls(client, response_recoverer=recoverer)
+
+    async def _result(self, value: Any) -> Any:
+        events = self._client.take_call_events()
+        data = _jsonable(value)
+        if not events:
+            return data
+        return {"ok": True, "data": data, "warnings": events}
+
+    async def _invoke(self, operation: Any) -> Any:
+        """Preserve safe SDK event metadata when the SDK raises."""
+
+        try:
+            return await operation
+        except Exception as exc:
+            events = self._client.take_call_events()
+            if events:
+                setattr(exc, "_benchmark_events", events)
+            raise
 
     def tool_specs(self) -> list[ToolSpec]:
         async def list_challenges(arguments: BaseModel) -> Any:
             assert isinstance(arguments, _NoArguments)
-            return _jsonable(await self._client.list_challenges())
+            return await self._result(
+                await self._invoke(self._client.list_challenges())
+            )
 
         async def start_challenge(arguments: BaseModel) -> Any:
             assert isinstance(arguments, _UniqueCodeArguments)
-            return _jsonable(await self._client.start_challenge(arguments.unique_code))
+            return await self._result(
+                await self._invoke(
+                    self._client.start_challenge(arguments.unique_code)
+                )
+            )
 
         async def get_hint(arguments: BaseModel) -> Any:
             assert isinstance(arguments, _UniqueCodeArguments)
-            return _jsonable(await self._client.get_hint(arguments.unique_code))
+            return await self._result(
+                await self._invoke(self._client.get_hint(arguments.unique_code))
+            )
 
         async def submit_flag(arguments: BaseModel) -> Any:
             assert isinstance(arguments, _SubmitFlagArguments)
-            return _jsonable(
-                await self._client.submit_flag(arguments.unique_code, arguments.flag)
+            return await self._result(
+                await self._invoke(
+                    self._client.submit_flag(arguments.unique_code, arguments.flag)
+                )
             )
 
         async def close_challenge(arguments: BaseModel) -> Any:
             assert isinstance(arguments, _UniqueCodeArguments)
-            return _jsonable(await self._client.close_challenge(arguments.unique_code))
+            return await self._result(
+                await self._invoke(
+                    self._client.close_challenge(arguments.unique_code)
+                )
+            )
 
         return [
             ToolSpec("benchmark_list_challenges", "List benchmark challenges and current progress. This operation is read-only.", _NoArguments, list_challenges, lambda _arguments: (AccessClaim("read", "benchmark"),)),
@@ -76,6 +131,8 @@ class BenchmarkTools:
 
     async def close(self) -> None:
         await self._client.close()
+        if self._response_recoverer is not None:
+            await self._response_recoverer.close()
 
 
 def _jsonable(value: Any) -> Any:

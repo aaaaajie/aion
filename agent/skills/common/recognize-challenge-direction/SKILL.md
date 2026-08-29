@@ -2,13 +2,9 @@
 name: recognize-challenge-direction
 description: >-
   Challenge-controller bootstrap only: classify a whole CTF challenge as web,
-  pentest, binary, exploit, cloud, evasion, or unknown from bounded metadata
-  and, only when needed, one exact-target probe. It is not an Execution
-  exploitation playbook.
-when_to_use: >-
-  Use by the Challenge controller before its first technical plan or for one bounded
-  whole-challenge direction probe; do not use merely to classify an Execution subtask.
-auto_activate_for: [challenge]
+  pentest, binary, exploit, cloud, evasion, or unknown, then refine it into SRC,
+  internal-network, AI, reverse, or exploitation focus from bounded metadata and,
+  only when needed, one exact-target probe. It is not an Execution playbook.
 metadata:
   version: 2
   directions: [web, pentest, binary, exploit, cloud, evasion]
@@ -26,12 +22,15 @@ metadata:
 
 # Challenge direction recognition
 
-Use this Skill before the first technical plan. Return two independent values:
+Use this Skill before the first technical plan. Return two independent values and
+one optional refinement:
 
 - `direction`: the primary solving logic: `web`, `pentest`, `binary`, `exploit`,
   `cloud`, `evasion`, or `unknown`.
 - `access_surface`: how the target is reached: `http`, `https`, `raw_tcp`,
   `evm_rpc`, `artifact`, or `unknown`.
+- `execution_focus`: one of `src`, `web-vuln`, `internal-network`, `ai`,
+  `reverse`, `exploit`, or `unknown`. This is a routing hint, not proof.
 
 Do not confuse transport with solving direction. HTTP can carry an AI application
 or an EVM RPC endpoint. An `nc` launcher can start a blockchain instance. Port
@@ -47,14 +46,18 @@ numbers are weak evidence and never decide the direction alone.
    and the lead over the next candidate is at least `0.20`.
 4. Record the selected direction in the first `challenge_dispatch`. Keep it
    `unknown` when evidence does not meet the rule.
-5. Load exactly one matching reference: `references/web.md`,
+5. Set `execution_focus` only when at least one independent signal supports it:
+   source code or repository evidence implies `src`; reachable internal services
+   imply `internal-network`; model/tool/RAG behavior implies `ai`; an ELF or
+   protocol artifact implies `reverse` or `exploit`.
+6. Load exactly one matching reference: `references/web.md`,
    `references/pentest.md`, `references/binary.md`, `references/exploit.md`,
    `references/cloud.md`, or `references/evasion.md`.
-6. When direction is `unknown`, create at most one bounded `recon` task with
+7. When direction is `unknown`, create at most one bounded `recon` task with
    `hypothesis_key=challenge-direction` and `task_key=direction-probe-1`. Its
    only question must distinguish the leading candidates. Do not turn it into
    port scanning, path scanning, vulnerability testing, or flag hunting.
-7. After the report, update the direction in the next `challenge_dispatch` only
+8. After the report, update the direction in the next `challenge_dispatch` only
    when the report or an observation supplies new evidence.
 
 ## Execution probe
