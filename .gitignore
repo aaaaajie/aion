@@ -21,6 +21,7 @@ claude-code-source-code/
 百度agent+解题过程/
 tsecbench_session_organizer.py
 scripts/recheck_liuyan.py
+scripts/build_platform.py
 deploy/README.md
 agent/skills/execution/* copy/
 
