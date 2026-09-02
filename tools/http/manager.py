@@ -3070,11 +3070,12 @@ class HttpProbeManager:
                 output.flush()
                 os.fsync(output.fileno())
             temporary.replace(path)
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            if os.name != "nt":
+                directory = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

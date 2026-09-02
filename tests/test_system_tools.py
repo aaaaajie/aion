@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import pwd
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows has no POSIX pwd module.
+    pwd = None  # type: ignore[assignment]
 
 from agent.state import StateService
 from agent.state.clock import utc_now
@@ -173,11 +177,17 @@ def make_tools(tmp_path: Path):
     return factory
 
 
+requires_posix_sandbox = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Shell execution is provided by the Linux/macOS runtime sandbox",
+)
+
+
 @pytest.mark.asyncio
 async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> None:
     async with make_tools() as tools:
         target = tools._filesystem.policy.root / "notes.txt"
-        target.write_text("alpha\nbeta\nbeta\n", encoding="utf-8")
+        target.write_bytes(b"alpha\nbeta\nbeta\n")
         read_result = await tools.read_file("notes.txt")
         assert read_result["ok"] is True
         assert read_result["data"]["content"] == "alpha\nbeta\nbeta\n"
@@ -381,6 +391,7 @@ async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(make
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools) -> None:
     async with make_tools() as tools:
         command = await tools.shell("printf sandbox-ok; pwd")
@@ -420,6 +431,7 @@ async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools)
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, tmp_path: Path) -> None:
     skill_root = tmp_path / "skills"
     scripts = skill_root / "execution" / "fixture" / "scripts"
@@ -469,6 +481,7 @@ async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, t
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_background_tasks_can_be_read_and_stopped(make_tools) -> None:
     async with make_tools() as tools:
         background = await tools.shell(
@@ -494,6 +507,7 @@ async def test_background_tasks_can_be_read_and_stopped(make_tools) -> None:
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_shell_client_close_keeps_task_for_same_agent(make_tools) -> None:
     harness = make_tools()
     async with harness as tools:
@@ -518,6 +532,7 @@ async def test_shell_client_close_keeps_task_for_same_agent(make_tools) -> None:
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_agent_ownership_and_persistent_temp_are_isolated(make_tools) -> None:
     harness = make_tools()
     async with harness as first:
@@ -599,6 +614,7 @@ async def test_macos_shell_cannot_connect_to_host_container_socket(make_tools) -
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_completed_output_expires_after_fixed_ttl(make_tools) -> None:
     clock = _MutableClock()
     harness = make_tools(
@@ -623,6 +639,7 @@ async def test_completed_output_expires_after_fixed_ttl(make_tools) -> None:
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_pause_and_resume_marks_running_task_interrupted(make_tools) -> None:
     harness = make_tools(reap_interval_seconds=0)
     tools = await harness.__aenter__()
@@ -663,6 +680,7 @@ async def test_pause_and_resume_marks_running_task_interrupted(make_tools) -> No
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_agent_and_run_terminal_cleanup_remove_runtime_files(make_tools) -> None:
     harness = make_tools(reap_interval_seconds=0)
     async with harness as tools:
@@ -683,6 +701,7 @@ async def test_agent_and_run_terminal_cleanup_remove_runtime_files(make_tools) -
 
 
 @pytest.mark.asyncio
+@requires_posix_sandbox
 async def test_shell_agent_and_run_cleanup_are_concurrently_idempotent(make_tools) -> None:
     harness = make_tools(reap_interval_seconds=0)
     tools = await harness.__aenter__()
@@ -713,7 +732,10 @@ async def test_sandbox_unavailable_is_reported_without_running_shell(make_tools)
 
     assert result["ok"] is False
     assert result["error"]["stage"] == "execution"
-    assert result["error"]["code"] == "sandbox_unavailable"
+    assert result["error"]["code"] in {
+        "sandbox_unavailable",
+        "sandbox_unsupported_platform",
+    }
     assert result["error"]["retry"]["allowed"] is False
 
 
@@ -831,9 +853,9 @@ def test_sandbox_profile_hides_runtime_control_plane_but_reopens_agent_paths(
     )
 
     profile = backend._macos_profile(write_paths=(shared,))
-    hidden_aion = '(deny file-read* (subpath "' + str(hidden[0]) + '"))'
-    hidden_tools = '(deny file-read* (subpath "' + str(hidden[1]) + '"))'
-    shared_allow = '(allow file-read* (subpath "' + str(shared) + '"))'
+    hidden_aion = f"(deny file-read* (subpath {json.dumps(str(hidden[0]))}))"
+    hidden_tools = f"(deny file-read* (subpath {json.dumps(str(hidden[1]))}))"
+    shared_allow = f"(allow file-read* (subpath {json.dumps(str(shared))}))"
     assert hidden_aion in profile
     assert hidden_tools in profile
     assert "(deny network-outbound)" in profile
@@ -844,6 +866,8 @@ def test_sandbox_profile_hides_runtime_control_plane_but_reopens_agent_paths(
 def test_linux_container_sandbox_drops_privileges_without_namespaces(
     tmp_path: Path,
 ) -> None:
+    if pwd is None or not hasattr(os, "getuid"):
+        pytest.skip("POSIX account lookup is required")
     executable = tmp_path / "setpriv"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | 0o111)

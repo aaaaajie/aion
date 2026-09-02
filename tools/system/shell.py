@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import platform
-import pwd
 import re
 import shutil
 import signal
@@ -17,6 +16,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows has no POSIX pwd module.
+    pwd = None  # type: ignore[assignment]
 
 import psutil
 
@@ -376,7 +380,9 @@ class SandboxBackend:
             (str(self.root), str(self.root))
         ]:
             parent = Path(destination).parent
-            while parent != Path("/"):
+            # Stop at either POSIX ``/`` or a Windows drive root when tests
+            # exercise the Linux command builder on a Windows host.
+            while parent != parent.parent:
                 destination_parents.add(parent)
                 parent = parent.parent
         for parent in sorted(destination_parents, key=lambda item: len(item.parts)):
@@ -663,6 +669,22 @@ class ShellTaskManager:
         shared_root: Path | None = None,
     ) -> dict[str, Any]:
         self._require_open()
+        if len(command) > 100_000:
+            raise self._error(
+                "validation", "command_too_long", "Shell command is too long"
+            )
+        if _OFFLINE_INSTALL_PATTERN.search(command):
+            raise self._error(
+                "validation",
+                "offline_install_blocked",
+                "Package-manager and network installer commands are disabled in the offline runtime",
+            )
+        if _CONTAINER_CONTROL_PATTERN.search(command) or _CONTAINER_SOCKET_PATTERN.search(command):
+            raise self._error(
+                "permission",
+                "container_control_blocked",
+                "Host container-engine control is outside the Agent target scope",
+            )
         if self.sandbox.platform not in {"Darwin", "Linux"}:
             raise self._error(
                 "execution",
@@ -683,22 +705,6 @@ class ShellTaskManager:
         if not working_directory.is_dir():
             raise self._error(
                 "validation", "not_a_directory", "Shell cwd is not a directory"
-            )
-        if len(command) > 100_000:
-            raise self._error(
-                "validation", "command_too_long", "Shell command is too long"
-            )
-        if _OFFLINE_INSTALL_PATTERN.search(command):
-            raise self._error(
-                "validation",
-                "offline_install_blocked",
-                "Package-manager and network installer commands are disabled in the offline runtime",
-            )
-        if _CONTAINER_CONTROL_PATTERN.search(command) or _CONTAINER_SOCKET_PATTERN.search(command):
-            raise self._error(
-                "permission",
-                "container_control_blocked",
-                "Host container-engine control is outside the Agent target scope",
             )
         owner = await self.service.get_agent_runtime(self.run_id, agent_id)
         if owner["agent"]["status"] in {

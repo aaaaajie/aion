@@ -699,7 +699,7 @@ class FileSystemService:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-                os.fchmod(stream.fileno(), stat.S_IMODE(mode))
+                os.chmod(temporary_path, stat.S_IMODE(mode))
             os.replace(temporary_path, path)
         finally:
             try:

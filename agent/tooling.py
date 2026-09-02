@@ -585,11 +585,12 @@ class ToolResultStore:
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
             os.chmod(path, 0o600)
-            directory = os.open(self.root, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            if os.name != "nt":
+                directory = os.open(self.root, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
         except Exception:
             temporary.unlink(missing_ok=True)
             path.unlink(missing_ok=True)

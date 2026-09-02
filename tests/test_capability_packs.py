@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -305,6 +306,8 @@ def test_required_system_tools_are_present_and_hashed() -> None:
         if not entry.get("required", True):
             continue
         path = root / entry["path"]
-        assert path.is_file() and path.stat().st_mode & 0o111, name
+        assert path.is_file(), name
+        if os.name != "nt":
+            assert path.stat().st_mode & 0o111, name
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         assert digest == entry["sha256"], name

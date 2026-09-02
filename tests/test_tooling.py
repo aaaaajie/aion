@@ -308,7 +308,8 @@ def test_large_result_store_is_private_atomic_and_pageable(tmp_path: Path) -> No
     result_ref = owner.persist(content)
     path = next((tmp_path / "run" / "agents" / "agent-a" / "tool-results").glob("*.json"))
     assert path.read_text(encoding="utf-8") == content
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert os.stat(path).st_mode & 0o777 == 0o600
 
     offset = 0
     chunks: list[str] = []
