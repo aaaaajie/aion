@@ -1,11 +1,18 @@
 """Agent-facing tool wrappers for the project."""
 
 from .benchmark import BenchmarkTools
+from .browser import AgentBrowserClient, BrowserManager, BrowserTools
 from .http import HttpInteractionEngine, HttpProbeManager, HttpTools
+from .proxy import CaidoProxyManager, ProxyTools
 from .system import SystemTools
 
 __all__ = [
     "BenchmarkTools",
+    "AgentBrowserClient",
+    "BrowserManager",
+    "BrowserTools",
+    "CaidoProxyManager",
+    "ProxyTools",
     "SystemTools",
     "HttpInteractionEngine",
     "HttpProbeManager",

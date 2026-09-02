@@ -96,6 +96,8 @@ EVIDENCE_RESULT_TOOLS = frozenset(
         "system_web_fingerprint",
         "system_http_output",
         "system_http_response",
+        "system_browser",
+        "system_proxy",
         "system_network_discovery",
         "system_network_output",
         "pwn_process_open",
@@ -1614,7 +1616,11 @@ class AgentRunner:
     def _evidence_type(tool_name: str) -> str:
         if tool_name in {"system_write_file", "system_edit_file"}:
             return "file"
-        if tool_name.startswith("system_http_") or tool_name.startswith("system_web_"):
+        if (
+            tool_name.startswith("system_http_")
+            or tool_name.startswith("system_web_")
+            or tool_name in {"system_browser", "system_proxy"}
+        ):
             return "http"
         if tool_name.startswith("system_network_"):
             return "network"

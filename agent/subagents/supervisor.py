@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -64,8 +65,10 @@ from tools.http import HttpProbeManager, HttpTools
 from tools.network import NetworkDiscoveryManager, NetworkTools
 from tools.binary import BinaryTools
 from tools.artifact import ArtifactTools
+from tools.browser import BrowserManager, BrowserTools
 from tools.binaries import default_toolchain_root, toolchain_for
 from tools.pentest import PentestTools
+from tools.proxy import CaidoProxyManager, ProxyTools
 from tools.system import ShellTaskManager, SystemTools
 from tools.system.policy import WorkspacePolicy
 
@@ -83,6 +86,51 @@ if not LOGGER.handlers:
     LOGGER.addHandler(_handler)
 LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
+
+
+def _browser_proxy_environment() -> dict[str, str]:
+    """Pass only explicit proxy/browser settings into the sandboxed browser."""
+
+    proxy = (
+        os.environ.get("AION_CAIDO_PROXY_URL", "").strip()
+        or os.environ.get("AGENT_BROWSER_PROXY", "").strip()
+    )
+    environment: dict[str, str] = {}
+    if proxy:
+        no_proxy = os.environ.get(
+            "AION_CAIDO_NO_PROXY",
+            os.environ.get("AGENT_BROWSER_PROXY_BYPASS", "localhost,127.0.0.1"),
+        ).strip()
+        environment.update(
+            {
+                "AGENT_BROWSER_PROXY": proxy,
+                "AGENT_BROWSER_PROXY_BYPASS": no_proxy,
+                "HTTP_PROXY": proxy,
+                "HTTPS_PROXY": proxy,
+                "ALL_PROXY": proxy,
+                "http_proxy": proxy,
+                "https_proxy": proxy,
+                "all_proxy": proxy,
+                "NO_PROXY": no_proxy,
+                "no_proxy": no_proxy,
+            }
+        )
+    # Shell rebuilds its environment instead of inheriting the controller's
+    # process environment; forward only fixed browser launch knobs explicitly.
+    for name in (
+        "AGENT_BROWSER_EXECUTABLE_PATH",
+        "AGENT_BROWSER_ARGS",
+        "AGENT_BROWSER_CA_CERT",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_USER_AGENT",
+        "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+        "AGENT_BROWSER_IDLE_TIMEOUT_MS",
+        "AGENT_BROWSER_DEFAULT_TIMEOUT",
+    ):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
 
 
 class SubagentError(RuntimeError):
@@ -168,6 +216,8 @@ class AgentSupervisor:
         # Tool wrapper reconstruction while a controller is waiting.
         self._pausing = False
         self._shell_tasks: ShellTaskManager | None = None
+        self._browser: BrowserManager | None = None
+        self._proxy: CaidoProxyManager | None = None
         self._http_interactions: HttpProbeManager | None = None
         self._network_discovery: NetworkDiscoveryManager | None = None
         self._model_http_client: httpx.AsyncClient | None = None
@@ -280,9 +330,23 @@ class AgentSupervisor:
                 "AION_VENV_BIN": str(runtime_python.parent),
                 "AION_TOOLCHAIN_ROOT": str(toolchain.root),
                 "AION_TOOLCHAIN_BIN": str(toolchain.bin_dir),
+                **_browser_proxy_environment(),
             },
         )
         await self._shell_tasks.initialize(resume=resume)
+        self._browser = BrowserManager(run_id)
+        self._proxy = CaidoProxyManager(project_name=f"aion-{run_id}")
+        if os.environ.get("AION_CAIDO_URL", "").strip() or os.environ.get(
+            "STRIX_CAIDO_URL", ""
+        ).strip():
+            try:
+                await self._proxy.initialize()
+            except Exception as exc:
+                # Caido remains optional outside the hosted image; ProxyTools
+                # retries lazily when the Agent actually requests it.
+                LOGGER.warning(
+                    "caido initialization deferred error_type=%s", type(exc).__name__
+                )
         self._http_interactions = HttpProbeManager(
             WorkspacePolicy(self.project_root),
             service,
@@ -1989,6 +2053,8 @@ class AgentSupervisor:
             await asyncio.gather(*completion_tasks, return_exceptions=True)
         await self._stop_all()
         managers = (
+            ("_browser", self._browser),
+            ("_proxy", self._proxy),
             ("_http_interactions", self._http_interactions),
             ("_network_discovery", self._network_discovery),
             ("_shell_tasks", self._shell_tasks),
@@ -2019,6 +2085,16 @@ class AgentSupervisor:
             await self._ignore_cancel(self._poll_task)
             self._poll_task = None
         await self._close_skill_discovery()
+        if self._browser is not None:
+            try:
+                await self._browser.pause_run()
+            finally:
+                self._browser = None
+        if self._proxy is not None:
+            try:
+                await self._proxy.pause_run()
+            finally:
+                self._proxy = None
         if self._shell_tasks is not None:
             try:
                 await self._shell_tasks.pause_run()
@@ -2543,6 +2619,8 @@ class AgentSupervisor:
                 self._shell_tasks is None
                 or self._http_interactions is None
                 or self._network_discovery is None
+                or self._browser is None
+                or self._proxy is None
             ):
                 raise SubagentError("Execution task managers are not initialized")
             shell_client = self._shell_tasks.bind(
@@ -2562,6 +2640,8 @@ class AgentSupervisor:
                 ),
                 HttpTools(self._http_interactions.bind(agent_id)),
                 NetworkTools(self._network_discovery.bind(agent_id)),
+                BrowserTools(self._browser.bind(agent_id, shell_client)),
+                ProxyTools(self._proxy),
                 BinaryTools(self.project_root, toolchain_root=self.toolchain_root),
                 ArtifactTools(self.project_root),
                 PentestTools(root=self.project_root, toolchain_root=self.toolchain_root),
@@ -3565,6 +3645,15 @@ class AgentSupervisor:
     async def _finish_agent_resources(self, agent_id: str) -> None:
         """Best-effort idempotent cleanup for every Execution-owned manager."""
 
+        failures: list[dict[str, str]] = []
+        # Browser commands run through the Shell client, so close the browser
+        # before Shell removes the Agent workspace.
+        if self._browser is not None:
+            try:
+                await self._browser.finish_agent(agent_id)
+            except Exception as exc:
+                failures.append({"manager": "browser", "error_type": type(exc).__name__})
+
         operations: list[tuple[str, Any]] = []
         if self._http_interactions is not None:
             operations.append(("http", self._http_interactions.finish_agent(agent_id)))
@@ -3572,23 +3661,26 @@ class AgentSupervisor:
             operations.append(("network", self._network_discovery.finish_agent(agent_id)))
         if self._shell_tasks is not None:
             operations.append(("shell", self._shell_tasks.finish_agent(agent_id)))
-        if not operations:
-            return
-        results = await asyncio.gather(
-            *(operation for _, operation in operations), return_exceptions=True
-        )
-        failures = [
-            {"manager": name, "error_type": type(result).__name__}
-            for (name, _), result in zip(operations, results, strict=True)
-            if isinstance(result, BaseException)
-        ]
-        if failures:
-            await self._service().append_agent_event(
-                self._run_id(),
-                agent_id,
-                "agent_resource_cleanup_failed",
-                {"failures": failures},
+        if operations:
+            results = await asyncio.gather(
+                *(operation for _, operation in operations), return_exceptions=True
             )
+            failures.extend(
+                {
+                    "manager": name,
+                    "error_type": type(result).__name__,
+                }
+                for (name, _), result in zip(operations, results, strict=True)
+                if isinstance(result, BaseException)
+            )
+        if not failures:
+            return
+        await self._service().append_agent_event(
+            self._run_id(),
+            agent_id,
+            "agent_resource_cleanup_failed",
+            {"failures": failures},
+        )
 
     async def launch_http_work(
         self, interaction_id: str, phase: str, *, work_id: str

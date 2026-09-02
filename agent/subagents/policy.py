@@ -55,6 +55,8 @@ ROLE_TOOL_NAMES: dict[AgentRole, frozenset[str]] = {
             "system_http_output",
             "system_http_response",
             "system_http_stop",
+            "system_browser",
+            "system_proxy",
             "system_network_discovery",
             "system_network_output",
             "system_network_stop",
