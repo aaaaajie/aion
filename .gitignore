@@ -8,10 +8,21 @@ __pycache__/
 *.pyc
 *.pyo
 .coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.pyright/
+.pyre/
 *.egg-info/
 .system-tools/
 .aion/
 .playwright-cli/
+node_modules/
+*.log
+*.tmp
+*.temp
+*.bak
 .DS_Store
 
 # Local benchmark fixtures, challenge work products, and generated packages
@@ -29,6 +40,9 @@ agent/skills/execution/* copy/
 deploy/vps_known_hosts
 deploy/*.pem
 deploy/*.key
+
+# Local upstream Strix reference snapshot; extracted source stays local only.
+/docs/strix/
 
 # Local credentials, cookies, and session-forging material
 **/cookies.txt
