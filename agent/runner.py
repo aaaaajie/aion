@@ -353,7 +353,11 @@ class AgentRunner:
                             "# Targets\n\n"
                             f"{packet['challenge'].get('container_addr', [])}\n\n"
                             "# Important Observations\n\n"
-                            "Use only the facts and evidence references in the strategy reset packet.\n\n"
+                            "Preserve verified capabilities, request conditions and unresolved original candidates; "
+                            "read cited requests before adapting them.\n"
+                            + json.dumps({"acquired_capabilities": packet.get("acquired_capabilities", []),
+                                          "directions": packet.get("directions", [])}, ensure_ascii=False)
+                            + "\n\n"
                             "# Workflow\n\n"
                             "Keep dependent steps together and avoid repeating completed tests.\n\n"
                             "# Errors & Corrections\n\n"

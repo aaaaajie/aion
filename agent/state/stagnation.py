@@ -223,8 +223,10 @@ class StagnationState:
                     "hypothesis_id": hypothesis_id,
                     "status": review.get("direction_status", "open"),
                     "assessment": review.get("assessment"),
-                    "summary": str(review.get("summary") or "")[:600],
-                    "next_test": str(review.get("next_test") or "")[:400],
+                    "summary": str(review.get("summary") or ""),
+                    "next_test": str(review.get("next_test") or ""),
+                    "validation": review.get("validation"),
+                    "review_sequence": value.get("sequence"),
                     "strategy_revision": review.get("strategy_revision", 1),
                     "revoked": value.get("revoked", False),
                 }
@@ -234,6 +236,7 @@ class StagnationState:
             "strategy_revision": challenge["strategy_revision"],
             "evidence_refs": [f"evidence:{row.evidence_id}" for row in rows],
             "directions": directions[-12:],
+            "acquired_capabilities": review_state.get("acquired_capabilities", []),
             "weakly_rejected": [
                 item["hypothesis_id"] for item in directions
                 if item["status"] == "weakly_rejected" and not item["revoked"]

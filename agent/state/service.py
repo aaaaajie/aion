@@ -222,7 +222,6 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                     challenge = await self._require_challenge(
                         session, run_id, unique_code
                     )
-                    self._mark_progress(challenge)
                     sequence = await self._event(
                         session,
                         run_id,
@@ -232,16 +231,6 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                             "evidence_type": evidence_type,
                             "source": source,
                             "size_chars": len(content),
-                        },
-                        agent_id=context.agent_id,
-                    )
-                    await self._event(
-                        session,
-                        run_id,
-                        "challenge_progress_recorded",
-                        {
-                            "unique_code": unique_code,
-                            "progress_kinds": ["evidence_persisted"],
                         },
                         agent_id=context.agent_id,
                     )
@@ -517,7 +506,7 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                         if existing.container_status in RELEASED_CONTAINER_STATUSES:
                             existing.active_since = None
                         if (
-                            existing.is_completed != previous_completed
+                            (existing.is_completed and not previous_completed)
                             or existing.correct_flag_count > previous_correct_count
                         ):
                             self._mark_progress(existing)
@@ -4014,7 +4003,6 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
         source: str,
         source_ref: str | None = None,
         confidence: float = 0.5,
-        mark_progress: bool = False,
     ) -> dict[str, Any]:
         """Persist one deduplicated Observation with its evidence references."""
 
@@ -4037,8 +4025,6 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                 )
                 event_sequence: int | None = None
                 if created:
-                    if mark_progress and challenge_work_active(challenge):
-                        self._mark_progress(challenge)
                     event_sequence = await self._event(
                         session,
                         run_id,

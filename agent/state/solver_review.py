@@ -266,26 +266,16 @@ class SolverReviewState:
                 prior_refs = {
                     int(value)
                     for row in prior
-                    for value in (
-                        row.payload["review"].get("covered_sequences", [])
-                        + (row.payload["review"].get("validation") or {}).get(
-                            "conclusion_sequences", []
-                        )
-                        + (row.payload["review"].get("validation") or {}).get(
-                            "calibration_sequences", []
-                        )
-                    )
+                    if row.payload["review"].get("assessment") == "new_information"
+                    for value in (row.payload["review"].get("validation") or {}).get("conclusion_sequences", [])
                 }
                 sequence = await self._event(session, run_id, "solver_review_record", {
                     "review": review.model_dump(), "control_sequences": control_sequences,
                 }, agent_id=agent.agent_id)
-                eligible_refs = set(
-                    review.covered_sequences
-                    + (conclusions or [])
-                    + (calibration_sequences or [])
-                ) - set(review.revoked_sequences)
+                eligible_refs = set(conclusions) - (revoked if validation else set())
                 if (
                     review.assessment == "new_information"
+                    and validation is not None
                     and bool(eligible_refs - prior_refs)
                     and not challenge.is_completed
                 ):
