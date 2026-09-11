@@ -368,3 +368,56 @@ def test_deferred_result_has_executable_read_instruction(tmp_path):
         chunks.append(page["content"])
         instruction = page["read_result"]
     assert json.loads("".join(chunks)) == original
+
+
+async def test_long_foreground_shell_rejected_and_background_unblocks_batch():
+    from tools.system.models import ShellArguments, TaskStartArguments
+
+    started = []
+    released = asyncio.Event()
+    running = []
+
+    async def run_task():
+        await released.wait()
+
+    async def shell(args):
+        started.append(args.command)
+        if isinstance(args, TaskStartArguments):
+            running.append(asyncio.create_task(run_task()))
+            return {'ok': True, 'data': {'task_id': 'owned-task', 'status': 'running'}}
+        raise AssertionError('Rejected foreground command must not execute')
+
+    async def probe(args):
+        assert len(running) == 1 and not running[0].done()
+        return {'ok': True, 'data': 'independent response'}
+
+    class Tools:
+        def tool_specs(self):
+            return [
+                ToolSpec('system_shell', 'short', ShellArguments, shell,
+                         lambda _: (AccessClaim('write', '*'),)),
+                ToolSpec('system_task_start', 'background', TaskStartArguments, shell,
+                         lambda _: (AccessClaim('write', '*'),)),
+                ToolSpec('test_tool', 'probe', Arguments, probe,
+                         lambda _: (AccessClaim('read', 'http'),)),
+            ]
+
+    executor = ToolExecutor(ToolRegistry([Tools()]))
+    original = {'command': 'scan fixture', 'timeout': 500.0, 'cwd': '.', 'max_output_chars': 6000}
+    rejected = (await executor.execute([call('system_shell', json.dumps(original))]))[0].result
+    assert not started
+    assert rejected['error']['details']['execution_status'] == 'not_started'
+    suggestion = rejected['error']['details']
+    assert suggestion['next_tool'] == 'system_task_start'
+    assert {k: suggestion['next_arguments'][k] for k in original} == original
+    try:
+        results = await asyncio.wait_for(executor.execute([
+            call('system_task_start', json.dumps(suggestion['next_arguments']), 'background'),
+            call('test_tool', json.dumps({'value': 1}), 'probe'),
+        ]), 1)
+        assert all(item.result['ok'] for item in results)
+        assert started == ['scan fixture']
+        assert results[1].concurrency_wave > results[0].concurrency_wave
+    finally:
+        released.set()
+        await asyncio.gather(*running)

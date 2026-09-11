@@ -102,9 +102,11 @@ async def test_real_solver_review_chain_delivers_and_clears_reminder(tmp_path):
 
     async def solve(role, index, body):
         await ready.wait()
-        if index < 2:
-            return completion("solver_review", record(control, conclusion_sequences=[sources[index]]).model_dump())
-        if index == 2:
+        if index == 0:
+            return completion("tool_search", {"name": "solver_review"})
+        if index < 3:
+            return completion("solver_review", record(control, conclusion_sequences=[sources[index - 1]]).model_dump())
+        if index == 3:
             assert '"review_recommended": ["fixture-path"]' in body["messages"][-1]["content"]
             return completion("solver_review", record(summary="Review fixture controls before another attempt").model_dump())
         assert '"review_recommended": []' in body["messages"][-1]["content"]

@@ -116,7 +116,7 @@ def validate_execution(result, execution):
                        for item in execution["tasks"])
     elif result.payload.get("tool_name") in TASK_TOOLS:
         invalid |= not fact.get("output_read")
-        invalid |= any(item.get("task_id") == fact.get("task_id") and not item.get("output_read")
+        invalid |= any(fact.get("task_id") and item.get("task_id") == fact.get("task_id") and not item.get("output_read")
                        for item in execution["tasks"])
     if invalid:
         raise StatePermission("review_execution_inconclusive", "Incomplete execution cannot be validated")
@@ -164,6 +164,7 @@ class SolverReviewState:
             covered.update(seq for row in reviews
                            for seq in (row["payload"]["review"]["validation"] or {}).get("conclusion_sequences", []))
             state["execution"] = project_execution(events, covered)
+            state["execution"]["invalidated_at_sequence"] = max(invalidations, default=0)
             return state
 
     async def record_solver_review(self, run_id, context, review):
@@ -218,7 +219,7 @@ class SolverReviewState:
                     ))).all()
                     if (len(results) != len(set(conclusions)) or set(conclusions) & revoked
                         or any(row.payload.get("replayed") for row in results)
-                        or (review.environment_dependent and any(row.sequence < state["execution"]["generation"] for row in results))):
+                        or (review.environment_dependent and any(row.sequence < state["execution"]["invalidated_at_sequence"] for row in results))):
                         raise StatePermission("review_result_invalid", "Validated conclusions need fresh, current tool-result sequences")
                     for result in results:
                         validate_execution(result, state["execution"])
@@ -245,7 +246,7 @@ class SolverReviewState:
                         fact = receipt.payload.get("execution_fact") or execution_fact(
                             receipt.payload.get("tool_name"), receipt.payload.get("result"))
                         if (receipt.sequence in revoked or receipt.payload.get("replayed")
-                            or receipt.sequence < state["execution"]["generation"]
+                            or receipt.sequence < state["execution"]["invalidated_at_sequence"]
                             or not fact or not (fact.get("execution") or fact.get("task_id") or fact.get("interaction_id"))):
                             raise StatePermission("review_control_invalid", "Control must be current, executed and not revoked")
                         validate_execution(receipt, state["execution"])

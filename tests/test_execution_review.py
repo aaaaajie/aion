@@ -147,8 +147,7 @@ async def test_covered_results_clear_reminder_without_claiming_validity(tmp_path
     service, _, solver = await build_state(tmp_path)
     try:
         sources = [await result(service, i, status='completed') for i in range(6)]
-        await service.record_solver_review('run', solver, record(await evidence(service, solver),
-            summary='Conditions unknown', covered_sequences=sources))
+        await service.record_solver_review('run', solver, record(summary='Conditions unknown', covered_sequences=sources))
         assert not (await service.solver_review_state('run', 'solver'))['execution']['unreviewed_results']
     finally:
         await service.close()

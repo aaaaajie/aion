@@ -235,7 +235,7 @@ class SystemTools:
             ),
             ToolSpec(
                 "system_shell",
-                "Run bash in your Agent workspace; cwd=shared accesses this Run and challenge only. Install optional dependencies only in a private workspace directory or virtual environment. Use $TMPDIR for persistent temporary files; project and other Agent directories are inaccessible. Use system_task_start for long work and prefer HTTP tools over representable curl loops.",
+                "Run bash in your Agent workspace; cwd=shared accesses this Run and challenge only. Install optional dependencies only in a private workspace directory or virtual environment. Use $TMPDIR for persistent temporary files; project and other Agent directories are inaccessible. Foreground timeout is at most 30 seconds. Use system_task_start for longer work and prefer HTTP tools over representable curl loops. A timeout is incomplete execution, not a target-side negative.",
                 ShellArguments,
                 run_shell,
                 lambda _arguments: (AccessClaim("write", "*"),),

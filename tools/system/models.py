@@ -92,7 +92,7 @@ class GrepArguments(ToolArguments):
 class ShellArguments(ToolArguments):
     command: str = Field(min_length=1, description="One bounded bash command. Non-zero exit status is a failed command and must be investigated.")
     cwd: str = Field(default=".", description="Use . or a workspace path; $TMPDIR is available to Shell for temporary files only.")
-    timeout: float = Field(default=30.0, gt=0, le=600.0)
+    timeout: float = Field(default=30.0, gt=0, le=30.0, description="Foreground budget, at most 30 seconds. Use system_task_start for longer work; a timeout is inconclusive.")
     max_output_chars: int = Field(default=30_000, gt=0, le=1_000_000)
 
 

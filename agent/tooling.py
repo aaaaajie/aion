@@ -555,6 +555,15 @@ class ToolExecutor:
                 details={"fields": fields, "allowed_fields": list(spec.input_model.model_fields)},
                 arguments=value,
             )
+            if (name == "system_shell" and isinstance(value.get("timeout"), (int, float))
+                and value["timeout"] > 30):
+                item.result["error"]["message"] = (
+                    "Foreground Shell allows at most 30 seconds. Use system_task_start for longer work; nothing was started."
+                )
+                item.result["error"]["details"].update({
+                    "next_tool": "system_task_start",
+                    "next_arguments": {**value, "name": "Background command"},
+                })
             if "arguments" not in spec.input_model.model_fields and set(value) == {"arguments"}:
                 suggestion = self._next_call(name, value["arguments"])
                 if suggestion["next_tool"] == name:
