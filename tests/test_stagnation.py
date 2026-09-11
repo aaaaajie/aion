@@ -64,7 +64,7 @@ async def test_stagnation_stages_are_idempotent_and_worker_is_singleton(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_new_evidence_resets_stagnation_clock_and_preserves_revision(tmp_path):
+async def test_evidence_does_not_reset_stagnation_clock_or_revision(tmp_path):
     service, _, solver = await build_state(tmp_path)
     now = [service.clock()]
     service.clock = lambda: now[0]
@@ -83,10 +83,10 @@ async def test_new_evidence_resets_stagnation_clock_and_preserves_revision(tmp_p
         )
         after = (await service.get_overview("run", unique_code="a"))["challenges"][0]
         assert after["strategy_revision"] == before["strategy_revision"]
-        assert after["stagnation_stage"] == "normal"
-        assert after["last_progress_at"] == now[0].isoformat()
+        assert after["stagnation_stage"] == "review_due"
+        assert after["last_progress_at"] == before["last_progress_at"]
         now[0] += timedelta(seconds=5)
-        assert await service.scan_stagnation("run", policy) == []
+        assert (await service.scan_stagnation("run", policy))[0]["kind"] == "alternate_worker"
     finally:
         await service.close()
 
@@ -111,5 +111,66 @@ async def test_solver_review_rejects_stale_strategy_revision(tmp_path):
         )
         with pytest.raises(StatePermission, match="expired"):
             await service.record_solver_review("run", solver, review)
+    finally:
+        await service.close()
+
+
+async def test_only_new_validated_conclusions_reset_progress(tmp_path):
+    from tests.test_solver_review import evidence, record
+    service, _, solver = await build_state(tmp_path)
+    now = [service.clock()]
+    service.clock = lambda: now[0]
+
+    async def challenge():
+        return (await service.get_overview('run', unique_code='a'))['challenges'][0]
+
+    try:
+        before = (await challenge())['last_progress_at']
+        now[0] += timedelta(seconds=5)
+        source = await service.append_agent_event('run', 'solver', 'tool_result', {'result': 'new response'})
+        await service.record_solver_review('run', solver, record(assessment='new_information', covered_sequences=[source]))
+        await service.record_observation('run', 'a', category='fixture', summary='another output', source='fixture')
+        assert (await challenge())['last_progress_at'] == before
+        control = await evidence(service, solver)
+        validated = record(control, conclusion_sequences=[source], assessment='new_information',
+            acquired_capabilities=[{'kind': 'file_read', 'target_environment': 'fixture service',
+                'scope': 'Session A; four parent segments; known control readable',
+                'limitations': 'Original candidate must be retested after repairing the client'}])
+        await service.record_solver_review('run', solver, validated)
+        progress = (await challenge())['last_progress_at']
+        assert progress == now[0].isoformat()
+        now[0] += timedelta(seconds=4)
+        await service.record_solver_review('run', solver, validated)
+        assert (await challenge())['last_progress_at'] == progress
+        events = await service.list_agent_events('run', 'solver')
+        assert sum(e['event_type'] == 'challenge_progress_recorded' for e in events) == 1
+        now[0] += timedelta(seconds=4)
+        assert (await service.scan_stagnation('run', StagnationPolicy(8, 14, 22, 8, 1)))[0]['kind'] == 'strategy_reset'
+        packet = await service.get_stagnation_packet('run', 'a')
+        assert packet['acquired_capabilities'][0]['scope'] == validated.acquired_capabilities[0].scope
+        assert packet['directions'][0]['validation']['control_evidence_refs'] == [control]
+        assert packet['directions'][0]['next_test'] == validated.next_test
+    finally:
+        await service.close()
+
+
+async def test_continuous_evidence_cannot_prevent_review_or_revive_completion(tmp_path):
+    service, _, solver = await build_state(tmp_path)
+    now = [service.clock()]
+    service.clock = lambda: now[0]
+    policy = StagnationPolicy(8, 14, 22, 8, 1)
+    try:
+        for i in range(8):
+            now[0] += timedelta(seconds=1)
+            await service.persist_evidence('run', solver, evidence_type='text', source='fixture', content=f'same response {i}')
+        assert (await service.scan_stagnation('run', policy))[0]['kind'] == 'strategy_reset'
+        from agent.state.models import ChallengeRecord
+        async with service.db.sessions.begin() as session:
+            row = await session.get(ChallengeRecord, ('run', 'a'))
+            row.is_completed = True
+            row.work_status = 'completed'
+        await service.persist_evidence('run', solver, evidence_type='text', source='fixture', content='late output')
+        now[0] += timedelta(seconds=60)
+        assert await service.scan_stagnation('run', policy) == []
     finally:
         await service.close()
