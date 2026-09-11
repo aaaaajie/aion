@@ -1,611 +1,223 @@
-"""Role-scoped lightweight Agent control Tool Specs."""
+"""Small, explicit role tools; strategy lives with Chief and Solver."""
 
-from __future__ import annotations
-
-from collections.abc import Mapping
-from typing import Any, ClassVar
-
-from agent.state.errors import StatePermission
-from agent.state.schemas import AgentReportInput, ChallengeDispatchInput, ExecutionTaskInput
-from agent.tooling import AccessClaim, ToolDispatchOutcome, ToolSpec
-
+from agent.state.schemas import AgentReportInput, ReviewAgentReportInput, WorkerUpdateInput
+from agent.tooling import ToolSpec, ToolDispatchOutcome, AccessClaim
 from .models import (
-    AgentRole,
-    ChallengeDispatchArguments,
-    ControllerWaitArguments,
-    BootstrapCheckpointArguments,
-    BootstrapCycleYieldArguments,
-    EmptyArguments,
-    EvidenceReadArguments,
-    ExecutionCheckpointArguments,
-    ExecutionReport,
-    LaunchChallengesArguments,
     ReportQueryArguments,
-    SecondaryBootstrapArguments,
+    SolverObserveArguments,
+    LaunchChallengesArguments,
+    ControllerWaitArguments,
     SimpleHintArguments,
+    PauseChallengesArguments,
+    CloseChallengesArguments,
+    DelegateArguments,
+    CancelWorkerArguments,
+    SolverProgressArguments,
+    SolverReviewArguments,
     SubmitFlagArguments,
+    EvidenceReadArguments,
+    ReportReadArguments,
+    EvidenceSearchArguments,
 )
 from .policy import AgentPolicy
 
 
-_EXECUTION_KINDS = {
-    "general",
-    "recon",
-    "web",
-    "pentest",
-    "exploit",
-    "cloud",
-    "evasion",
-    "credential",
-    "privilege",
-    "verification",
-    "exploration",
-}
-_TASK_STAGES = {"discovery", "validation", "exploitation", "post_exploitation"}
-_TASK_TIMEOUT_FLOORS = {
-    "discovery": 900,
-    "validation": 1_800,
-    "exploitation": 1_800,
-    "post_exploitation": 1_800,
-}
-
-
-def _normalize_dispatch_tasks(
-    raw_tasks: Any,
-) -> tuple[list[Any], list[dict[str, Any]], bool]:
-    """Keep objective strict while treating optional model metadata as advisory."""
-
-    warnings: list[dict[str, Any]] = []
-    supplied = raw_tasks not in (None, [])
-    if not isinstance(raw_tasks, list):
-        if supplied:
-            warnings.append(
-                {
-                    "code": "invalid_tasks_dropped",
-                    "message": "Dispatch tasks must be an array; the decision was kept without tasks",
-                    "details": {},
-                }
-            )
-        return [], warnings, supplied
-
-    normalized_tasks = []
-    for index, item in enumerate(raw_tasks):
-        if hasattr(item, "model_dump"):
-            item = item.model_dump(mode="python")
-        if not isinstance(item, Mapping):
-            warnings.append(
-                {
-                    "code": "invalid_task_dropped",
-                    "message": "Dispatch task without an object payload was dropped",
-                    "details": {"index": index},
-                }
-            )
-            continue
-        objective = item.get("objective")
-        if not isinstance(objective, str) or not objective.strip():
-            warnings.append(
-                {
-                    "code": "invalid_task_dropped",
-                    "message": "Dispatch task without a usable objective was dropped",
-                    "details": {"index": index},
-                }
-            )
-            continue
-
-        changed_fields: list[str] = []
-        kind = item.get("kind", "general")
-        if kind not in _EXECUTION_KINDS:
-            kind = "general"
-            changed_fields.append("kind")
-        task_stage = item.get("task_stage", "discovery")
-        if task_stage not in _TASK_STAGES:
-            task_stage = "discovery"
-            changed_fields.append("task_stage")
-        priority = item.get("priority", 50)
-        if (
-            not isinstance(priority, int)
-            or isinstance(priority, bool)
-            or not 0 <= priority <= 100
-        ):
-            priority = 50
-            changed_fields.append("priority")
-        timeout_seconds = item.get("timeout_seconds", 1_800)
-        if (
-            not isinstance(timeout_seconds, int)
-            or isinstance(timeout_seconds, bool)
-            or not 1 <= timeout_seconds <= 3_600
-        ):
-            timeout_seconds = 1_800
-            changed_fields.append("timeout_seconds")
-        timeout_floor = _TASK_TIMEOUT_FLOORS[task_stage]
-        if timeout_seconds < timeout_floor:
-            timeout_seconds = timeout_floor
-            changed_fields.append("timeout_seconds")
-
-        normalized: dict[str, Any] = {
-            "objective": objective.strip()[:4_000],
-            "kind": kind,
-            "task_stage": task_stage,
-            "priority": priority,
-            "timeout_seconds": timeout_seconds,
-        }
-        if normalized["objective"] != objective:
-            changed_fields.append("objective")
-        for field, maximum in (
-            ("task_key", 128),
-            ("hypothesis_key", 128),
-            ("branch_key", 256),
-        ):
-            value = item.get(field)
-            if value is None:
-                continue
-            if isinstance(value, str) and value.strip() and len(value.strip()) <= maximum:
-                normalized[field] = value.strip()
-            else:
-                changed_fields.append(field)
-        for field, maximum in (("success_criteria", 20), ("context_refs", 50)):
-            value = item.get(field, [])
-            if not isinstance(value, list):
-                normalized[field] = []
-                changed_fields.append(field)
-                continue
-            kept = [entry.strip() for entry in value if isinstance(entry, str) and entry.strip()]
-            normalized[field] = kept[:maximum]
-            if len(kept) != len(value) or len(kept) > maximum:
-                changed_fields.append(field)
-
-        normalized_tasks.append(ExecutionTaskInput.model_validate(normalized))
-        if changed_fields:
-            warnings.append(
-                {
-                    "code": "task_fields_normalized",
-                    "message": "Optional dispatch task metadata was defaulted or dropped",
-                    "details": {"index": index, "fields": sorted(set(changed_fields))},
-                }
-            )
-    return normalized_tasks, warnings, supplied
-
-
 class AgentControlTools:
-    """Base provider for one fixed role's compact control surface."""
-
-    ROLE: ClassVar[AgentRole]
-    _TOOLS: ClassVar[tuple[tuple[str, type[Any], str, str], ...]] = ()
-
-    def __init__(
-        self,
-        supervisor: Any,
-        *,
-        agent_id: str,
-        unique_code: str | None = None,
-        bootstrap_mode: bool = False,
-    ) -> None:
+    def __init__(self, supervisor, *, agent_id: str, role: str, mode: str = "execute"):
         self.supervisor = supervisor
         self.agent_id = agent_id
-        self.unique_code = unique_code
-        self.bootstrap_mode = bootstrap_mode
-        self.policy = AgentPolicy(self.ROLE)
+        self.mode = mode
+        self.policy = AgentPolicy(role, mode)
 
-    def tool_specs(self) -> list[ToolSpec]:
-        handlers = {
-            "chief_observe": self.chief_observe,
-            "chief_launch_challenges": self.chief_launch_challenges,
-            "chief_wait": self.chief_wait,
-            "chief_request_hint": self.chief_request_hint,
-            "challenge_observe": self.challenge_observe,
-            "challenge_dispatch": self.challenge_dispatch,
-            "challenge_request_secondary_bootstrap": self.challenge_request_secondary_bootstrap,
-            "challenge_wait": self.challenge_wait,
-            "challenge_submit_flag": self.challenge_submit_flag,
-            "challenge_close": self.challenge_close,
-            "execution_report": self.execution_report,
-            "bootstrap_checkpoint": self.bootstrap_checkpoint,
-            "bootstrap_cycle_yield": self.bootstrap_cycle_yield,
-            "execution_checkpoint": self.execution_checkpoint,
-            "evidence_read": self.evidence_read,
-        }
-        specs: list[ToolSpec] = []
-        role_tools = self._TOOLS
-        if self.ROLE == "execution" and self.bootstrap_mode:
-            role_tools = role_tools + (
-                (
-                    "bootstrap_checkpoint",
-                    BootstrapCheckpointArguments,
-                    "bootstrap_checkpoint",
-                    "Persist one verified, non-terminal route handoff and continue solving toward the exact Flag.",
-                ),
-                (
-                    "bootstrap_cycle_yield",
-                    BootstrapCycleYieldArguments,
-                    "bootstrap_cycle_yield",
-                    "Yield this bounded Bootstrap cycle without ending the logical lane; the same Agent will resume with its state and context.",
-                ),
+    def tool_specs(self):
+        s = self.supervisor
+        caller = self.agent_id
+
+        async def chief_observe(a):
+            return await s.observe_chief(caller, max_reports=a.max_reports)
+
+        async def launch(a):
+            return await s.launch_challenges(caller, a.unique_codes)
+
+        async def wait(a):
+            return await s.wait_for_state(caller, a.reason)
+
+        async def hint(a):
+            return await s.request_hint_light(caller, a.unique_code, reason=a.reason)
+
+        async def pause(a):
+            return await s.pause_challenges(
+                caller,
+                a.unique_codes,
+                reason=a.reason,
+                release_container=a.release_container,
             )
-        elif self.ROLE == "execution":
-            role_tools = role_tools + (
-                (
-                    "execution_checkpoint",
-                    ExecutionCheckpointArguments,
-                    "execution_checkpoint",
-                    "Persist one high-value, Evidence-backed non-terminal handoff for Bootstrap and the Challenge controller.",
-                ),
-            )
-        if self.ROLE in {"challenge", "execution"}:
-            role_tools = role_tools + (
-                (
-                    "evidence_read",
-                    EvidenceReadArguments,
-                    "evidence_read",
-                    "Read one authorized immutable Evidence item with pagination.",
-                ),
-            )
-        for name, argument_model, method_name, description in role_tools:
-            typed_handler = handlers[method_name]
 
-            async def handler(
-                arguments: Any,
-                *,
-                tool_name: str = name,
-                bound_handler: Any = typed_handler,
-            ) -> Any:
-                if not self.policy.allows(tool_name):
-                    raise StatePermission(
-                        "tool_not_allowed_for_role",
-                        "This Agent role cannot use that tool",
-                    )
-                return await bound_handler(arguments)
+        async def close(a):
+            return await s.close_challenges(caller, a.unique_codes, reason=a.reason)
 
-            specs.append(
-                ToolSpec(
-                    name,
-                    description,
-                    argument_model,
-                    handler,
-                    access_claims=self._access_claims(name),
-                    requires_solo=name in {"chief_wait", "challenge_wait"},
-                    result_projector=(
-                        (lambda result, tool_name=name: self._control_projection(
-                            tool_name, result
-                        ))
-                        if name in {
-                            "chief_observe",
-                            "challenge_observe",
-                            "challenge_dispatch",
-                        }
-                        else None
-                    ),
-                )
-            )
-        return specs
+        async def observe(a):
+            return await s.observe_solver(caller, **a.model_dump())
 
-    @staticmethod
-    def _control_projection(
-        tool_name: str, result: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
-        data = result.get("data")
-        if not isinstance(data, Mapping):
-            return {}
-        if tool_name == "challenge_dispatch":
-            return {
-                "data": {
-                    key: data[key]
-                    for key in (
-                        "decision_number",
-                        "admissions",
-                        "idempotent_tasks",
-                        "decision_report_sequence",
-                        "transition_latency_ms",
-                    )
-                    if key in data
-                },
-                "warnings": list(result.get("warnings") or []),
-            }
-        if tool_name == "chief_observe":
-            return {
-                "data": {
-                    key: data[key]
-                    for key in (
-                        "run",
-                        "capacity",
-                        "challenges",
-                        "active_agents",
-                        "schedule",
-                        "reports",
-                        "report_count",
-                        "next_sequence",
-                        "has_more",
-                        "evidence",
-                    )
-                    if key in data
-                }
-            }
-        return {
-            "data": {
-                key: data[key]
-                for key in (
-                    "authority",
-                    "candidate_flags",
-                    "reports",
-                    "report_count",
-                    "report_cursor",
-                    "has_more",
-                    "active_execution_count",
-                    "active_executions",
-                    "all_execution_terminal",
-                    "evidence_root",
-                )
-                if key in data
-            }
-        }
+        async def delegate(a):
+            return await s.delegate_workers(caller, a.tasks)
 
-    async def close(self) -> None:
-        return None
+        async def cancel(a):
+            return await s.cancel_worker(caller, a.worker_id, reason=a.reason)
 
-    def _access_claims(self, name: str) -> Any:
-        if name == "evidence_read":
-            return lambda arguments: (
-                AccessClaim("read", f"evidence:{arguments.evidence_ref}"),
-            )
-        if name in {"chief_observe", "challenge_observe"}:
-            return lambda _arguments: (
-                AccessClaim("write", f"report-cursor:{self.agent_id}"),
-            )
-        if name.startswith("challenge_"):
-            return lambda _arguments: (
-                AccessClaim("write", f"challenge:{self.unique_code}"),
-            )
-        if name.startswith("execution_"):
-            return lambda _arguments: (
-                AccessClaim("write", f"execution:{self.agent_id}"),
-            )
-        return lambda _arguments: (AccessClaim("write", "agent-control"),)
+        async def progress(a):
+            return await s.solver_progress(caller, a)
 
-    async def chief_observe(self, arguments: ReportQueryArguments) -> dict[str, Any]:
-        return await self.supervisor.observe_chief(
-            self.agent_id, max_reports=arguments.max_reports
-        )
+        async def review(a):
+            return await s.solver_review(caller, a)
 
-    async def chief_launch_challenges(
-        self, arguments: LaunchChallengesArguments
-    ) -> dict[str, Any]:
-        return await self.supervisor.launch_challenges(
-            self.agent_id, arguments.unique_codes
-        )
+        async def submit(a):
+            return await s.submit_flag(caller, a.flag)
 
-    async def chief_wait(
-        self, arguments: ControllerWaitArguments
-    ) -> ToolDispatchOutcome:
-        return await self.supervisor.wait_chief(
-            self.agent_id, reason=arguments.reason
-        )
+        async def update(a):
+            return await s.report_worker(caller, a, terminal=False)
 
-    async def chief_request_hint(
-        self, arguments: SimpleHintArguments
-    ) -> dict[str, Any]:
-        return await self.supervisor.request_hint_light(
-            self.agent_id, arguments.unique_code, arguments.reason
-        )
+        async def report(a):
+            result = await s.report_worker(caller, a, terminal=True)
+            return ToolDispatchOutcome(result, yield_session=bool(result.get("ok")))
 
-    async def challenge_observe(
-        self, arguments: ReportQueryArguments
-    ) -> dict[str, Any]:
-        return await self.supervisor.observe_challenge(
-            self.agent_id, max_reports=arguments.max_reports
-        )
+        async def evidence(a):
+            return await s.read_evidence(caller, **a.model_dump())
 
-    async def challenge_dispatch(
-        self, arguments: ChallengeDispatchArguments
-    ) -> ToolDispatchOutcome:
-        tasks, normalization_warnings, tasks_supplied = _normalize_dispatch_tasks(
-            arguments.tasks
-        )
-        result = await self.supervisor.dispatch_challenge(
-            self.agent_id,
-            ChallengeDispatchInput(
-                summary=arguments.summary,
-                outcome=arguments.outcome,
-                direction=arguments.direction,
-                tasks=tasks,
-                evidence_refs=arguments.evidence_refs,
-                next_steps=arguments.next_steps,
+        async def search(a):
+            return await s.search_evidence(caller, **a.model_dump())
+
+        async def read_report(a):
+            return await s.read_report(caller, **a.model_dump())
+
+        controls = [
+            (
+                "chief_observe",
+                ReportQueryArguments,
+                chief_observe,
+                "Observe competition, capacity and Solver reports.",
             ),
-        )
-        if not result.get("ok"):
-            return ToolDispatchOutcome(result)
-        if normalization_warnings and isinstance(result, Mapping):
-            result = {
-                **dict(result),
-                "warnings": [
-                    *normalization_warnings,
-                    *list(result.get("warnings") or []),
-                ],
-            }
-        all_supplied_tasks_dropped = tasks_supplied and not tasks
-        return ToolDispatchOutcome(
-            result,
-            yield_session=bool(result.get("ok")) and not all_supplied_tasks_dropped,
-        )
-
-    async def challenge_request_secondary_bootstrap(
-        self, arguments: SecondaryBootstrapArguments
-    ) -> dict[str, Any]:
-        return await self.supervisor.request_secondary_bootstrap(
-            self.agent_id,
-            arguments.route_a,
-            arguments.route_b,
-            arguments.reason,
-        )
-
-    async def challenge_wait(
-        self, arguments: ControllerWaitArguments
-    ) -> ToolDispatchOutcome:
-        return await self.supervisor.wait_for_state(
-            self.agent_id, arguments.reason
-        )
-
-    async def challenge_submit_flag(
-        self, arguments: SubmitFlagArguments
-    ) -> ToolDispatchOutcome:
-        result = await self.supervisor.submit_flag(self.agent_id, arguments.flag)
-        data = result.get("data") if isinstance(result, Mapping) else None
-        return ToolDispatchOutcome(
-            result,
-            yield_session=bool(
-                result.get("ok")
-                and isinstance(data, Mapping)
-                and data.get("challenge_completed")
+            (
+                "chief_launch_challenges",
+                LaunchChallengesArguments,
+                launch,
+                "Start challenges or resume their existing Solver.",
             ),
-        )
-
-    async def challenge_close(self, _arguments: EmptyArguments) -> dict[str, Any]:
-        return await self.supervisor.close_challenge(self.agent_id)
-
-    async def execution_report(
-        self, arguments: ExecutionReport
-    ) -> ToolDispatchOutcome:
-        payload = AgentReportInput.model_validate(arguments, from_attributes=True)
-        result = await self.supervisor.report_execution_payload(self.agent_id, payload)
-        data = result.get("data") if isinstance(result, Mapping) else None
-        return ToolDispatchOutcome(
-            result,
-            yield_session=bool(
-                result.get("ok")
-                and isinstance(data, Mapping)
-                and (data.get("terminal") or data.get("cycle_yield"))
+            (
+                "chief_wait",
+                ControllerWaitArguments,
+                wait,
+                "Wait for new state without polling the model.",
             ),
-        )
-
-    async def bootstrap_checkpoint(
-        self, arguments: BootstrapCheckpointArguments
-    ) -> ToolDispatchOutcome:
-        result = await self.supervisor.report_bootstrap_checkpoint(
-            self.agent_id,
-            route_key=arguments.route_key,
-            summary=arguments.summary,
-            next_step=arguments.next_step,
-            task_stage=arguments.task_stage,
-            evidence_refs=arguments.evidence_refs,
-        )
-        return ToolDispatchOutcome(result, yield_session=False)
-
-    async def bootstrap_cycle_yield(
-        self, arguments: BootstrapCycleYieldArguments
-    ) -> ToolDispatchOutcome:
-        result = await self.supervisor.yield_bootstrap_cycle(
-            self.agent_id,
-            summary=arguments.summary,
-        )
-        return ToolDispatchOutcome(result, yield_session=bool(result.get("ok")))
-
-    async def execution_checkpoint(
-        self, arguments: ExecutionCheckpointArguments
-    ) -> ToolDispatchOutcome:
-        result = await self.supervisor.report_execution_checkpoint(
-            self.agent_id,
-            summary=arguments.summary,
-            next_step=arguments.next_step,
-            task_stage=arguments.task_stage,
-            urgency=arguments.urgency,
-            evidence_refs=arguments.evidence_refs,
-        )
-        data = result.get("data") if isinstance(result, Mapping) else None
-        return ToolDispatchOutcome(
-            result,
-            yield_session=bool(
-                result.get("ok")
-                and isinstance(data, Mapping)
-                and data.get("handoff_terminal")
+            (
+                "chief_request_hint",
+                SimpleHintArguments,
+                hint,
+                "Request one platform hint for a challenge.",
             ),
-        )
-
-    async def evidence_read(self, arguments: EvidenceReadArguments) -> dict[str, Any]:
-        return await self.supervisor.read_evidence(
-            self.agent_id,
-            arguments.evidence_ref,
-            offset=arguments.offset,
-            limit_chars=arguments.limit_chars,
-        )
-
-
-class ChiefAgentTools(AgentControlTools):
-    ROLE: ClassVar[AgentRole] = "chief"
-    _TOOLS = (
-        (
+            (
+                "chief_pause_challenges",
+                PauseChallengesArguments,
+                pause,
+                "Pause work, preserving Solver identity; release targets by default.",
+            ),
+            (
+                "chief_close_challenges",
+                CloseChallengesArguments,
+                close,
+                "Permanently close challenges and release their resources.",
+            ),
+            (
+                "solver_observe",
+                SolverObserveArguments,
+                observe,
+                "Read authoritative challenge state, task ledger and incremental Worker reports.",
+            ),
+            (
+                "solver_delegate",
+                DelegateArguments,
+                delegate,
+                "Delegate independent source inspection, client validation or evidence review with context_refs and success_criteria. Use execute for experiments and review for read-only analysis. Review Workers cannot read parent paths or task logs; provide exact evidence/report refs for artifact-specific review. Continue independent work and reuse existing tasks.",
+            ),
+            (
+                "solver_cancel_worker",
+                CancelWorkerArguments,
+                cancel,
+                "Cancel one owned Worker. Does not create replacement work.",
+            ),
+            (
+                "solver_wait",
+                ControllerWaitArguments,
+                wait,
+                "Wait for an active task or Worker completion, preserving sessions. Not a timer or application readiness check; without a wake source, returns immediately.",
+            ),
+            (
+                "solver_progress",
+                SolverProgressArguments,
+                progress,
+                "Publish Solver progress to Chief.",
+            ),
+            (
+                "solver_review",
+                SolverReviewArguments,
+                review,
+                "Record progress, uncertainty and the next test when useful. Ordinary observations need no calibration. Supply validation for verified conclusions or ruled-out hypotheses; revoke invalidated sources explicitly.",
+            ),
+            (
+                "solver_submit_flag",
+                SubmitFlagArguments,
+                submit,
+                "Submit an exact candidate answer. Platform state determines challenge completion.",
+            ),
+            (
+                "worker_update",
+                WorkerUpdateInput,
+                update,
+                "Publish evidence, tested and untested scope, and suggestions; continue the same task.",
+            ),
+            (
+                "worker_report",
+                ReviewAgentReportInput if self.mode == "review" else AgentReportInput,
+                report,
+                "Finish this explicit task with a terminal report. Review Workers report summary, evidence_refs, tested, untested and next_steps only; findings are not accepted in review mode.",
+            ),
+            (
+                "evidence_read",
+                EvidenceReadArguments,
+                evidence,
+                "Read one Evidence reference within this challenge and Run, with pagination.",
+            ),
+            (
+                "evidence_search",
+                EvidenceSearchArguments,
+                search,
+                "Search same-challenge Evidence metadata with pagination.",
+            ),
+            (
+                "report_read",
+                ReportReadArguments,
+                read_report,
+                "Read a same-challenge report by reference with pagination.",
+            ),
+        ]
+        read_names = {
             "chief_observe",
-            ReportQueryArguments,
-            "chief_observe",
-            "Read the compact authoritative run, capacity, schedule, and new Challenge reports.",
-        ),
-        (
-            "chief_launch_challenges",
-            LaunchChallengesArguments,
-            "chief_launch_challenges",
-            "Refresh once and launch a bounded ordered batch of Challenge Agents.",
-        ),
-        (
-            "chief_wait",
-            ControllerWaitArguments,
-            "chief_wait",
-            "Yield until new run state is available. This must be the only tool call.",
-        ),
-        (
-            "chief_request_hint",
-            SimpleHintArguments,
-            "chief_request_hint",
-            "Request the challenge Hint subject only to authoritative remote hard rules.",
-        ),
-    )
-
-
-class ChallengeAgentTools(AgentControlTools):
-    ROLE: ClassVar[AgentRole] = "challenge"
-    _TOOLS = (
-        (
-            "challenge_observe",
-            ReportQueryArguments,
-            "challenge_observe",
-            "Consume a bounded page of new Execution reports and read the compact challenge state.",
-        ),
-        (
-            "challenge_dispatch",
-            ChallengeDispatchArguments,
-            "challenge_dispatch",
-            "Atomically record one decision and enqueue useful independent tasks. Arguments are top-level, never wrapped in arguments. Minimal JSON: {\"summary\":\"test the exposed HTTP surface\",\"tasks\":[{\"objective\":\"collect one HTTP baseline\"}]}.",
-        ),
-        (
-            "challenge_request_secondary_bootstrap",
-            SecondaryBootstrapArguments,
-            "challenge_request_secondary_bootstrap",
-            "Temporarily add one Bootstrap lane only when two durable, non-overlapping routes are explicitly justified.",
-        ),
-        (
-            "challenge_wait",
-            ControllerWaitArguments,
-            "challenge_wait",
-            "Yield when no immediate action is useful. This must be the only tool call.",
-        ),
-        (
-            "challenge_submit_flag",
-            SubmitFlagArguments,
-            "challenge_submit_flag",
-            "Submit one candidate Flag without automatic retry.",
-        ),
-        (
-            "challenge_close",
-            EmptyArguments,
-            "challenge_close",
-            "Close this challenge and release its container resources.",
-        ),
-    )
-
-
-class ExecutionAgentTools(AgentControlTools):
-    ROLE: ClassVar[AgentRole] = "execution"
-    _TOOLS = (
-        (
-            "execution_report",
-            ExecutionReport,
-            "execution_report",
-            "Persist the one terminal result. Invalid optional evidence is returned as warnings rather than losing the report.",
-        ),
-    )
+            "solver_observe",
+            "evidence_read",
+            "evidence_search",
+            "report_read",
+        }
+        return [
+            ToolSpec(
+                name,
+                description,
+                model,
+                handler,
+                lambda _a, read=name in read_names: (
+                    AccessClaim("read" if read else "write", "agent:" + caller),
+                ),
+                requires_solo=name in {"chief_wait", "solver_wait", "worker_report"},
+            )
+            for name, model, handler, description in controls
+            if self.policy.allows(name)
+        ]

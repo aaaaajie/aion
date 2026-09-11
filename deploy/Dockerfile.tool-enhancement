@@ -1,0 +1,23 @@
+# Connected build only. Runtime consumes the exported image with networking disabled.
+ARG BASE_IMAGE=aion:tool-lifecycle-check
+FROM ${BASE_IMAGE}
+USER root
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/aion/tools/binaries/playwright-browsers \
+    SEMGREP_SEND_METRICS=off \
+    SEMGREP_ENABLE_VERSION_CHECK=0
+RUN python -m pip install --no-cache-dir playwright==1.55.0 semgrep==1.136.0 && python -m pip check
+RUN sed -i s,http://deb.debian.org,https://deb.debian.org,g /etc/apt/sources.list.d/debian.sources \
+    && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-aion-build-retries \
+    && python -m playwright install --with-deps chromium
+COPY tools /opt/aion/tools
+COPY agent /opt/aion/agent
+COPY challenges_sdk /opt/aion/challenges_sdk
+COPY scripts /opt/aion/scripts
+COPY pyproject.toml /opt/aion/pyproject.toml
+RUN python tools/binaries/offline_tools.py install && python -m pip check
+RUN --network=none python /opt/aion/scripts/build_cyberchef_python.py
+RUN python /opt/aion/scripts/seal_enhanced_toolchain.py
+WORKDIR /opt/aion
+RUN --network=none python scripts/check_enhanced_toolchain.py
+
+RUN --network=none python scripts/check_cyberchef_toolchain.py

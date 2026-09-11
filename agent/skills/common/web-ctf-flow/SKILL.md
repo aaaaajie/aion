@@ -1,118 +1,80 @@
 ---
 name: web-ctf-flow
 description: >-
-  面向已授权 Web CTF、靶场和 benchmark 的快速解题流程：从题目元数据建立
-  最小状态链，保持认证会话和返回 ID，并用最小验证确认高价值 Web 假设，尤其是
-  状态化报表、用户输入渲染和 SSTI。不要用于未授权系统或无边界扫描。
-when_to_use: >-
-  当题目是授权的 Web CTF、靶场或 benchmark，且需要处理 login、session、cookie、
-  report、record、render、template、SSTI、returned ID 或多步骤 API 状态流时使用。
-auto_activate_for: []
+  页面错误与业务结果分离、认证会话失效、重定向与 Cookie 对照、扫描会话隔离。
+  Diagnose authorized Web CTF stateful workflows when page errors, redirects,
+  cookies and business results disagree, or scanning invalidates a session.
+  Establish controls and the shortest goal check without broad route guessing.
 ---
 
-# Web CTF 状态流与最小验证
+# Web state and layered diagnosis
 
-这个 Skill 的目标是让 Agent 尽快从题目描述进入一条可复现的高价值请求链，
-而不是先进行宽泛的路径扫描。只在 Challenge 明确授权的目标范围内工作。
+Use current-challenge evidence to connect prerequisites, requests, returned state
+and the goal. A page comment is a lead; it does not prove a hidden route exists.
 
-## 1. 先把题目转换成状态图
+## Establish a small state map
 
-只读取题目元数据、当前 Assignment 和必要的本地题目源码，整理为：
+Record known endpoints, method/body schema, identity, CSRF, returned object IDs
+and the observed success condition. Use actual returned IDs and links. Distinguish
+request parsing, authentication, database/result handling, template rendering and
+subsequent business actions; failure in one layer does not establish failure in all.
+Do not require a linear business chain unless its dependencies are evidenced.
 
-```text
-前置条件 → 请求 → 返回状态/ID → 下一请求 → 成功判据
-```
+## Compare controls and layers
 
-优先提取：
+- Preserve the initial response before redirects and the final response separately.
+  Compare status, Location, Cookie changes and the subsequent business result.
+  A Cookie alone does not prove authentication; use it on a known identity or
+  read-only business control distinct from the failed rendered page. Do this before
+  requiring that page to recover. If no such control is known, locate one from
+  observed links or source; do not invent an endpoint.
+- For a persistent 5xx, change one relevant variable with a normal/invalid request
+  pair and inspect the affected layer. A failed page can coexist with changed state.
+  Repeated refreshes or larger route lists do not identify the failing layer.
+- A 401/403 may reflect identity, authorization or a gateway; a 404 may reflect the
+  route or object. Compare a known control before interpreting an unknown request.
+- With an expired session, invalid request or unread output, mark the experiment
+  inconclusive. A negative conclusion covers only the input and conditions tested.
+- When a new capability is verified, compare a direct goal-related read/check with
+  continuing the current business chain. A guessed data location is not a fact.
+  If the next uncertainty is where flag content could reside, search for
+  `ctf-flag-locator` to prioritize candidate carriers using current evidence.
 
-- 认证、角色、Session、CSRF 和对象归属要求；
-- 题目 hint/evaluation 指定的阶段；
-- 下一步真正需要的 Cookie、Token、对象 ID 或重定向；
-- manifest 或题目说明明确给出的 flag carrier/location。
+## Keep scans from changing the control
 
-不要因为出现 `login`、`API` 或 `file` 就自动扩大扫描范围。
+Keep dependent business steps on the same verified session. Give reconnaissance
+its own client/session and Cookie storage; parallel scans must not share a writable
+Cookie jar. Exclude known logout, delete and other state-changing routes from
+indiscriminate probing. Calibrate a known authenticated request before and after
+scan batches. If it stops working, suspend dependent conclusions and revalidate the
+session before continuing; do not interpret the batch as missing routes or denied roles.
 
-## 2. 保持同一会话，使用真实返回值
+## Choose and stop a branch
 
-- 整条状态链使用同一个 HTTP client/session；登录成功后不要更换 Cookie 容器。
-- 只记录状态码、响应结构、Cookie 是否存在、重定向和后续所需 ID。
-- 创建接口返回的 ID 是后续读取的权威引用；不要猜测 seeded record 的 ID。
-- 请求体先按公开 hint 和源码中的 schema 构造，避免重复试错。
+Use existing HTTP request/output/analysis tools and returned read handles; do not
+repeat requests merely to inspect results. For uncertain input-to-database behavior,
+search the SQLi Skill; for partial source, search the source audit workflow. Load
+neither solely because a form exists. For actual delayed template rendering, read
+`references/ssti-dialects.md` and validate the rendering route, same session and
+returned object ID before interpreting a harmless canary.
 
-典型的状态化对象链是：
+After two valid tests of one hypothesis add no information, recheck prerequisites
+and choose a distinguishing condition. Changing tools or scale does not reset the
+hypothesis. Stop a branch when the goal is verified, evidence excludes the specific
+condition, or a required prerequisite is unavailable; record the last case as blocked
+or inconclusive, not rejected.
 
-```text
-公开提示/账号 → 登录 → 创建用户可控对象 → 使用返回 ID 获取对象 → 验证渲染/业务结果
-```
+Report the minimum request order, prerequisites, returned references, control and
+result evidence, conclusion scope and next uncertainty using solver_progress or
+worker_report as appropriate. Keep raw credentials and response bodies in evidence,
+not ordinary summaries. Only Solver handles candidate submission.
 
-## 3. 用最小 canary 验证渲染假设
+## 请求证据与工具
 
-如果用户输入稍后会被模板渲染，先使用无害算术表达式确认方言和渲染时机：
+先用 skill_search / tool_search 发现已有能力，再获取准确 schema。登录或动态页面难以建立正常请求时使用 system_browser_open/action，捕获后用 system_browser_export_request 转交 system_http_request。已有正常请求用 system_http_replay 单字段替换；用 system_http_compare 比较已有对照响应，不为分析重复发请求。页面 500 不等于认证失败，统一 403 必须与随机不存在路径对照。网络结论必须注明执行来源、地址与实际失败阶段；未知阶段保留未知。浏览器凭据可能过期，不完整上传不能重放。
 
-- Jinja2、Twig、Nunjucks：`{{7*7}}`
-- Freemarker：`${7*7}`
-- ERB/EEx 类：`<%= 7*7 %>`
-- Velocity 类：`#set($x=7*7)$x`
+## POC 检索与验证
 
-只有输出从字面量变成 `49` 才算确认模板求值。若仍是字面量，优先检查：
+对已知产品、CVE 或页面特征，先调用 `system_poc_search`；不要从文件路径猜规则。对返回的 `poc_ref` 调用 `system_poc_inspect`，确认来源、请求、判断条件、支持状态和阻塞原因。`reference_only` 的 Yak/Yakit 记录只用于原文和依赖线索，不能执行。
 
-1. 是否请求了真正的 render/view 路由；
-2. 是否携带了创建对象时的同一 Session；
-3. 是否使用了创建接口返回的 ID；
-4. 是否存在转义或不同模板方言。
-
-确认后，只沿题目明确授权的 proof path 前进，并以 manifest/题目说明的载体为准。
-不要搜索任意文件、探测外部网络或重复执行相同的高风险输入。
-
-## 4. 高价值发现立即共享并停止泛化探索
-
-在 AION 中：
-
-- 验证出新的高价值事实后立即提交 `execution_checkpoint`；
-- 只在分支完成、阻塞或得到精确候选时提交一次终态 `execution_report`；
-- Challenge 看到 checkpoint 后按稳定 task key 进行一次后续派发；
-- 已确认成功路径后不要继续同类宽泛侦察。
-
-共享内容只保留路由、前置条件、输入类别、结果类别、来源引用和下一步，
-不要把 Cookie、完整响应、Evidence 正文、凭据或候选值写入普通摘要。
-
-## 5. 按状态码改变假设，而不是机械重试
-
-- `401`：会话丢失、登录顺序错误或 Cookie 未传递；
-- `403`：已认证但角色/权限不满足；
-- `404`：路由或对象 ID 错误，先核对上一步返回值；
-- `400/422`：请求 schema 或必需状态不对；
-- `5xx`：保留安全的错误类别，只改变一个变量重新验证；
-- canary 原样返回：渲染路径、转义或方言判断错误。
-
-每次重试都必须有新假设或新证据。重复内容只推进游标，不生成重复报告。
-
-## 6. A-03 类题目的快速判断
-
-若题目描述同时出现“登录”“创建报表/记录”“标题或字段展示”“渲染”，
-优先检查以下闭环：
-
-```text
-登录并保留 Session
-  → 创建带可控字段的对象
-  → 使用返回的对象 ID 获取/渲染
-  → 先发 harmless canary
-  → 按题目声明的 proof path 完成一次验证
-```
-
-这类题最常见的卡点是：未登录直接读取、换了 Session、读取固定的 seeded ID，
-或在已确认渲染后仍继续大范围侦察。
-
-## 7. 完成判据
-
-成功输出必须包含：
-
-- 可复现的最小请求顺序；
-- 每一步的状态前置和返回引用；
-- 独立验证的结果类别；
-- 明确的停止点和下一步（若尚未完成）。
-
-若无法完成，报告最小阻塞状态，不要用猜测填充候选结果。
-
-需要模板方言对照时，读取 `references/ssti-dialects.md`；仅在当前题目确实涉及
-服务端模板渲染时读取该资源。
+仅当状态为 `supported` 且目标 origin 明确时调用一次 `system_poc_run`。它会复用当前 Run/Agent 的 HTTP 资源和可指定会话；返回 interaction 后只用 `system_poc_output` 等待或读取，不重复提交。输出中的 `matched` 只表示模板条件满足，`not_matched` 只覆盖这次请求，正文缺失/截断、传输失败或无法确定时为 `inconclusive`。解释时引用 interaction/request 证据、执行来源、地址、状态码、Location、Cookie 和正文完整性；500 页面可与认证成立同时存在，统一 403 必须先做随机路径对照。

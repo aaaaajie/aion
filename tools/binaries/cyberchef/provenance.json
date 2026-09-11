@@ -1,0 +1,7 @@
+{
+  "component": "aion-cyberchef-python",
+  "version": "11.2.0-aion-python",
+  "source": "tools/cyberchef/engine.py",
+  "runtime": "AION Python 3.11 image",
+  "network": "none"
+}

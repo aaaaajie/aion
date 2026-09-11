@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from agent.model_usage import post_model
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -244,8 +245,13 @@ class SkillDiscovery:
                             "timeout", "Skill discovery timed out"
                         )
                     response = await asyncio.wait_for(
-                        self._http_client().post(
+                        post_model(
+                            self._http_client(),
                             completions_url(self.settings.llm_base_url),
+                            event_writer=lambda event_type, payload: self._emit(
+                                agent_id, event_type, payload
+                            ),
+                            purpose="skill_discovery",
                             headers={
                                 "Authorization": (
                                     "Bearer "
@@ -393,7 +399,7 @@ class SkillDiscovery:
         candidates: list[SkillCandidate] = []
         try:
             for skill_id in ids:
-                record = self.catalog.get("execution", str(skill_id))
+                record = self.catalog.get("worker", str(skill_id))
                 candidates.append(
                     SkillCandidate(
                         skill_id=record.skill_id,
@@ -458,10 +464,14 @@ class SkillDiscovery:
                 or not 0 <= float(confidence) <= 1
                 or not isinstance(reason, str)
             ):
-                raise SkillDiscoveryError("invalid_response", "Invalid candidate fields")
+                raise SkillDiscoveryError(
+                    "invalid_response", "Invalid candidate fields"
+                )
             normalized_reason = " ".join(reason.split())
             if not normalized_reason or len(normalized_reason) > MAX_REASON_CHARS:
-                raise SkillDiscoveryError("invalid_response", "Invalid candidate reason")
+                raise SkillDiscoveryError(
+                    "invalid_response", "Invalid candidate reason"
+                )
             seen.add(skill_id)
             source = allowed[skill_id]
             result.append(
@@ -496,8 +506,8 @@ class SkillDiscovery:
                     "content": (
                         "Select zero to five genuinely relevant skills for the bounded "
                         "execution task. Do not select a skill from generic word overlap. "
-                        "Return strict JSON only: {\"candidates\":[{\"skill_id\":\"...\","
-                        "\"confidence\":0.0,\"reason\":\"...\"}]}. Use only IDs in "
+                        'Return strict JSON only: {"candidates":[{"skill_id":"...",'
+                        '"confidence":0.0,"reason":"..."}]}. Use only IDs in '
                         "the supplied catalog and keep each reason under 160 characters."
                     ),
                 },

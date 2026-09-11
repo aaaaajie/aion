@@ -7,7 +7,7 @@ from typing import Any
 
 
 RELEASED_CONTAINER_STATUSES = frozenset({"stopped", "closed"})
-ACTIVE_CHALLENGE_WORK_STATUSES = frozenset({"active", "warning", "extended"})
+ACTIVE_CHALLENGE_WORK_STATUSES = frozenset({"active"})
 MAX_CHALLENGE_SLOTS = 3
 
 
@@ -71,7 +71,10 @@ def container_capacity_summary(
         str(item["unique_code"])
         for item in values
         if isinstance(item.get("unique_code"), str)
-        and bool(item.get("is_completed"))
+        and (
+            bool(item.get("is_completed"))
+            or str(item.get("work_status") or "") == "closed"
+        )
         and container_slot_occupied(item.get("container_status"))
     )
     occupied_count = len(occupied_codes)
@@ -110,9 +113,7 @@ def challenge_start_gate(
         if "slot_occupied" in challenge
         else container_slot_occupied(challenge.get("container_status"))
     )
-    allowed = slot_occupied or (
-        int(capacity["occupied_count"]) < limit
-    )
+    allowed = slot_occupied or (int(capacity["occupied_count"]) < limit)
     return {
         "allowed": allowed,
         "reason": None if allowed else "challenge_slots_exhausted",

@@ -76,6 +76,11 @@ If introspection is restricted, continue with:
 
 ## 3. HIDDEN PARAMETER DISCOVERY
 
+For a concrete authorized endpoint, use `pentest_arjun` with a finite
+wordlist and the matching GET, POST, JSON or XML mode. Treat a differential
+response as a candidate until it is replayed with the existing HTTP evidence
+tools.
+
 Look for:
 
 - fields present in admin docs but not public docs

@@ -52,7 +52,9 @@ class SchemaMetaRecord(Base):
 
     key: Mapped[str] = mapped_column(String(256), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
 
 class RunRecord(Base):
@@ -62,56 +64,86 @@ class RunRecord(Base):
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     model: Mapped[str | None] = mapped_column(String(256))
     prompt: Mapped[str | None] = mapped_column(Text)
-    context_window_tokens: Mapped[int] = mapped_column(Integer, default=1_000_000, nullable=False)
-    phase: Mapped[str] = mapped_column(String(16), default="early", nullable=False)
+    context_window_tokens: Mapped[int] = mapped_column(
+        Integer, default=1_000_000, nullable=False
+    )
     duration_minutes: Mapped[int] = mapped_column(Integer, default=360, nullable=False)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    current_challenge_code: Mapped[str | None] = mapped_column(String(256))
-    score_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    deadline_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    selected_challenge_codes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    score_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
     last_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    last_projected_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    stagnation_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_projected_sequence: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pause_reason: Mapped[str | None] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
 
 class ChallengeRecord(Base):
     __tablename__ = "challenges"
 
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
     unique_code: Mapped[str] = mapped_column(String(256), primary_key=True)
     description: Mapped[str | None] = mapped_column(Text)
-    difficulty: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    difficulty: Mapped[str] = mapped_column(
+        String(32), default="unknown", nullable=False
+    )
     level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     flag_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     correct_flag_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    platform_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
-    container_status: Mapped[str] = mapped_column(String(32), default="stopped", nullable=False)
-    container_addr: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    direction: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
-    work_status: Mapped[str] = mapped_column(String(32), default="unassigned", nullable=False)
-    control_state: Mapped[str] = mapped_column(
-        String(32), default="ok", nullable=False
+    platform_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False
     )
-    control_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    container_status: Mapped[str] = mapped_column(
+        String(32), default="stopped", nullable=False
+    )
+    container_addr: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    direction: Mapped[str] = mapped_column(
+        String(32), default="unknown", nullable=False
+    )
+    work_status: Mapped[str] = mapped_column(
+        String(32), default="unassigned", nullable=False
+    )
     pause_reason: Mapped[str | None] = mapped_column(String(128))
     evidence_root: Mapped[str | None] = mapped_column(Text)
-    stagnation_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    hint_eligible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     hint_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    strategy_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    stagnation_stage: Mapped[str] = mapped_column(
+        String(32), default="normal", nullable=False
+    )
+    last_intervention_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    intervention_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    alternate_worker_id: Mapped[str | None] = mapped_column(String(128))
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    exploration_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
     __table_args__ = (
         Index("ix_challenges_run_work", "run_id", "work_status"),
@@ -123,57 +155,82 @@ class AgentRecord(Base):
     __tablename__ = "agents"
 
     agent_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     parent_id: Mapped[str | None] = mapped_column(String(128))
     unique_code: Mapped[str | None] = mapped_column(String(256))
-    cycle_id: Mapped[str | None] = mapped_column(String(128))
     role: Mapped[str] = mapped_column(String(32), nullable=False)
-    kind: Mapped[str] = mapped_column(String(32), default="general", nullable=False)
-    task_stage: Mapped[str | None] = mapped_column(String(32))
+    mode: Mapped[str] = mapped_column(String(16), default="execute", nullable=False)
+    tool_fingerprints: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    task_digest: Mapped[str | None] = mapped_column(String(64))
+    resource_processes: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    resource_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pending_delivery: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
     priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
     mission: Mapped[str] = mapped_column(Text, default="", nullable=False)
     initial_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    session_memory: Mapped[str] = mapped_column(Text, default=DEFAULT_SESSION_MEMORY, nullable=False)
-    active_skills: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
-    final_report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    last_summarized_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    session_memory: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_SESSION_MEMORY, nullable=False
+    )
+    active_skills: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    final_report: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    last_summarized_sequence: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     report_cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    report_cursors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    success_criteria: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    success_criteria: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     context_refs: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    hypothesis_key: Mapped[str | None] = mapped_column(String(128))
     task_key: Mapped[str | None] = mapped_column(String(128))
-    branch_key: Mapped[str | None] = mapped_column(String(256))
     terminal_report_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     timeout_seconds: Mapped[int | None] = mapped_column(Integer)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_report_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Heartbeats describe liveness only.  These timestamps are advanced by
+    # durable model/tool events so supervisors can distinguish a live process
+    # from an Agent that is actually making progress.
+    last_model_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_tool_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_report_sequence: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     controller_cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
     __table_args__ = (
         Index("ix_agents_run_status", "run_id", "status"),
+        Index(
+            "uq_solver_challenge",
+            "run_id",
+            "unique_code",
+            unique=True,
+            sqlite_where=(role == "solver"),
+        ),
+        Index("uq_chief_run", "run_id", unique=True, sqlite_where=(role == "chief")),
         Index("ix_agents_challenge_status", "run_id", "unique_code", "status"),
         UniqueConstraint(
-            "run_id", "unique_code", "task_key", name="uq_execution_task_key"
-        ),
-        Index(
-            "ix_agents_challenge_hypothesis",
-            "run_id",
-            "unique_code",
-            "hypothesis_key",
-        ),
-        Index(
-            "ix_agents_challenge_branch",
-            "run_id",
-            "unique_code",
-            "branch_key",
+            "run_id", "unique_code", "task_key", name="uq_worker_task_key"
         ),
     )
 
@@ -220,86 +277,6 @@ class ObservationRecord(Base):
     )
 
 
-class HypothesisRecord(Base):
-    __tablename__ = "hypothesis_records"
-
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
-    )
-    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
-    hypothesis_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    statement: Mapped[str] = mapped_column(Text, nullable=False)
-    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
-    based_on_observations: Mapped[list[str]] = mapped_column(
-        JSON, default=list, nullable=False
-    )
-    status: Mapped[str] = mapped_column(
-        String(16), default="proposed", nullable=False
-    )
-    created_by: Mapped[str | None] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
-    )
-    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-
-    __table_args__ = (
-        PrimaryKeyConstraint(
-            "run_id", "unique_code", "hypothesis_key", name="pk_hypothesis"
-        ),
-        Index(
-            "ix_hypotheses_challenge",
-            "run_id",
-            "unique_code",
-            "status",
-        ),
-    )
-
-
-class ExecutionBranchRecord(Base):
-    __tablename__ = "execution_branches"
-
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
-    )
-    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
-    branch_key: Mapped[str] = mapped_column(String(256), nullable=False)
-    target_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
-    hypothesis_key: Mapped[str | None] = mapped_column(String(128))
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    task_stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(
-        String(16), default="proposed", nullable=False
-    )
-    priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
-    mission: Mapped[str | None] = mapped_column(Text)
-    agent_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    outcome: Mapped[dict[str, Any]] = mapped_column(
-        JSON, default=dict, nullable=False
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
-    )
-    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-
-    __table_args__ = (
-        PrimaryKeyConstraint(
-            "run_id", "unique_code", "branch_key", name="pk_execution_branch"
-        ),
-        Index(
-            "ix_execution_branches_challenge_status",
-            "run_id",
-            "unique_code",
-            "status",
-        ),
-    )
-
-
 class ShellTaskRecord(Base):
     __tablename__ = "shell_tasks"
 
@@ -326,9 +303,7 @@ class ShellTaskRecord(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    output_cleaned_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    output_cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cleanup_reason: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -382,9 +357,7 @@ class NetworkTaskRecord(Base):
     error_code: Mapped[str | None] = mapped_column(String(128))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    output_cleaned_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    output_cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cleanup_reason: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -439,9 +412,7 @@ class HttpInteractionRecord(Base):
     analysis_finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
-    output_cleaned_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    output_cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cleanup_reason: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -460,42 +431,13 @@ class HttpInteractionRecord(Base):
     )
 
 
-class CycleRecord(Base):
-    __tablename__ = "cycles"
-
-    cycle_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
-    unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
-    cycle_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="state", nullable=False)
-    state_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    plan: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    verification: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    state_update: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    report_cursor_at_start: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    decision_report_sequence: Mapped[int | None] = mapped_column(Integer)
-    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    state_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    analysis_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    plan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    execute_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    verify_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    __table_args__ = (
-        UniqueConstraint("run_id", "unique_code", "cycle_number", name="uq_cycle_number"),
-        Index("ix_cycles_challenge", "run_id", "unique_code", "cycle_number"),
-    )
-
-
 class FindingRecord(Base):
     __tablename__ = "findings"
 
     finding_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
     agent_id: Mapped[str | None] = mapped_column(String(128))
     category: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -503,16 +445,35 @@ class FindingRecord(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    verification_status: Mapped[str] = mapped_column(String(16), default="candidate", nullable=False)
-    evidence_paths: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    verification_status: Mapped[str] = mapped_column(
+        String(16), default="candidate", nullable=False
+    )
+    evidence_paths: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("run_id", "unique_code", "category", "fingerprint", name="uq_finding_fingerprint"),
-        Index("ix_findings_challenge_verification", "run_id", "unique_code", "verification_status"),
+        UniqueConstraint(
+            "run_id",
+            "unique_code",
+            "category",
+            "fingerprint",
+            name="uq_finding_fingerprint",
+        ),
+        Index(
+            "ix_findings_challenge_verification",
+            "run_id",
+            "unique_code",
+            "verification_status",
+        ),
     )
 
 
@@ -547,7 +508,9 @@ class CredentialRecord(Base):
     __tablename__ = "credentials"
 
     credential_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     unique_code: Mapped[str] = mapped_column(String(256), nullable=False)
     finding_id: Mapped[str | None] = mapped_column(String(128))
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -555,7 +518,9 @@ class CredentialRecord(Base):
     secret_value: Mapped[str] = mapped_column(Text, nullable=False)
     scope: Mapped[str | None] = mapped_column(Text)
     verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
     __table_args__ = (Index("ix_credentials_challenge", "run_id", "unique_code"),)
 
@@ -564,7 +529,9 @@ class ReportRecord(Base):
     __tablename__ = "reports"
 
     report_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
     parent_id: Mapped[str | None] = mapped_column(String(128))
@@ -572,9 +539,13 @@ class ReportRecord(Base):
     report_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    content_digest: Mapped[str | None] = mapped_column(String(64))
+    call_id: Mapped[str | None] = mapped_column(String(128))
     consumed_by: Mapped[str | None] = mapped_column(String(128))
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_report_sequence"),
@@ -586,31 +557,51 @@ class OperationRecord(Base):
     __tablename__ = "operations"
 
     operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     agent_id: Mapped[str | None] = mapped_column(String(128))
     unique_code: Mapped[str | None] = mapped_column(String(256))
     operation_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="started", nullable=False)
     arguments_fingerprint: Mapped[str | None] = mapped_column(String(64))
-    request_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    result_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    request_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    result_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
     result_code: Mapped[str | None] = mapped_column(String(128))
     error_code: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(String(512))
     started_sequence: Mapped[int | None] = mapped_column(Integer)
     completed_sequence: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (Index("ix_operations_state", "run_id", "status"),)
+    __table_args__ = (
+        Index("ix_operations_state", "run_id", "status"),
+        Index(
+            "uq_flag_submission",
+            "run_id",
+            "unique_code",
+            "arguments_fingerprint",
+            unique=True,
+            sqlite_where=(operation_type == "benchmark_submit_flag"),
+        ),
+    )
 
 
 class AdmissionRecord(Base):
     __tablename__ = "admission_queue"
 
     admission_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
     unique_code: Mapped[str | None] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -620,8 +611,12 @@ class AdmissionRecord(Base):
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reserved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("run_id", "agent_id", name="uq_admission_agent"),
@@ -674,11 +669,17 @@ class ResourceWorkRecord(Base):
 class ResourceSampleRecord(Base):
     __tablename__ = "resource_samples"
 
-    sample_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    sample_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     cpu_percent: Mapped[float] = mapped_column(Float, nullable=False)
     memory_percent: Mapped[float] = mapped_column(Float, nullable=False)
-    sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    sampled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
     __table_args__ = (Index("ix_resource_sample_time", "run_id", "sampled_at"),)
 
@@ -687,13 +688,16 @@ class StateEventRecord(Base):
     __tablename__ = "state_events"
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     agent_id: Mapped[str | None] = mapped_column(String(128))
-    cycle_id: Mapped[str | None] = mapped_column(String(128))
     event_type: Mapped[str] = mapped_column(String(128), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_state_event_sequence"),
@@ -711,8 +715,8 @@ class AuditOutboxRecord(Base):
     sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error: Mapped[str | None] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-
-    __table_args__ = (
-        Index("ix_outbox_pending", "run_id", "sequence"),
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+    __table_args__ = (Index("ix_outbox_pending", "run_id", "sequence"),)

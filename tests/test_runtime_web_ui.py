@@ -32,13 +32,15 @@ def test_workbench_has_chinese_three_panel_contract() -> None:
         assert f'id="{removed_control}"' not in html
 
 
-def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules() -> None:
+def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules() -> (
+    None
+):
     app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
     css = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
     for required in (
-        "challengeAgents",
+        "solverAgents",
         "chiefAgent",
-        "executionChildren",
+        "workerChildren",
         "switchAgent",
         "buildConversationItems",
         "buildRawConversation",
@@ -66,12 +68,12 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
         "operationResultData",
         "runtimeDuration",
         "compareAgentStart",
-        "executionStatusRank",
-        "compareExecutionAgents",
-        "challengeStatusRank",
-        "compareChallengeAgents",
+        "workerStatusRank",
+        "compareWorkers",
+        "solverStatusRank",
+        "compareSolvers",
         "agentStartLabel",
-        "executionAgentName",
+        "workerName",
         "started_at",
         "setupPaneResizers",
         "paneWidthBounds",
@@ -79,25 +81,31 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
         "ArrowRight",
         'conversation-stream").addEventListener("scroll',
         'status === "completed"',
-        'if (content) {',
-        'if (content) {\n          flushToolGroup();',
+        "if (content) {",
+        "if (content) {\n          flushToolGroup();",
         'kind: "answer"',
         'kind: "tool_group"',
         'kind: "report"',
-        'item.events, item.sequenceStart, item.sequenceEnd',
-        'dataset.sequenceStart',
-        'dataset.sequenceEnd',
+        "item.events, item.sequenceStart, item.sequenceEnd",
+        "dataset.sequenceStart",
+        "dataset.sequenceEnd",
     ):
         assert required in app
-    assert 'agent.parent_id === parentId' in app
-    assert '.sort(compareExecutionAgents)' in app
+    assert "agent.parent_id === parentId" in app
+    assert ".sort(compareWorkers)" in app
     assert 'if (["running", "working", "active"].includes(status)) return 0;' in app
     assert 'if (["queued", "pending", "starting"].includes(status)) return 1;' in app
-    assert '.sort(compareChallengeAgents)' in app
-    assert 'if (["running", "working", "active", "waiting"].includes(status)) return 0;' in app
-    assert 'return compareAgentStart(left, right);' in app
-    assert 'latestAgentActivity(right) - latestAgentActivity(left)' not in app
-    assert "grid-template-columns: var(--left-width) minmax(var(--min-center-width), 1fr) var(--right-width)" in css
+    assert ".sort(compareSolvers)" in app
+    assert (
+        'if (["running", "working", "active", "waiting"].includes(status)) return 0;'
+        in app
+    )
+    assert "return compareAgentStart(left, right);" in app
+    assert "latestAgentActivity(right) - latestAgentActivity(left)" not in app
+    assert (
+        "grid-template-columns: var(--left-width) minmax(var(--min-center-width), 1fr) var(--right-width)"
+        in css
+    )
     assert "height: 100vh" in css
     assert ".conversation-stream" in css
     assert ".chief-dock" in css
@@ -111,54 +119,54 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert ".tool-row" in css
     assert ".tool-row-detail-shell" in css
     assert ".tool-detail" in css
-    assert ".agent-icon-challenge" in css
-    assert ".agent-icon-execution" in css
+    assert ".agent-icon-solver" in css
+    assert ".agent-icon-worker" in css
     assert ".agent-icon-chief" in css
-    assert ".agent-icon-bootstrap" in css
-    assert ".agent-icon-exploration" in css
-    assert '/assets/gongji.svg' in css
-    assert '/assets/yewutansuo.svg' in css
     assert ".agent-icon.status-active" in css
     assert ".agent-icon.status-completed" in css
     assert ".agent-icon.status-error" in css
-    assert 'agent?.role !== "execution" || status !== "error"' in app
-    assert '["stopped", "closed", "terminated", "exited"].includes(containerStatus)' in app
+    assert 'agent?.role !== "worker" || status !== "error"' in app
+    assert (
+        '["stopped", "closed", "terminated", "exited"].includes(containerStatus)' in app
+    )
     assert 'return "muted"' in app
     assert '["pending", "queued", "starting", "waiting", "blocked", "stopping"]' in app
-    assert 'if (agent?.role === "challenge" && status === "muted")' in app
-    assert 'controller_cursor' not in (WEB_ROOT / "server.py").read_text(encoding="utf-8")
+    assert 'if (agent?.role === "solver" && status === "muted")' in app
+    assert "controller_cursor" not in (WEB_ROOT / "server.py").read_text(
+        encoding="utf-8"
+    )
     assert 'operation.operation_type === "benchmark_submit_flag"' in app
-    assert 'cumulative_score' in app
+    assert "cumulative_score" in app
     assert '"提交 Flag"' in app
     assert '"获得分数"' in app
     assert '"已运行时长"' in app
-    assert 'if (agent.role === "chief" || agent.role === "challenge")' in app
-    assert 'return `${minutes} 分钟`;' in app
+    assert 'if (agent.role === "chief" || agent.role === "solver")' in app
+    assert "return `${minutes} 分钟`;" in app
     assert "function timestampDate(value)" in app
     assert '`${text.replace(" ", "T")}Z`' in app
     assert 'stat.dataset.runtimeDuration = "true"' in app
     assert "refreshRuntimeDuration()" in app
     for tool_name in (
-        "challenge_get_state",
-        "challenge_wait_for_state",
-        "chief_get_core_state",
-        "execution_get_assignment",
+        "solver_observe",
+        "solver_wait",
+        "chief_observe",
+        "worker_update",
         "skill_read",
         "system_http_request",
         "system_web_fingerprint",
         "tool_result_read",
     ):
         assert f"{tool_name}:" in app
-    assert 'target ? `${toolDisplayName(name)}：${target}` : toolDisplayName(name)' in app
+    assert (
+        "target ? `${toolDisplayName(name)}：${target}` : toolDisplayName(name)" in app
+    )
     assert 'make("small", "", name)' in app
     assert "/assets/Challenge.svg" in css
     assert "/assets/Execution.svg" in css
     assert "/assets/Chief.svg" in css
     assert ".copy-button" in css
-    assert "Exec Agent." in app
-    assert 'if (agent?.kind === "bootstrap") return "Bootstrap";' in app
-    assert 'if (agent?.kind === "exploration") return "探索";' in app
-    assert 'function agentRoleLabel(agent)' in app
+    assert "Worker." in app
+    assert "function agentRoleLabel(agent)" in app
     assert "创建 ${clock(agent.created_at)}" in app
     assert "execution-start-time" not in app
     assert "execution-start-time" not in css
@@ -172,21 +180,23 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert "tool-detail-section-header" in app
     assert ".pane-resizer" in css
     assert 'data-resize="left"' in (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert 'data-resize="right"' in (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'data-resize="right"' in (WEB_ROOT / "index.html").read_text(
+        encoding="utf-8"
+    )
     assert ".tooltip-layer" in css
     assert "scrollbar-gutter: stable" in css
     assert "prefers-reduced-motion" in css
     assert "data-mobile-pane" in css
     assert "makeRobotIcon" not in app
     assert ".robot-icon" not in css
-    assert 'agent-icon.status-active {\n  animation:' not in css
+    assert "agent-icon.status-active {\n  animation:" not in css
     assert "expandedTools" not in app
     assert "expandedProcessing" not in app
     assert "renderToolActivityGroup" not in app
     assert "renderProcessingGroup" not in app
     assert "renderStandaloneProcessing" not in app
     assert "renderPlanning" not in app
-    assert "kind: \"planning\"" not in app
+    assert 'kind: "planning"' not in app
     assert "规划下一步" not in app
     assert ".planning-turn" not in css
     assert ".planning-icon" not in css
@@ -200,7 +210,7 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert ".tool-row.expanded" not in css
     assert 'make("button", "tool-row-head tool-event-head")' in app
     assert 'head.setAttribute("aria-expanded", String(expanded))' in app
-    assert 'renderToolRow(row, groupId)' in app
+    assert "renderToolRow(row, groupId)" in app
     assert 'shell.classList.toggle("is-open", nextExpanded)' in app
     assert 'summary.setAttribute("aria-expanded", String(nextExpanded))' in app
     assert 'head.setAttribute("aria-expanded", String(nextExpanded))' in app
@@ -208,10 +218,10 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert "width: 24px" in css
     assert "height: 24px" in css
     assert "transition: grid-template-rows 220ms" in css
-    assert ".tool-activity-head[aria-expanded=\"true\"] > .chevron" in css
+    assert '.tool-activity-head[aria-expanded="true"] > .chevron' in css
     assert 'summary.setAttribute("aria-expanded", String(expanded))' in app
-    assert 'const groupId = `tool-group-${sequenceStart}-${sequenceEnd}`' in app
-    assert 'wrapper.append(head, shell)' in app
+    assert "const groupId = `tool-group-${sequenceStart}-${sequenceEnd}`" in app
+    assert "wrapper.append(head, shell)" in app
     assert "pause-button" not in app
     assert "follow-button" not in app
     assert "jump-button" not in app
@@ -234,7 +244,15 @@ def test_workbench_frontend_keeps_agent_hierarchy_history_and_conversation_rules
     assert "httpPreviewValue" in app
     assert "http-selection-list" in app
     assert "toolBatchSelections.set(callId, entry.id)" in app
-    for http_field in ("request.headers", "request.cookies", "request.auth", "request.body", "request.query", "args.wait_seconds", "args.session_id"):
+    for http_field in (
+        "request.headers",
+        "request.cookies",
+        "request.auth",
+        "request.body",
+        "request.query",
+        "args.wait_seconds",
+        "args.session_id",
+    ):
         assert http_field in app
     assert '[["packet", "报文"], ["json", "JSON"]]' in app
     assert '[["summary", "摘要"], ["json", "JSON"]]' in app
@@ -263,13 +281,17 @@ def test_workbench_uses_safe_dom_rendering_and_removes_obsolete_event_ui() -> No
     assert "orphan-process-turn" not in app
     assert "orphan-process-turn" not in css
     assert "orphan-process-turn::before" not in css
-    assert 'chief-avatar">A' not in (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'chief-avatar">A' not in (WEB_ROOT / "index.html").read_text(
+        encoding="utf-8"
+    )
     assert ".activity-list" not in css
     assert ".statusbar" in css
     assert "titlebar" not in css
 
 
-def test_workbench_sidebar_can_collapse_selected_challenge_and_logs_transitions() -> None:
+def test_workbench_sidebar_can_collapse_selected_challenge_and_logs_transitions() -> (
+    None
+):
     app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
     server = (WEB_ROOT / "server.py").read_text(encoding="utf-8")
 

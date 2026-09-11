@@ -1,0 +1,41 @@
+rules:
+  - id: python-review-boundary
+    languages: [python]
+    message: Review input origin and authorization at this operation; not a verified vulnerability.
+    severity: INFO
+    pattern-either:
+      - pattern: subprocess.$F(...)
+      - pattern: os.system(...)
+      - pattern: eval(...)
+      - pattern: exec(...)
+      - pattern: pickle.loads(...)
+      - pattern: render_template_string(...)
+      - pattern: open(...)
+      - pattern: $DB.execute(...)
+  - id: php-review-boundary
+    languages: [php]
+    message: Review input origin and authorization at this operation; not a verified vulnerability.
+    severity: INFO
+    pattern-either:
+      - pattern: system(...)
+      - pattern: shell_exec(...)
+      - pattern: eval(...)
+      - pattern: unserialize(...)
+      - pattern: file_get_contents(...)
+      - pattern: file_put_contents(...)
+      - pattern: $DB->query(...)
+      - pattern: $T->render(...)
+  - id: javascript-review-boundary
+    languages: [javascript, typescript]
+    message: Review input origin and authorization at this operation; not a verified vulnerability.
+    severity: INFO
+    pattern-either:
+      - pattern: $CP.exec(...)
+      - pattern: $CP.execSync(...)
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: $FS.readFile(...)
+      - pattern: $FS.readFileSync(...)
+      - pattern: $DB.query(...)
+      - pattern: $T.render(...)
+      - pattern: $S.unserialize(...)

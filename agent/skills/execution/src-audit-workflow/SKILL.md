@@ -1,65 +1,59 @@
 ---
 name: src-audit-workflow
 description: >-
-  Audit an authorized source repository or extracted application bundle by building
-  a bounded inventory, locating routes and trust boundaries, ranking source-level
-  vulnerability hypotheses, and validating only high-signal candidates with the
-  existing HTTP and evidence tools.
+  局部源码审计、文件读取后沿入口引用配置与路径拼接收敛、部分文件覆盖范围。
+  Trace authorized full or partial application source, including files obtained
+  one at a time through a verified file-read capability. Follow entrypoints,
+  imports, configuration and path construction to a reachable goal-related flow.
 ---
 
-# SRC audit workflow
+# Source audit from available evidence
 
-Treat source analysis as hypothesis generation. A code pattern is not a finding
-until the relevant input path, guard, sink, and observable impact are connected.
+Source suggests hypotheses; a finding needs reachable input, guards, operation and
+observable result. A complete repository is useful but is not a prerequisite.
 
-## Preconditions
+## Start with the source actually available
 
-- Confirm the repository or extracted bundle is inside the assigned workspace.
-- Record a bounded file inventory before opening large files.
-- Identify languages, frameworks, build files, routes, API clients, and test data.
-- Read only files needed for the current hypothesis; use paging for large results.
+For a local repository or extracted bundle, make a bounded inventory of languages,
+manifests and entrypoints. For remotely obtained fragments, record the original
+read request, source identity/path if known, local artifact and actual read ranges.
+Do not invent a repository fingerprint or claim complete coverage for partial files.
+A missing include or an unread range remains unknown, not absent from the application.
 
-## Workflow
+## Follow one evidence-supported chain
 
-1. Inventory files, line counts, languages, dependency manifests, and entry points.
-2. Extract routes, handlers, controllers, API paths, client-side endpoints, and
-   authentication middleware.
-3. Search for input sources, authorization checks, dangerous sinks, deserializers,
-   file operations, process execution, redirects, and database queries.
-4. Build a small candidate table with source location, source, sink, missing guard,
-   reachable path, likely impact, confidence, and required validation.
-5. Prioritize candidates that have a concrete caller, a reachable sink, and an
-   observable effect. Do not report a dangerous function in dead code alone.
-6. For one high-signal candidate, use the existing HTTP tools to send the minimum
-   authorized verification request. Poll existing interaction IDs; never replay
-   traffic merely to inspect output.
-7. Compare the verification result with a control request or normal workflow,
-   preserve complete evidence references, and mark the candidate verified,
-   rejected, or inconclusive.
+1. Find the observed route/handler and its input, session and object prerequisites.
+2. Follow concrete references/imports into configuration and the relevant operation.
+   Read only the next referenced file or missing range needed to resolve a question.
+3. For file operations, trace configured base, path joins and the referenced data.
+   Distinguish object IDs, display names and filesystem paths. Mark inferred paths
+   as candidates until a read/control or source relationship verifies them.
+4. Connect source, guard and sink to a reachable request and goal. Compare a direct
+   check enabled by verified file reading with continuing the current business chain.
+   Do not keep enumerating guessed endpoints because a comment mentions approval.
+5. Validate one high-signal candidate using the existing authorized tools, a known
+   control and a minimal request. Inspect returned output before updating conclusions.
 
-## Tool guidance
+Contradictory source, documents and current behavior retain separate source refs.
+Do not assume partial source is deployed unchanged. A dangerous function in dead
+code is not a reachable finding; absence from one fragment excludes no other file.
 
-Use `system_glob`, `system_read_file`, and `system_shell` for bounded local
-inventory and search. Use `system_http_request` for one known request,
-`system_http_analyze` and `system_http_output` for existing interactions, and
-`execution_report` for the final evidence-backed result. Use `pentest_sqlmap` or
-`pentest_dir_fuzz` only when the assignment supplies a precise target and the
-source evidence justifies the check.
+## Tool guidance and stopping
 
-## Stop conditions
+Use system_glob, system_read_file and system_shell for bounded local inspection;
+use the existing verified file-read request for referenced remote files. Use HTTP
+request/output/analysis tools with returned handles rather than replaying traffic to
+read results. Search tool schemas when needed, not new clients or broad scanners.
 
-Stop a branch when the path is unreachable, a guard is confirmed effective, the
-same request shape has already been tested, the target is outside scope, or the
-required source/tool dependency is unavailable. Report the missing dependency;
-do not replace a static observation with an invented exploit result.
+Stop a branch when its specific path is demonstrably unreachable, its guard is
+verified, the goal is verified, or a needed source/control is unavailable. The last
+case is inconclusive. Revisit only for missing coverage, changed conditions or new
+evidence; changing tools or growing dictionaries alone is not new information.
 
-## Required report
+Report available-source identity and scope, examined paths/ranges, the source-to-
+operation chain, facts versus inferred locations, control/result refs, bounded
+conclusion and next uncertainty. Use solver_progress or worker_report for your role.
 
-Include:
+## 离线源码定位
 
-- repository fingerprint and bounded audit scope
-- files, lines, functions, routes, or endpoints examined
-- hypothesis and source-to-sink reasoning
-- control and verification request references, when used
-- status: `supported`, `rejected`, or `inconclusive`
-- exact evidence references and a next step only when new evidence is required
+获取源码后，搜索 system_source_scan 并读取 schema，对工作区源码目录运行离线扫描。通过 system_task_output 读取审计线索与 JSON 产物；再沿输入、校验、调用点和权限检查阅读源码。命中不是已证实漏洞，无命中也不是安全证明。不对整套依赖反复扫描，不把规则当成完整调用链分析器。

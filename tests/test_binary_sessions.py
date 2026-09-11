@@ -85,7 +85,13 @@ def _elf64(path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_linux_process_session_is_binary_safe_and_stateful(tmp_path: Path) -> None:
+async def test_linux_process_session_is_binary_safe_and_stateful(
+    tmp_path: Path, monkeypatch
+) -> None:
+    signals = []
+    monkeypatch.setattr(
+        "tools.binary.session.os.killpg", lambda pid, sig: signals.append((pid, sig))
+    )
     target = tmp_path / "target"
     _elf64(target)
     readers: list[asyncio.StreamReader] = []
@@ -127,6 +133,7 @@ async def test_linux_process_session_is_binary_safe_and_stateful(tmp_path: Path)
     assert bytes(session.writer.sent) == b"\x01\x02"
     assert result["output_base64"] == "AP9kb25l"
     await manager.close_all()
+    assert len(signals) == 2
 
 
 @pytest.mark.asyncio
@@ -141,7 +148,9 @@ async def test_process_session_rejects_non_linux_runner(tmp_path: Path) -> None:
     )
 
     with pytest.raises(BinarySessionError) as error:
-        await manager.open_process(PwnProcessOpenArguments.model_validate({"file_path": "target"}))
+        await manager.open_process(
+            PwnProcessOpenArguments.model_validate({"file_path": "target"})
+        )
 
     assert error.value.code == "linux_execution_required"
 
@@ -152,7 +161,9 @@ async def test_tcp_session_uses_bounded_binary_io() -> None:
     writer = FakeWriter()
     reader.feed_data(b"OK\x00\xff\n")
 
-    async def connection_factory(*_: Any, **__: Any) -> tuple[asyncio.StreamReader, FakeWriter]:
+    async def connection_factory(
+        *_: Any, **__: Any
+    ) -> tuple[asyncio.StreamReader, FakeWriter]:
         return reader, writer
 
     manager = BinarySessionManager(
@@ -160,7 +171,9 @@ async def test_tcp_session_uses_bounded_binary_io() -> None:
         platform_name="Darwin",
         connection_factory=connection_factory,
     )
-    opened = await manager.open_tcp(PwnTcpOpenArguments.model_validate({"host": "127.0.0.1", "port": 1}))
+    opened = await manager.open_tcp(
+        PwnTcpOpenArguments.model_validate({"host": "127.0.0.1", "port": 1})
+    )
     result = await manager.io(
         PwnSessionIoArguments.model_validate(
             {"session_id": opened["session_id"], "max_bytes": 32}

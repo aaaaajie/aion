@@ -1,4 +1,4 @@
-"""Offline scheduling, resource admission, and stagnation control."""
+"""Explicit Agent and technical resource admission."""
 
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ from .models import (
     ChallengeRecord,
     FindingRecord,
     ResourceWorkRecord,
+    RunRecord,
 )
 from .resources import challenge_work_active
-from .service import ACTIVE_EXECUTION_STATUSES, StateService, derive_phase
+from .service import StateService
 
 
 DIFFICULTY_RANK = {"easy": 0, "medium": 1, "hard": 2}
@@ -73,7 +74,9 @@ class ResourceController:
                 await self.sample()
                 await asyncio.sleep(interval_seconds)
 
-        self._sampling_task = asyncio.create_task(loop(), name=f"aion-resource-sampler-{self.run_id}")
+        self._sampling_task = asyncio.create_task(
+            loop(), name=f"aion-resource-sampler-{self.run_id}"
+        )
 
     async def stop_sampling(self) -> None:
         if self._sampling_task is None:
@@ -106,10 +109,33 @@ class ResourceController:
             async with self.service.db.sessions.begin() as session:
                 agent = await session.get(AgentRecord, agent_id)
                 if agent is None or agent.run_id != self.run_id:
-                    return {"ok": False, "code": "agent_not_found", "reason": "agent was not found"}
-                admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
+                    return {
+                        "ok": False,
+                        "code": "agent_not_found",
+                        "reason": "agent was not found",
+                    }
+                run = await session.get(RunRecord, self.run_id)
+                if run.status != "active" or now >= aware(run.deadline_at):
+                    return {
+                        "ok": False,
+                        "code": "run_inactive",
+                        "reason": "Run is paused or has ended",
+                    }
+                admission = await session.scalar(
+                    select(AdmissionRecord).where(
+                        AdmissionRecord.run_id == self.run_id,
+                        AdmissionRecord.agent_id == agent_id,
+                    )
+                )
                 if admission is None:
-                    admission = AdmissionRecord(admission_id=f"admission_{uuid4().hex}", run_id=self.run_id, agent_id=agent_id, unique_code=agent.unique_code, role=agent.role, priority=agent.priority)
+                    admission = AdmissionRecord(
+                        admission_id=f"admission_{uuid4().hex}",
+                        run_id=self.run_id,
+                        agent_id=agent_id,
+                        unique_code=agent.unique_code,
+                        role=agent.role,
+                        priority=agent.priority,
+                    )
                     session.add(admission)
                 if admission.status in {"starting", "running"}:
                     return {
@@ -118,7 +144,7 @@ class ResourceController:
                         "status": admission.status,
                         "admission_id": admission.admission_id,
                     }
-                # A queued Bootstrap can outlive a failed/closed Challenge
+                # A queued Worker can outlive a failed/closed Solver
                 # during startup.  Re-check ownership at the point of
                 # reservation so the scheduler never launches an orphan.
                 if agent.status not in {"queued", "pending"}:
@@ -136,8 +162,17 @@ class ResourceController:
                     if (
                         parent is None
                         or parent.run_id != self.run_id
-                        or parent.role != "challenge"
-                        or parent.status in {"failed", "stopped", "completed", "cancelled", "interrupted"}
+                        or parent.role != "solver"
+                        or parent.status
+                        in {
+                            "failed",
+                            "stopped",
+                            "completed",
+                            "cancelled",
+                            "interrupted",
+                            "paused",
+                            "blocked",
+                        }
                     ):
                         if admission.status == "queued":
                             admission.status = "cancelled"
@@ -159,8 +194,26 @@ class ResourceController:
                     admission.reason = reason
                     admission.retry_at = now + timedelta(seconds=0.5)
                     admission.updated_at = now
-                    await self.service._event(session, self.run_id, "agent_admission_queued", {"agent_id": agent_id, "reason": reason, "cpu_percent": cpu, "memory_percent": memory})
-                    return {"ok": False, "status": "queued", "admission_id": admission.admission_id, "retry_at": admission.retry_at.isoformat(), "reason": reason, "cpu_percent": cpu, "memory_percent": memory}
+                    await self.service._event(
+                        session,
+                        self.run_id,
+                        "agent_admission_queued",
+                        {
+                            "agent_id": agent_id,
+                            "reason": reason,
+                            "cpu_percent": cpu,
+                            "memory_percent": memory,
+                        },
+                    )
+                    return {
+                        "ok": False,
+                        "status": "queued",
+                        "admission_id": admission.admission_id,
+                        "retry_at": admission.retry_at.isoformat(),
+                        "reason": reason,
+                        "cpu_percent": cpu,
+                        "memory_percent": memory,
+                    }
                 admission.status = "starting"
                 admission.reason = None
                 admission.retry_at = None
@@ -196,16 +249,38 @@ class ResourceController:
         async with self._lock:
             event_sequence: int | None = None
             async with self.service.db.sessions.begin() as session:
-                admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
+                admission = await session.scalar(
+                    select(AdmissionRecord).where(
+                        AdmissionRecord.run_id == self.run_id,
+                        AdmissionRecord.agent_id == agent_id,
+                    )
+                )
                 if admission is None:
                     return {"ok": False, "code": "admission_not_found"}
+                if admission.status in {"completed", "cancelled", "failed"}:
+                    return {
+                        "ok": True,
+                        "status": admission.status,
+                        "admission_id": admission.admission_id,
+                    }
                 admission.status = "running"
                 admission.started_at = self.clock()
                 admission.updated_at = self.clock()
-                event_sequence = await self.service._event(session, self.run_id, "agent_started", {"agent_id": agent_id, "admission_id": admission.admission_id})
-                result = {"ok": True, "status": "running", "admission_id": admission.admission_id}
+                event_sequence = await self.service._event(
+                    session,
+                    self.run_id,
+                    "agent_started",
+                    {"agent_id": agent_id, "admission_id": admission.admission_id},
+                )
+                result = {
+                    "ok": True,
+                    "status": "running",
+                    "admission_id": admission.admission_id,
+                }
             if event_sequence is not None:
-                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
+                await self.service.notifier.notify(
+                    self.service.run_signal_key(self.run_id), event_sequence
+                )
             return result
 
     async def next_queued_agent_id(self) -> str | None:
@@ -239,7 +314,9 @@ class ResourceController:
                     ResourceWorkRecord.run_id == self.run_id,
                     ResourceWorkRecord.status == "queued",
                 )
-                .order_by(ResourceWorkRecord.priority.desc(), ResourceWorkRecord.created_at)
+                .order_by(
+                    ResourceWorkRecord.priority.desc(), ResourceWorkRecord.created_at
+                )
                 .limit(1)
             )
             if agent is None and work is None:
@@ -274,7 +351,9 @@ class ResourceController:
                     ResourceWorkRecord.run_id == self.run_id,
                     ResourceWorkRecord.status == "queued",
                 )
-                .order_by(ResourceWorkRecord.priority.desc(), ResourceWorkRecord.created_at)
+                .order_by(
+                    ResourceWorkRecord.priority.desc(), ResourceWorkRecord.created_at
+                )
                 .limit(1)
             )
             if work is None:
@@ -440,269 +519,48 @@ class ResourceController:
                     {"agent_id": agent_id, "reason": admission.reason},
                     agent_id=agent_id,
                 )
-                result = {"ok": True, "status": "failed", "admission_id": admission.admission_id}
+                result = {
+                    "ok": True,
+                    "status": "failed",
+                    "admission_id": admission.admission_id,
+                }
             if event_sequence is not None:
-                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
+                await self.service.notifier.notify(
+                    self.service.run_signal_key(self.run_id), event_sequence
+                )
             return result
 
-    async def finish(self, agent_id: str, *, status: str = "completed") -> dict[str, Any]:
+    async def finish(
+        self, agent_id: str, *, status: str = "completed"
+    ) -> dict[str, Any]:
         async with self._lock:
             event_sequence: int | None = None
             async with self.service.db.sessions.begin() as session:
-                admission = await session.scalar(select(AdmissionRecord).where(AdmissionRecord.run_id == self.run_id, AdmissionRecord.agent_id == agent_id))
+                admission = await session.scalar(
+                    select(AdmissionRecord).where(
+                        AdmissionRecord.run_id == self.run_id,
+                        AdmissionRecord.agent_id == agent_id,
+                    )
+                )
                 if admission is None:
                     return {"ok": False, "code": "admission_not_found"}
                 changed = admission.status != status
                 admission.status = status
                 admission.updated_at = self.clock()
                 if changed:
-                    event_sequence = await self.service._event(session, self.run_id, "agent_admission_finished", {"agent_id": agent_id, "status": status})
-                result = {"ok": True, "status": status, "admission_id": admission.admission_id}
-            if event_sequence is not None:
-                await self.service.notifier.notify(self.service.run_signal_key(self.run_id), event_sequence)
-            return result
-
-class StagnationManager:
-    """Turn prolonged lack of progress into a soft signal, then a hard pause."""
-
-    LOW_YIELD_SECONDS = 8 * 60
-    PAUSE_SECONDS = 15 * 60
-    STAGNATION_PAUSE_REASON = "stagnation_timeout"
-
-    def __init__(
-        self,
-        service: StateService,
-        *,
-        clock: Callable[[], datetime] = utc_now,
-    ) -> None:
-        self.service = service
-        self.clock = clock
-        self._lock = asyncio.Lock()
-
-    async def evaluate(self, run_id: str, unique_code: str) -> dict[str, Any]:
-        async with self._lock:
-            result: dict[str, Any]
-            async with self.service.db.sessions.begin() as session:
-                challenge = await self.service._require_challenge(
-                    session, run_id, unique_code
-                )
-                if (
-                    not challenge_work_active(challenge)
-                    or challenge.is_completed
-                    or challenge.work_status == "closed"
-                ):
-                    result = {
-                        "unique_code": unique_code,
-                        "status": challenge.work_status,
-                        "elapsed_seconds": 0,
-                        "action": "none",
-                    }
-                else:
-                    now = aware(self.clock())
-                    baseline = challenge.last_progress_at or challenge.active_since
-                    elapsed = (
-                        max(0, int((now - aware(baseline)).total_seconds()))
-                        if baseline is not None
-                        else 0
+                    event_sequence = await self.service._event(
+                        session,
+                        self.run_id,
+                        "agent_admission_finished",
+                        {"agent_id": agent_id, "status": status},
                     )
-                    if elapsed < self.LOW_YIELD_SECONDS:
-                        result = {
-                            "unique_code": unique_code,
-                            "status": challenge.work_status,
-                            "elapsed_seconds": elapsed,
-                            "action": "none",
-                        }
-                    narrow_work_active = False
-                    if elapsed >= self.PAUSE_SECONDS and challenge.stagnation_level < 2:
-                        narrow_work_active = (
-                            await session.scalar(
-                                select(AgentRecord.agent_id)
-                                .where(
-                                    AgentRecord.run_id == run_id,
-                                    AgentRecord.unique_code == unique_code,
-                                    AgentRecord.role == "execution",
-                                    AgentRecord.kind != "bootstrap",
-                                    AgentRecord.task_stage.in_(
-                                        ["validation", "exploitation", "post_exploitation"]
-                                    ),
-                                    AgentRecord.status.in_(
-                                        sorted(ACTIVE_EXECUTION_STATUSES)
-                                    ),
-                                )
-                                .limit(1)
-                            )
-                            is not None
-                        )
-                    if (
-                        elapsed >= self.PAUSE_SECONDS
-                        and challenge.stagnation_level < 2
-                        and not narrow_work_active
-                    ):
-                        self.service._freeze_exploration(challenge)
-                        challenge.stagnation_level = 2
-                        challenge.work_status = "paused"
-                        challenge.paused_at = now
-                        challenge.pause_reason = self.STAGNATION_PAUSE_REASON
-                        challenge.version += 1
-                        event_sequence = await self.service._event(
-                            session,
-                            run_id,
-                            "challenge_stagnation_paused",
-                            {
-                                "unique_code": unique_code,
-                                "elapsed_seconds": elapsed,
-                                "pause_reason": self.STAGNATION_PAUSE_REASON,
-                            },
-                        )
-                        result = {
-                            "unique_code": unique_code,
-                            "status": challenge.work_status,
-                            "elapsed_seconds": elapsed,
-                            "action": "pause_stagnation",
-                            "pause_reason": self.STAGNATION_PAUSE_REASON,
-                            "event_sequence": event_sequence,
-                        }
-                    elif challenge.stagnation_level < 1:
-                        challenge.stagnation_level = 1
-                        challenge.version += 1
-                        event_sequence = await self.service._event(
-                            session,
-                            run_id,
-                            "challenge_low_yield",
-                            {
-                                "unique_code": unique_code,
-                                "elapsed_seconds": elapsed,
-                            },
-                        )
-                        result = {
-                            "unique_code": unique_code,
-                            "status": challenge.work_status,
-                            "elapsed_seconds": elapsed,
-                            "action": "low_yield",
-                            "event_sequence": event_sequence,
-                        }
-                    else:
-                        result = {
-                            "unique_code": unique_code,
-                            "status": challenge.work_status,
-                            "elapsed_seconds": elapsed,
-                            "action": "none",
-                        }
-            if result["action"] not in {"low_yield", "pause_stagnation"}:
-                return result
-            overview = await self.service.get_overview(run_id)
-            chief = next(
-                (item for item in overview["agents"] if item["role"] == "chief"),
-                None,
-            )
-            controller = next(
-                (
-                    item
-                    for item in overview["agents"]
-                    if item["role"] == "challenge"
-                    and item["unique_code"] == unique_code
-                ),
-                None,
-            )
-            if chief is not None and controller is not None:
-                report = await self.service.publish_control_report(
-                    run_id,
-                    sender_id=controller["agent_id"],
-                    recipient_id=chief["agent_id"],
-                    unique_code=unique_code,
-                    report_type="challenge_status",
-                    status=(
-                        "stagnation_paused"
-                        if result["action"] == "pause_stagnation"
-                        else "low_yield"
-                    ),
-                    payload={
-                        "type": (
-                            "challenge_stagnation_paused"
-                            if result["action"] == "pause_stagnation"
-                            else "challenge_low_yield"
-                        ),
-                        "unique_code": unique_code,
-                        "elapsed_seconds": result["elapsed_seconds"],
-                        **(
-                            {"pause_reason": result["pause_reason"]}
-                            if result["action"] == "pause_stagnation"
-                            else {}
-                        ),
-                    },
-                )
-                result["chief_report_ref"] = report["report_ref"]
-            return result
-
-
-class ChallengeScheduler:
-    """Stable phase-aware challenge selection."""
-
-    def __init__(self, service: StateService, *, clock: Callable[[], datetime] = utc_now) -> None:
-        self.service = service
-        self.clock = clock
-
-    async def select(self, run_id: str, *, limit: int = 3) -> list[dict[str, Any]]:
-        async with self.service.db.sessions() as session:
-            run = await self.service._require_run(session, run_id)
-            unfinished = list((await session.scalars(select(ChallengeRecord).where(ChallengeRecord.run_id == run_id, ChallengeRecord.is_completed.is_(False)))).all())
-            runnable = [
-                item
-                for item in unfinished
-                if item.work_status not in {"paused", "completed", "closed"}
-            ]
-            paused = [item for item in unfinished if item.work_status == "paused"]
-            restart_required = not runnable and bool(paused)
-            phase = derive_phase(run.started_at, run.deadline_at, self.clock())
-            remaining_seconds = max(
-                0,
-                int((aware(run.deadline_at) - aware(self.clock())).total_seconds()),
-            )
-            late_rotation = remaining_seconds <= 90 * 60
-            if late_rotation:
-                challenges = [*runnable, *paused]
-            else:
-                challenges = paused if restart_required else runnable
-            if phase == "early":
-                selected = self._early(challenges, limit)
-            elif phase == "mid" and not late_rotation:
-                selected = sorted(challenges, key=self._mid_key, reverse=True)[:limit]
-            else:
-                candidate_codes = set((await session.scalars(select(FindingRecord.unique_code).where(FindingRecord.run_id == run_id, FindingRecord.category == "flag", FindingRecord.verification_status.in_(["candidate", "verified"])))).all())
-                selected = sorted(challenges, key=lambda item: self._late_key(item, candidate_codes), reverse=True)[:limit]
-            result = [
-                self.service._challenge_dict(item, run=run, now=self.clock())
-                for item in selected
-            ]
-            for item in result:
-                item["restart_required"] = bool(
-                    item["work_status"] == "paused"
-                    and (restart_required or late_rotation)
+                result = {
+                    "ok": True,
+                    "status": status,
+                    "admission_id": admission.admission_id,
+                }
+            if event_sequence is not None:
+                await self.service.notifier.notify(
+                    self.service.run_signal_key(self.run_id), event_sequence
                 )
             return result
-
-    async def choose_one(self, run_id: str) -> dict[str, Any] | None:
-        values = await self.select(run_id, limit=1)
-        return values[0] if values else None
-
-    def _early(self, values: list[ChallengeRecord], limit: int) -> list[ChallengeRecord]:
-        ordered = sorted(
-            values,
-            key=lambda item: (
-                DIFFICULTY_RANK.get(item.difficulty, 99),
-                -item.total_score,
-                item.unique_code,
-            ),
-        )
-        return ordered[:limit]
-
-    @staticmethod
-    def _mid_key(item: ChallengeRecord) -> tuple[Any, ...]:
-        progress = aware(item.last_progress_at).timestamp() if item.last_progress_at else 0
-        completion = item.correct_flag_count / item.flag_count if item.flag_count else 0
-        return (progress > 0, completion, progress, item.total_score, -DIFFICULTY_RANK.get(item.difficulty, 99), item.unique_code)
-
-    @staticmethod
-    def _late_key(item: ChallengeRecord, candidate_codes: set[str] | None = None) -> tuple[Any, ...]:
-        completion = item.correct_flag_count / item.flag_count if item.flag_count else 0
-        return (item.unique_code in (candidate_codes or set()), item.hint_eligible, item.correct_flag_count > 0, completion, item.total_score, -DIFFICULTY_RANK.get(item.difficulty, 99), item.unique_code)

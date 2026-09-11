@@ -20,3 +20,26 @@ immutable Catalog.
 Preserve facts from the checkpoint. Do not invent results. Keep each section concise
 and keep the whole document below the supplied budget. This is a single-run memory;
 do not write user-level or cross-task memories.
+Preserve official hints with their report IDs or sequence references, their effect on
+the current hypothesis, and any unresolved prerequisites. Receipt is not adoption.
+Distinguish a failed valid experiment from one not run, timed out, using an expired
+session, or whose output was not read. Preserve material conflicts between hints,
+source and observed behavior; never replace them with an assumed implementation.
+Preserve experiment_reviews: hypothesis IDs, covered_sequences, assessment, summary, next_test, nested validation
+(conclusion_sequences, control_evidence_refs, calibration_basis or calibration_sequences),
+unresolved reviews and revoked_sequences. Skills remain independently tracked.
+These are Solver declarations, not authoritative technical findings. Revoked event
+sequences and their dependent batch conclusions must be removed as supporting
+evidence and recorded under Errors & Corrections. Preserve the distinction between
+inconclusive execution and a valid negative result, even after context compression.
+
+Preserve solver_review assessments separately from execution facts. Inconclusive reviews require no calibration or Skill adoption and do not establish negative conclusions. Ordinary information assessments need no calibration and do not by themselves prove a conclusion. Distinct no_new_information and inconclusive attempts both count toward stagnation; uncertainty alone does not reset it. Preserve stagnation separately from validity. Preserve environment dependence, accumulated HTTP/deferred output reading, calibration dependencies, revocations and optional observer revision/assessment pairs. Use solver_review.covered_sequences to acknowledge reviewed execution results.
+
+Within the existing headings, keep a compact evidence/work record:
+- Current State: current goal, verified capabilities and the key unresolved premise. After a new capability, preserve the shortest evidence-supported goal check and its prerequisites.
+- Important Observations: observations with source refs and tested input, endpoint, client, identity and environment; distinguish hypotheses and bounded negative conclusions. A document or page comment remains a lead until current behavior verifies it.
+- Workflow/Worklog: event sequence numbers identify evidence events, never target object IDs. Preserve actual returned object IDs separately; if none is supplied, leave it unknown rather than incrementing an event sequence. Keep exact file/output paths, observed read ranges, tested scope and control results. Claim complete reading only from actual read receipts, not commands or assertions.
+- Errors & Corrections: observed failures, unmet prerequisites, revoked sequences and dependent conclusions. A single connection failure is not a lasting network restriction; one input without a difference does not exclude an entire mechanism. On environment or identity changes, mark only dependent conclusions for recalibration.
+- Next Steps: the smallest distinguishing experiment. After two valid tests add no information, preserve the premise to reassess and what new evidence would justify continuing. Changing tools or scale alone is not a new hypothesis. Preserve relevant Skill search results and active IDs/hashes; do not copy instructions or repeat an unchanged unsuccessful search.
+
+Keep implementation failures and unverified branches inconclusive, separate from valid negative results. Preserve why rereading/retesting is needed (missing range, new question, changed conditions). Preserve pending observer correction IDs and supporting evidence, distinguishing Solver feedback from execution-supported resolution. Recompute Next Steps from corrected premises: a stale proposed action is not an instruction to preserve. If an applicable Skill is active, lack of execution tools is not a method gap or a reason to repeat Skill search. Reuse entries instead of repeating them, within the existing total budget and headings.

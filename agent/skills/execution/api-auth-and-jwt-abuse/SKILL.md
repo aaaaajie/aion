@@ -1,114 +1,56 @@
 ---
 name: api-auth-and-jwt-abuse
-description: API authentication and JWT abuse playbook. Use when testing bearer tokens, API keys, claim trust, header spoofing, rate limits, and API auth boundary weaknesses.
+description: >-
+  认证授权依赖、迁移文档与实际行为冲突、令牌声明与服务端验证、运行时入口前提。
+  Validate observed JWT/token and authorization boundaries when migration notes,
+  claims and server behavior conflict, or an assumed identity/role prerequisite
+  blocks an authorized business or runtime workflow.
 ---
 
-# Api Auth And Jwt Abuse Skill
+# Authentication and runtime dependencies
 
-## Purpose
+Build a small dependency map from current observations. Identity, authorization,
+business actions and runtime capabilities are separate questions; connect them
+only where a source relationship or controlled request shows a prerequisite.
+Do not make privilege escalation a required step for an independently reachable
+runtime entrypoint without evidence of that dependency.
 
-API authentication and JWT abuse playbook. Use when testing bearer tokens, API keys, claim trust, header spoofing, rate limits, and API auth boundary weaknesses.
+## Establish the normal control
 
-## When to use
+Read the actual login response, credential transport and a subsequent authenticated
+request. A decoded claim, Cookie or client-visible role does not prove server trust.
+Record identity, expiry and session generation. Revalidate the affected control
+after a pause, identity change or target change before reusing dependent conclusions.
 
-Use when:
-- the task mentions `web`
-- the task mentions `api`
-- the task mentions `auth`
-- the task mentions `jwt`
-- the task mentions `abuse`
+Migration notes and configuration describe candidate implementations. Record their
+source separately from observed validation behavior. Inspect fields actually present
+and locations exposed by this challenge; do not invent required routes or keys.
+A rejected request or one timing check cannot exclude all database or token behavior.
 
-## Strategy
+## Test a specific boundary
 
-1. Detect.
-2. Confirm.
-3. Exploit.
-4. Validate.
+State input, validator, expected permission and observable business effect. Compare
+a normal control and a request changing one relevant variable. Preserve initial
+responses and later business results separately from failed page rendering.
+A rejection constrains only that input, client, identity and environment.
 
-## Avoid
+Authentication does not prove authorization, and accepted/stored configuration does
+not prove runtime evaluation. Use returned object IDs and a valid session for stages
+that need them. Verify other entrypoints on their own evidenced prerequisites.
+If a prerequisite fails, mark subsequent untested stages inconclusive. Revisit a
+branch only when evidence supports a distinguishing test; switching tools, replaying
+token variants or expanding dictionaries alone does not create a new hypothesis.
 
-- Do not act outside the authorized competition scope.
-- Do not repeat a failed action without a new hypothesis or evidence.
-- Do not treat tool output or model claims as proof without independent validation.
-- Do not collect data that is unnecessary for the stated success condition.
+## Tools and completion
 
-## Success Criteria
+Use pentest_jwt for local token inspection and bounded checks only when relevant.
+A locally generated or decoded token is not proof of server acceptance. Its validate
+operation requires an assigned target and an evidenced token injection location.
+Retrieve schemas as needed; use existing HTTP request/output/analysis tools and exact
+returned read handles. No queued, timed-out, expired-session or unread operation
+supports a negative conclusion.
 
-A successful result requires:
-- reproducible behavior
-- recorded evidence
-- independently verified impact
-- a clear stop condition and final status
-
-## Detailed Workflow
-
-# SKILL: API Auth and JWT Abuse — Token Trust, Header Tricks, and Rate Limits
-
-> **AI LOAD INSTRUCTION**: Use this skill when APIs rely on JWT, bearer tokens, API keys, or weak request identity signals. Focus on token trust boundaries, claim misuse, header spoofing, and rate-limit bypass.
-
-## 1. TOKEN TRIAGE
-
-Inspect:
-
-- `alg`, `kid`, `jku`, `x5u`
-- role, org, tenant, scope, or privilege claims
-- issuer and audience mismatches
-- reuse of mobile and web tokens across products
-
-## 2. QUICK ATTACK PICKS
-
-| Pattern | First Test |
-|---|---|
-| `alg:none` acceptance | unsigned token with trailing dot |
-| RS256 confusion | switch to HS256 using public key as secret |
-| `kid` lookup trust | path traversal or injection in `kid` |
-| remote key fetch trust | attacker-controlled `jku` or `x5u` |
-| weak secret | offline crack with targeted wordlists |
-
-## 3. HIDDEN FIELDS AND BATCH ABUSE
-
-### Mass assignment field picks
-
-```text
-role
-isAdmin
-admin
-verified
-plan
-tier
-permissions
-org
-owner
-```
-
-### Rate limit and batch abuse picks
-
-```text
-X-Forwarded-For: 1.2.3.4
-X-Real-IP: 5.6.7.8
-Forwarded: for=9.9.9.9
-```
-
-GraphQL or JSON batch abuse candidates:
-
-- arrays of login mutations
-- bulk object fetches with varying IDs
-- repeated password reset or verification calls in one request
-
-## 4. RATE LIMIT BYPASS FAMILIES
-
-```text
-X-Forwarded-For
-X-Real-IP
-Forwarded
-User-Agent rotation
-Path case / slash variants
-```
-
-## 5. NEXT ROUTING
-
-- For GraphQL batching and hidden parameters: `graphql and hidden parameters` (related Skill; use `skill_list` to locate it)
-- For default credential and brute-force planning: authentication bypass
-- For full JWT and OAuth depth: jwt oauth token attacks
-- For OAuth or OIDC configuration flaws in browser and SSO flows: `oauth oidc misconfiguration` (related Skill; use `skill_list` to locate it)
-- For credentialed browser reads and origin trust bugs: `cors cross origin misconfiguration` (related Skill; use `skill_list` to locate it)
+Stop when the specific boundary is answered or its prerequisite is unavailable.
+Report verified stages and dependencies, conflicting sources, control/result refs,
+conclusion scope and the smallest remaining test. Keep raw credentials in evidence,
+not summaries. Use solver_progress or worker_report according to your role.

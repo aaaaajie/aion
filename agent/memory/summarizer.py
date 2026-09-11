@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from agent.model_usage import post_model
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 from time import monotonic
@@ -17,7 +19,7 @@ from agent.config import (
 )
 from agent.prompts import load_prompt
 
-from .context import normalize_session_memory, truncate_text
+from .context import normalize_session_memory, rough_token_count, truncate_text
 
 
 class SummarizerError(RuntimeError):
@@ -30,8 +32,10 @@ class SessionMemorySummarizer:
         settings: AgentSettings,
         *,
         client: httpx.AsyncClient | None = None,
+        event_writer=None,
     ) -> None:
         self.settings = settings
+        self.event_writer = event_writer
         self._client = client
         self._owns_client = client is None
         self.last_metrics: dict[str, Any] = {}
@@ -61,27 +65,22 @@ class SessionMemorySummarizer:
             recent_events=recent_events,
         )
         payload: Any = None
-        attempts = 0
-        retry_delay_ms = 0
+        attempts = 1
         response_status: int | None = None
         started = monotonic()
         summary_deadline = asyncio.get_running_loop().time() + 20.0
         if deadline_monotonic is not None:
             summary_deadline = min(summary_deadline, deadline_monotonic)
-        while attempts < 2:
-            attempts += 1
-            try:
-                remaining = summary_deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    self.last_metrics = {
-                        "attempts": attempts,
-                        "retry_delay_ms": retry_delay_ms,
-                        "http_status": response_status,
-                        "latency_ms": int((monotonic() - started) * 1_000),
-                    }
-                    raise SummarizerError("The Run deadline has expired")
-                request = client.post(
+        try:
+            remaining = summary_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise SummarizerError("The Run deadline has expired")
+            response = await asyncio.wait_for(
+                post_model(
+                    client,
                     completions_url(self.settings.llm_base_url),
+                    event_writer=self.event_writer,
+                    purpose="memory",
                     headers={
                         "Authorization": f"Bearer {self.settings.llm_api_key.get_secret_value()}",
                         "Content-Type": "application/json",
@@ -89,83 +88,59 @@ class SessionMemorySummarizer:
                     json={
                         "model": self.settings.llm_model,
                         "messages": [
-                            {
-                                "role": "system",
-                                "content": load_prompt("session_memory_system.txt"),
-                            },
+                            {"role": "system", "content": load_prompt("session_memory_system.txt")},
                             {"role": "user", "content": prompt},
                         ],
                         **deepseek_auxiliary_request_options(),
                         "max_tokens": self.settings.context_budget.summary_max_output_tokens,
                     },
-                )
-                response = (
-                    await asyncio.wait_for(request, timeout=remaining)
-                    if remaining is not None
-                    else await request
-                )
-                response_status = response.status_code
-                response.raise_for_status()
-                payload = response.json()
-                break
-            except (httpx.HTTPError, ValueError, asyncio.TimeoutError) as exc:
-                status = (
-                    exc.response.status_code
-                    if isinstance(exc, httpx.HTTPStatusError)
-                    else None
-                )
-                retryable = isinstance(exc, (httpx.TransportError, asyncio.TimeoutError)) or status in {
-                    408,
-                    429,
-                    500,
-                    502,
-                    503,
-                    504,
-                }
-                if not retryable or attempts >= 2:
-                    self.last_metrics = {
-                        "attempts": attempts,
-                        "retry_delay_ms": retry_delay_ms,
-                        "http_status": status,
-                        "latency_ms": int((monotonic() - started) * 1_000),
-                    }
-                    raise SummarizerError(
-                        f"session memory request failed ({status or 'transport'})"
-                    ) from exc
-                retry_after = 0.0
-                if isinstance(exc, httpx.HTTPStatusError):
-                    try:
-                        retry_after = float(exc.response.headers.get("Retry-After", "0"))
-                    except ValueError:
-                        retry_after = 0.0
-                delay = min(2.0, max(retry_after, 0.25))
-                if (
-                    asyncio.get_running_loop().time() + delay >= summary_deadline
-                ):
-                    self.last_metrics = {
-                        "attempts": attempts,
-                        "retry_delay_ms": retry_delay_ms,
-                        "http_status": status,
-                        "latency_ms": int((monotonic() - started) * 1_000),
-                    }
-                    raise SummarizerError(
-                        "session memory retry would exceed the Run deadline"
-                    ) from exc
-                retry_delay_ms += int(delay * 1_000)
-                await asyncio.sleep(delay)
+                ),
+                timeout=remaining,
+            )
+            response_status = response.status_code
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, asyncio.TimeoutError) as exc:
+            status = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None
+            )
+            self.last_metrics = {
+                "attempts": attempts,
+                "http_status": status,
+                "latency_ms": int((monotonic() - started) * 1_000),
+            }
+            raise SummarizerError(
+                f"session memory request failed ({status or 'transport'})"
+            ) from exc
+        except SummarizerError:
+            self.last_metrics = {
+                "attempts": attempts,
+                "http_status": response_status,
+                "latency_ms": int((monotonic() - started) * 1_000),
+            }
+            raise
 
         self.last_metrics = {
             "attempts": attempts,
-            "retry_delay_ms": retry_delay_ms,
             "http_status": response_status,
             "latency_ms": int((monotonic() - started) * 1_000),
         }
         try:
-            content = payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            if finish_reason in {"length", "max_tokens", "truncated"}:
+                raise SummarizerError(
+                    f"session memory response was truncated ({finish_reason})"
+                )
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise SummarizerError("session memory response was invalid") from exc
         if not isinstance(content, str) or not content.strip():
             raise SummarizerError("session memory response was empty")
+        if rough_token_count(content) > self.settings.context_budget.summary_max_output_tokens:
+            raise SummarizerError("session memory response exceeded its output budget")
         normalized, _ = normalize_session_memory(
             content,
             max_tokens=self.settings.context_budget.session_memory_max_tokens,
@@ -180,17 +155,106 @@ class SessionMemorySummarizer:
         recent_messages: Sequence[Mapping[str, Any]],
         recent_events: Sequence[Mapping[str, Any]],
     ) -> str:
+        compact_events = [SessionMemorySummarizer._compact_event(event) for event in recent_events[-60:]]
+        compact_messages = [
+            item
+            for item in (
+                SessionMemorySummarizer._compact_message(message)
+                for message in recent_messages[-60:]
+            )
+            if item
+        ]
+        compact_events, compact_messages = SessionMemorySummarizer._bound_recent(
+            compact_events, compact_messages, max_tokens=8_000
+        )
         return "\n\n".join(
             [
-                "Current memory:\n" + truncate_text(current_memory, 36_000),
-                "Checkpoint:\n" + json.dumps(checkpoint, ensure_ascii=False, default=str),
-                "Recent events:\n" + truncate_text(
-                    json.dumps(list(recent_events), ensure_ascii=False, default=str),
-                    48_000,
-                ),
-                "Recent conversation:\n" + truncate_text(
-                    json.dumps(list(recent_messages), ensure_ascii=False, default=str),
-                    48_000,
-                ),
+                "Current memory:\n" + truncate_text(current_memory, 24_000),
+                "Checkpoint:\n" + truncate_text(json.dumps(checkpoint, ensure_ascii=False, default=str), 8_000),
+                "Recent events:\n" + json.dumps(compact_events, ensure_ascii=False, default=str),
+                "Recent conversation:\n" + json.dumps(compact_messages, ensure_ascii=False, default=str),
             ]
         )
+
+    @staticmethod
+    def _bound_recent(
+        events: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Keep the newest compact records under the shared recent-input budget."""
+        while rough_token_count((events, messages)) > max_tokens:
+            if events and (not messages or len(events) >= len(messages)):
+                events.pop(0)
+            elif messages:
+                messages.pop(0)
+            else:
+                break
+        return events, messages
+
+    @staticmethod
+    def _compact_event(event: Mapping[str, Any]) -> dict[str, Any]:
+        # Persisted events use ``payload``; replay fixtures and a few legacy
+        # records carry their useful text in ``content``.  Keep that text in
+        # the compact input so corrections/revocations remain auditable.
+        payload = event.get("payload", event.get("content"))
+        if isinstance(payload, Mapping):
+            keep = {
+                key: SessionMemorySummarizer._compact_value(payload[key], max_chars=2_000)
+                for key in (
+                    "tool_name", "tool_call_id", "execution_fact", "observation_data",
+                    "result_ref", "result_persisted", "error_code", "status", "unique_code",
+                    "report_type", "through_sequence", "reason", "cleanup", "resource_usage",
+                    "task_key", "objective", "success_criteria", "context_refs", "pending",
+                    "todo", "next_test", "hypothesis_id", "assessment", "summary",
+                    "validation", "revoked_sequences", "correction", "tasks", "task_snapshot",
+                    "progress_kind",
+                )
+                if key in payload
+            }
+        else:
+            keep = {"value": truncate_text(str(payload), 500)} if payload is not None else {}
+        return {
+            key: event[key]
+            for key in ("sequence", "event_type", "agent_id", "created_at")
+            if key in event
+        } | {"payload": keep}
+
+    @staticmethod
+    def _compact_value(value: Any, *, max_chars: int) -> Any:
+        encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        if len(encoded) <= max_chars:
+            return value
+        return truncate_text(encoded, max_chars)
+
+    @staticmethod
+    def _compact_message(message: Mapping[str, Any]) -> dict[str, Any]:
+        role = message.get("role")
+        if role == "system":
+            return {}
+        content = message.get("content")
+        if isinstance(content, str):
+            content = re.sub(
+                r"<(active_skills|capability_directory|capability_hints)>.*?</\1>",
+                "",
+                content,
+                flags=re.S,
+            ).strip()
+            try:
+                parsed = json.loads(content)
+            except (TypeError, ValueError):
+                parsed = truncate_text(content, 800)
+            else:
+                if isinstance(parsed, Mapping):
+                    parsed = {
+                        key: SessionMemorySummarizer._compact_value(parsed[key], max_chars=1_200)
+                        for key in (
+                            "ok", "status", "error", "result_ref", "evidence_refs",
+                            "event_sequence", "task_id", "tasks", "todo", "next_test",
+                            "correction", "review", "summary", "hypothesis_id", "assessment",
+                        )
+                        if key in parsed
+                    }
+                content = parsed
+        return {"role": role, "content": content}

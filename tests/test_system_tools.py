@@ -1,11 +1,11 @@
 """Contract and security tests for the workspace system tools."""
 
 from __future__ import annotations
+from tests.resource_runtime import another_resource_agent
 
 import asyncio
 import json
 import os
-import pwd
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -45,7 +45,12 @@ class _SystemToolClient:
 
     async def _call(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
         calls = await ToolExecutor(ToolRegistry([self.provider])).execute(
-            [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments)}}]
+            [
+                {
+                    "id": name,
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            ]
         )
         assert calls[0].result is not None
         return calls[0].result
@@ -54,10 +59,22 @@ class _SystemToolClient:
         return await self._call("system_read_file", {"file_path": file_path, **kwargs})
 
     async def write_file(self, file_path: str, content: str):
-        return await self._call("system_write_file", {"file_path": file_path, "content": content})
+        return await self._call(
+            "system_write_file", {"file_path": file_path, "content": content}
+        )
 
-    async def edit_file(self, file_path: str, old_text: str, new_text: str, **kwargs: object):
-        return await self._call("system_edit_file", {"file_path": file_path, "old_string": old_text, "new_string": new_text, **kwargs})
+    async def edit_file(
+        self, file_path: str, old_text: str, new_text: str, **kwargs: object
+    ):
+        return await self._call(
+            "system_edit_file",
+            {
+                "file_path": file_path,
+                "old_string": old_text,
+                "new_string": new_text,
+                **kwargs,
+            },
+        )
 
     async def create_directory(self, path: str, **kwargs: object):
         return await self._call("system_create_directory", {"path": path, **kwargs})
@@ -72,10 +89,15 @@ class _SystemToolClient:
         return await self._call("system_glob", {"pattern": pattern, "path": path})
 
     async def grep(self, pattern: str, path: str = ".", **kwargs: object):
-        return await self._call("system_grep", {"pattern": pattern, "path": path, **kwargs})
+        return await self._call(
+            "system_grep", {"pattern": pattern, "path": path, **kwargs}
+        )
 
     async def shell(self, command: str, **kwargs: object):
         return await self._call("system_shell", {"command": command, **kwargs})
+
+    async def task_start(self, command: str, **kwargs: object):
+        return await self._call("system_task_start", {"name": "Fixture task", "command": command, **kwargs})
 
     async def task_output(self, task_id: str, **kwargs: object):
         return await self._call("system_task_output", {"task_id": task_id, **kwargs})
@@ -85,9 +107,6 @@ class _SystemToolClient:
 
     async def task_cleanup(self, task_id: str):
         return await self._call("system_task_cleanup", {"task_id": task_id})
-
-    async def close(self) -> None:
-        await self.provider.close()
 
 
 class _ToolHarness:
@@ -100,7 +119,6 @@ class _ToolHarness:
         reap_interval_seconds: float = 60.0,
         read_only_paths: Sequence[Path] = (),
         environment: Mapping[str, str] | None = None,
-        isolated_workspace: bool = False,
     ) -> None:
         self.root = root
         self.sandbox_executable = sandbox_executable
@@ -108,7 +126,6 @@ class _ToolHarness:
         self.reap_interval_seconds = reap_interval_seconds
         self.read_only_paths = tuple(read_only_paths)
         self.environment = dict(environment or {})
-        self.isolated_workspace = isolated_workspace
         self.run_id = f"tools-{uuid4().hex}"
         self.agent_id: str | None = None
         self.service: StateService | None = None
@@ -143,20 +160,13 @@ class _ToolHarness:
             environment=self.environment,
         )
         await self.manager.initialize()
-        shared_root = (
-            self.manager.shared_workspace_root("challenge")
-            if self.isolated_workspace
-            else None
-        )
+        shared_root = self.manager.shared_workspace_root("challenge")
         shell = self.manager.bind(self.agent_id, shared_root=shared_root)
-        return _SystemToolClient(
-            SystemTools(
-                root=self.root,
-                shell=shell,
-                agent_work_root=shell.agent_work_root if self.isolated_workspace else None,
-                shared_work_root=shell.shared_work_root if self.isolated_workspace else None,
-            )
-        )
+        await shell.ensure_workspace()
+        return _SystemToolClient(SystemTools(
+            root=self.root, shell=shell, agent_work_root=shell.agent_work_root,
+            shared_work_root=shell.shared_work_root,
+        ))
 
     async def __aexit__(self, *_args: object) -> None:
         assert self.manager is not None
@@ -176,7 +186,7 @@ def make_tools(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> None:
     async with make_tools() as tools:
-        target = tools._filesystem.policy.root / "notes.txt"
+        target = tools.provider._agent_work_root / "notes.txt"
         target.write_text("alpha\nbeta\nbeta\n", encoding="utf-8")
         read_result = await tools.read_file("notes.txt")
         assert read_result["ok"] is True
@@ -193,7 +203,7 @@ async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> No
             "ok": True,
             "data": {
                 "type": "update",
-                "file_path": "notes.txt",
+                "file_path": "agent/notes.txt",
                 "replaced_count": 2,
                 "bytes_written": len("alpha\ngamma\ngamma\n".encode()),
             },
@@ -206,7 +216,9 @@ async def test_read_write_and_edit_protect_against_stale_files(make_tools) -> No
 
         created = await tools.write_file("nested/new.txt", "new content")
         assert created["ok"] is True
-        assert (tools._filesystem.policy.root / "nested/new.txt").read_text() == "new content"
+        assert (
+            tools.provider._agent_work_root / "nested/new.txt"
+        ).read_text() == "new content"
 
 
 @pytest.mark.asyncio
@@ -217,26 +229,26 @@ async def test_write_auto_creates_parents_then_list_glob_and_grep(make_tools) ->
 
         listed = await tools.list_directory("src", recursive=True)
         listed_paths = {entry["path"] for entry in listed["data"]["entries"]}
-        assert {"src/pkg", "src/pkg/a.py", "src/pkg/b.txt"} <= listed_paths
+        assert {"agent/src/pkg", "agent/src/pkg/a.py", "agent/src/pkg/b.txt"} <= listed_paths
 
         globbed = await tools.glob("**/*.py", "src")
-        assert globbed["data"]["matches"] == ["src/pkg/a.py"]
+        assert globbed["data"]["matches"] == ["agent/src/pkg/a.py"]
 
         searched = await tools.grep("needle", "src", glob="**/*.py")
         assert searched["data"]["matches"] == [
             {
-                "file_path": "src/pkg/a.py",
+                "file_path": "agent/src/pkg/a.py",
                 "line_number": 1,
                 "line": "needle = 1",
                 "match": "needle",
             }
         ]
-        assert (tools._filesystem.policy.root / "src/pkg").is_dir()
+        assert (tools.provider._agent_work_root / "src/pkg").is_dir()
 
 
 @pytest.mark.asyncio
 async def test_isolated_paths_route_agent_and_shared_outputs(make_tools) -> None:
-    async with make_tools(isolated_workspace=True) as tools:
+    async with make_tools() as tools:
         relative = await tools.write_file("artifact.txt", "agent-only")
         assert relative["ok"] is True
         agent_work = tools.provider._agent_work_root
@@ -249,13 +261,17 @@ async def test_isolated_paths_route_agent_and_shared_outputs(make_tools) -> None
 
         shared = await tools.write_file("shared/result.txt", "sibling-readable")
         assert shared["ok"] is True
-        assert (shared_work / "result.txt").read_text(encoding="utf-8") == "sibling-readable"
+        assert (shared_work / "result.txt").read_text(
+            encoding="utf-8"
+        ) == "sibling-readable"
         read_shared = await tools.read_file("shared/result.txt")
         assert read_shared["data"]["content"] == "sibling-readable"
 
         project_file = tools._filesystem.policy.root / "project-result.txt"
         project_file.write_text("read-only target", encoding="utf-8")
-        assert (await tools.read_file("project/project-result.txt"))["data"]["content"] == "read-only target"
+        assert (await tools.read_file("project/project-result.txt"))["error"][
+            "code"
+        ] == "workspace_path_rejected"
         for path in (
             "project/result.txt",
             "../outside.txt",
@@ -263,7 +279,7 @@ async def test_isolated_paths_route_agent_and_shared_outputs(make_tools) -> None
         ):
             rejected = await tools.write_file(path, "must-not-write")
             assert rejected["error"]["code"] in {
-                "project_write_protected",
+                "workspace_path_rejected",
                 "workspace_write_rejected",
             }
         assert not (tools._filesystem.policy.root / "absolute-result.txt").exists()
@@ -282,8 +298,10 @@ async def test_isolated_paths_route_agent_and_shared_outputs(make_tools) -> None
 
 
 @pytest.mark.asyncio
-async def test_agent_work_is_cleaned_but_challenge_shared_work_remains(make_tools) -> None:
-    harness = make_tools(isolated_workspace=True, reap_interval_seconds=0)
+async def test_agent_work_is_cleaned_but_challenge_shared_work_remains(
+    make_tools,
+) -> None:
+    harness = make_tools(reap_interval_seconds=0)
     async with harness as tools:
         assert harness.manager is not None
         assert harness.agent_id is not None
@@ -320,18 +338,20 @@ async def test_file_evidence_snapshot_is_exact_and_never_leaks_to_model(
         assert call.evidence_payload == {
             "evidence_type": "file",
             "content": "exact\nproof\n",
-            "metadata": {"file_path": "proof.txt"},
+            "metadata": {"file_path": "agent/proof.txt"},
         }
 
 
 @pytest.mark.asyncio
-async def test_path_traversal_symlink_escape_and_root_delete_are_rejected(make_tools, tmp_path: Path) -> None:
+async def test_path_traversal_symlink_escape_and_root_delete_are_rejected(
+    make_tools, tmp_path: Path
+) -> None:
     async with make_tools() as tools:
         outside = tmp_path.parent / "system-tools-outside.txt"
         outside.write_text("outside", encoding="utf-8")
-        os.symlink(outside, tools._filesystem.policy.root / "escape.txt")
+        os.symlink(outside, tools.provider._agent_work_root / "escape.txt")
         traversal = await tools.read_file("../system-tools-outside.txt")
-        assert traversal["error"]["code"] == "path_outside_workspace"
+        assert traversal["error"]["code"] == "workspace_write_rejected"
 
         symlink = await tools.read_file("escape.txt")
         assert symlink["error"]["code"] == "path_outside_workspace"
@@ -341,10 +361,12 @@ async def test_path_traversal_symlink_escape_and_root_delete_are_rejected(make_t
 
 
 @pytest.mark.asyncio
-async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(make_tools) -> None:
+async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(
+    make_tools,
+) -> None:
     async with make_tools() as tools:
         root = tools._filesystem.policy.root
-        (root / ".aion" / "runs").mkdir(parents=True)
+        (root / ".aion" / "runs").mkdir(parents=True, exist_ok=True)
         (root / ".aion" / "runs" / "old-flag.txt").write_text(
             "control-plane-secret", encoding="utf-8"
         )
@@ -354,8 +376,8 @@ async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(make
         )
 
         for path in (".aion", ".aion/runs/old-flag.txt", ".system-tools"):
-            rejected = await tools.read_file(path)
-            assert rejected["error"]["code"] == "project_path_protected"
+            rejected = await tools.read_file(str(root / path))
+            assert rejected["error"]["code"] == "workspace_path_rejected"
 
         listed = await tools.list_directory(".", recursive=True)
         listed_paths = {entry["path"] for entry in listed["data"]["entries"]}
@@ -381,7 +403,9 @@ async def test_runtime_control_plane_paths_are_hidden_from_filesystem_tools(make
 
 
 @pytest.mark.asyncio
-async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools) -> None:
+async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(
+    make_tools,
+) -> None:
     async with make_tools() as tools:
         command = await tools.shell("printf sandbox-ok; pwd")
         assert command["ok"] is True
@@ -393,10 +417,14 @@ async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools)
         assert workspace_write["data"]["exit_code"] == 0
         agent_work = tools.provider._shell.agent_work_root
         assert agent_work is not None
-        assert (agent_work / "shell-created.txt").read_text(encoding="utf-8") == "shell-write"
+        assert (agent_work / "shell-created.txt").read_text(
+            encoding="utf-8"
+        ) == "shell-write"
         assert not (tools._filesystem.policy.root / "shell-created.txt").exists()
 
-        environment = await tools.shell("printf '%s' \"${BENCHMARK_TOKEN-unavailable}\"")
+        environment = await tools.shell(
+            "printf '%s' \"${BENCHMARK_TOKEN-unavailable}\""
+        )
         assert environment["data"]["output"] == "unavailable"
 
         outside = await tools.shell(
@@ -420,7 +448,9 @@ async def test_shell_runs_in_sandbox_and_enforces_output_and_timeout(make_tools)
 
 
 @pytest.mark.asyncio
-async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, tmp_path: Path) -> None:
+async def test_shell_runs_read_only_python_and_shell_skill_scripts(
+    make_tools, tmp_path: Path
+) -> None:
     skill_root = tmp_path / "skills"
     scripts = skill_root / "execution" / "fixture" / "scripts"
     scripts.mkdir(parents=True)
@@ -457,10 +487,7 @@ async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, t
         assert write["data"]["status"] == "failed"
         assert python_script.read_text(encoding="utf-8") == "print('python-skill')\n"
 
-        background = await tools.shell(
-            'bash "$AION_SKILLS_ROOT/execution/fixture/scripts/background.sh"',
-            run_in_background=True,
-        )
+        background = await tools.task_start('bash "$AION_SKILLS_ROOT/execution/fixture/scripts/background.sh"')
         output = await tools.task_output(
             background["data"]["task_id"], wait_seconds=1.0
         )
@@ -471,19 +498,18 @@ async def test_shell_runs_read_only_python_and_shell_skill_scripts(make_tools, t
 @pytest.mark.asyncio
 async def test_background_tasks_can_be_read_and_stopped(make_tools) -> None:
     async with make_tools() as tools:
-        background = await tools.shell(
-            "printf start; sleep 0.1; printf end",
-            run_in_background=True,
-        )
+        background = await tools.task_start('printf start; sleep 0.1; printf end')
         task_id = background["data"]["task_id"]
-        output = await tools.task_output(task_id, wait_seconds=1.0)
+        assert background["data"]["read_result"]["tool"] == "system_task_output"
+        output = await tools.task_output(**background["data"]["read_result"]["arguments"], wait_seconds=1.0)
         assert output["data"]["status"] == "completed"
         assert "start" in output["data"]["output"]
         assert "end" in output["data"]["output"]
+        assert output["data"]["result_state"] == "available"
         repeated = await tools.task_output(task_id)
         assert repeated == output
 
-        long_task = await tools.shell("sleep 10", run_in_background=True)
+        long_task = await tools.task_start('sleep 10')
         active_cleanup = await tools.task_cleanup(long_task["data"]["task_id"])
         assert active_cleanup["error"]["code"] == "unknown_tool"
         stopped = await tools.task_stop(long_task["data"]["task_id"])
@@ -494,15 +520,11 @@ async def test_background_tasks_can_be_read_and_stopped(make_tools) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shell_client_close_keeps_task_for_same_agent(make_tools) -> None:
+async def test_shell_binding_recreation_keeps_task_for_same_agent(make_tools) -> None:
     harness = make_tools()
     async with harness as tools:
-        background = await tools.shell(
-            "printf before; sleep 0.1; printf after",
-            run_in_background=True,
-        )
+        background = await tools.task_start('printf before; sleep 0.1; printf after')
         task_id = background["data"]["task_id"]
-        await tools.close()
 
         assert harness.manager is not None
         assert harness.agent_id is not None
@@ -510,6 +532,8 @@ async def test_shell_client_close_keeps_task_for_same_agent(make_tools) -> None:
             SystemTools(
                 root=harness.root,
                 shell=harness.manager.bind(harness.agent_id),
+                agent_work_root=harness.manager.agent_work_root(harness.agent_id),
+                shared_work_root=harness.manager.shared_workspace_root("challenge"),
             )
         )
         output = await rebound.task_output(task_id, wait_seconds=1)
@@ -523,25 +547,21 @@ async def test_agent_ownership_and_persistent_temp_are_isolated(make_tools) -> N
     async with harness as first:
         assert harness.service is not None
         assert harness.manager is not None
-        second_agent = await harness.service.register_agent(
-            harness.run_id,
-            role="chief",
-            initial_prompt="second owner",
-        )
+        second_agent = await another_resource_agent(harness.service, harness.run_id)
         second = _SystemToolClient(
             SystemTools(
                 root=harness.root,
                 shell=harness.manager.bind(second_agent["agent_id"]),
+                agent_work_root=harness.manager.agent_work_root(second_agent["agent_id"]),
+                shared_work_root=harness.manager.shared_workspace_root("challenge"),
             )
         )
 
         created = await first.shell(
-            "printf persistent > \"$TMPDIR/value\"; printf '%s' \"$TMPDIR\""
+            'printf persistent > "$TMPDIR/value"; printf \'%s\' "$TMPDIR"'
         )
-        reread = await first.shell("cat \"$TMPDIR/value\"")
-        isolated = await second.shell(
-            "test ! -e \"$TMPDIR/value\"; printf isolated"
-        )
+        reread = await first.shell('cat "$TMPDIR/value"')
+        isolated = await second.shell('test ! -e "$TMPDIR/value"; printf isolated')
 
         assert reread["data"]["output"] == "persistent"
         assert isolated["data"]["status"] == "completed"
@@ -553,29 +573,28 @@ async def test_agent_ownership_and_persistent_temp_are_isolated(make_tools) -> N
 
 
 @pytest.mark.asyncio
-async def test_conventional_absolute_tmp_path_is_available_on_macos(make_tools) -> None:
+async def test_macos_public_tmp_is_not_an_agent_workspace(make_tools) -> None:
     if sys.platform != "darwin":
-        pytest.skip("macOS sandbox-exec compatibility check")
+        pytest.skip("macOS host tmp access policy")
     marker = f"aion-tmp-{uuid4().hex}"
     async with make_tools() as tools:
         result = await tools.shell(
-            f"printf absolute-tmp > /tmp/{marker}; cat /tmp/{marker}; rm -f /tmp/{marker}"
+            f"if printf forbidden > /tmp/{marker}; then printf LEAK; else printf DENIED; fi"
         )
-    assert result["data"]["status"] == "completed"
-    assert result["data"]["output"] == "absolute-tmp"
+    assert "DENIED" in result["data"]["output"]
+    assert not Path("/tmp", marker).exists()
 
 
 @pytest.mark.asyncio
-async def test_host_container_control_is_blocked(make_tools) -> None:
+async def test_command_data_is_not_rejected_by_keyword(make_tools) -> None:
     async with make_tools() as tools:
-        for command in (
-            "docker ps",
-            "sh -c 'docker exec target cat /run/secrets/flag'",
-            "python3 -c 'open(\"/var/run/docker.sock\")'",
-            "kubectl exec target -- cat /run/secrets/flag",
-        ):
-            result = await tools.shell(command)
-            assert result["error"]["code"] == "container_control_blocked"
+        result = await tools.shell("cat <<'DATA' > words.txt\ndocker-compose.yml\n/var/run/docker.sock\npip install example\nDATA\ngrep docker words.txt")
+        assert result["ok"]
+        assert result["data"]["exit_code"] == 0
+        assert "docker-compose.yml" in result["data"]["output"]
+        # Package commands are executed normally; --version never installs anything.
+        version = await tools.shell("python3 -m pip --version")
+        assert version["ok"]
 
 
 @pytest.mark.asyncio
@@ -589,7 +608,7 @@ async def test_macos_shell_cannot_connect_to_host_container_socket(make_tools) -
         "p=chr(47)+chr(118)+chr(97)+chr(114)+chr(47)+chr(114)+chr(117)+"
         "chr(110)+chr(47)+chr(100)+chr(111)+chr(99)+chr(107)+chr(101)+"
         "chr(114)+chr(46)+chr(115)+chr(111)+chr(99)+chr(107); "
-        "s=socket.socket(socket.AF_UNIX); s.connect(p); print(\"connected\")'"
+        's=socket.socket(socket.AF_UNIX); s.connect(p); print("connected")\''
     )
     async with make_tools() as tools:
         result = await tools.shell(command)
@@ -628,10 +647,7 @@ async def test_pause_and_resume_marks_running_task_interrupted(make_tools) -> No
     tools = await harness.__aenter__()
     resumed: ShellTaskManager | None = None
     try:
-        background = await tools.shell(
-            "printf before; sleep 10; printf after",
-            run_in_background=True,
-        )
+        background = await tools.task_start('printf before; sleep 10; printf after')
         task_id = background["data"]["task_id"]
         await asyncio.sleep(0.05)
         assert harness.manager is not None
@@ -649,7 +665,9 @@ async def test_pause_and_resume_marks_running_task_interrupted(make_tools) -> No
         )
         await resumed.initialize(resume=True)
         rebound = _SystemToolClient(
-            SystemTools(root=harness.root, shell=resumed.bind(harness.agent_id))
+            SystemTools(root=harness.root, shell=resumed.bind(harness.agent_id),
+                agent_work_root=resumed.agent_work_root(harness.agent_id),
+                shared_work_root=resumed.shared_workspace_root("challenge"))
         )
         output = await rebound.task_output(task_id)
         assert output["data"]["status"] == "interrupted"
@@ -683,7 +701,9 @@ async def test_agent_and_run_terminal_cleanup_remove_runtime_files(make_tools) -
 
 
 @pytest.mark.asyncio
-async def test_shell_agent_and_run_cleanup_are_concurrently_idempotent(make_tools) -> None:
+async def test_shell_agent_and_run_cleanup_are_concurrently_idempotent(
+    make_tools,
+) -> None:
     harness = make_tools(reap_interval_seconds=0)
     tools = await harness.__aenter__()
     try:
@@ -705,10 +725,10 @@ async def test_shell_agent_and_run_cleanup_are_concurrently_idempotent(make_tool
 
 
 @pytest.mark.asyncio
-async def test_sandbox_unavailable_is_reported_without_running_shell(make_tools) -> None:
-    async with make_tools(
-        sandbox_executable="/does/not/exist/sandbox-exec"
-    ) as tools:
+async def test_sandbox_unavailable_is_reported_without_running_shell(
+    make_tools,
+) -> None:
+    async with make_tools(sandbox_executable="/does/not/exist/sandbox-exec") as tools:
         result = await tools.shell("printf should-not-run")
 
     assert result["ok"] is False
@@ -720,9 +740,15 @@ async def test_sandbox_unavailable_is_reported_without_running_shell(make_tools)
 @pytest.mark.asyncio
 async def test_executor_validation_and_json_serialization(make_tools) -> None:
     async with make_tools() as tools:
+
         async def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
             calls = await ToolExecutor(ToolRegistry([tools])).execute(
-                [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments)}}]
+                [
+                    {
+                        "id": name,
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                ]
             )
             assert calls[0].result is not None
             return calls[0].result
@@ -742,7 +768,7 @@ async def test_system_tool_definitions_are_generated_from_specs(make_tools) -> N
     async with make_tools() as tools:
         definitions = ToolRegistry([tools]).definitions()
     names = [item["function"]["name"] for item in definitions]
-    assert len(names) == 9
+    assert len(names) == 10
     assert names == [
         "system_read_file",
         "system_write_file",
@@ -751,17 +777,23 @@ async def test_system_tool_definitions_are_generated_from_specs(make_tools) -> N
         "system_glob",
         "system_grep",
         "system_shell",
+        "system_task_start",
         "system_task_output",
         "system_task_stop",
     ]
-    assert all(item["function"]["parameters"]["additionalProperties"] is False for item in definitions)
+    assert all(
+        item["function"]["parameters"]["additionalProperties"] is False
+        for item in definitions
+    )
     read_schema = definitions[0]["function"]["parameters"]
     assert "limit_chars" in read_schema["properties"]
     assert "limit" not in read_schema["properties"]
     assert not hasattr(SystemTools, "tool_definitions")
 
 
-def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path) -> None:
+def test_linux_sandbox_command_is_available_as_a_reserved_backend(
+    tmp_path: Path,
+) -> None:
     executable = tmp_path / "bwrap"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | 0o111)
@@ -789,7 +821,9 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
     assert command[:2] == [str(executable), "--die-with-parent"]
     assert "--ro-bind" in command
     assert "--bind" in command
-    assert ["--tmpfs", "/tmp"] not in [command[index : index + 2] for index in range(len(command) - 1)]
+    assert ["--tmpfs", "/tmp"] not in [
+        command[index : index + 2] for index in range(len(command) - 1)
+    ]
     tmp_bind = command.index(str(persistent_tmp))
     assert command[tmp_bind - 1 : tmp_bind + 2] == [
         "--bind",
@@ -798,14 +832,12 @@ def test_linux_sandbox_command_is_available_as_a_reserved_backend(tmp_path: Path
     ]
     chdir_index = command.index("--chdir")
     assert command[chdir_index : chdir_index + 2] == ["--chdir", str(work)]
-    assert command[-4:] == ["--noprofile", "--norc", "-lc", "printf linux-ok"]
-    root_bind = command.index(str(tmp_path), command.index("--ro-bind"))
-    assert command[root_bind - 1 : root_bind + 2] == [
-        "--ro-bind",
-        str(tmp_path),
-        str(tmp_path),
+    assert command[-6:] == ["--noprofile", "--norc", "-o", "pipefail", "-lc", "printf linux-ok"]
+    assert ["--ro-bind", str(tmp_path), str(tmp_path)] not in [
+        command[i : i + 3] for i in range(len(command) - 2)
     ]
-    work_bind = command.index(str(work), root_bind + 1)
+    assert "--unshare-pid" in command
+    work_bind = command.index(str(work), command.index("--bind", tmp_bind + 1))
     assert command[work_bind - 1 : work_bind + 2] == ["--bind", str(work), str(work)]
     skill_bind = command.index(str(read_only), work_bind + 1)
     assert command[skill_bind - 1 : skill_bind + 2] == [
@@ -839,37 +871,6 @@ def test_sandbox_profile_hides_runtime_control_plane_but_reopens_agent_paths(
     assert "(deny network-outbound)" in profile
     assert profile.index(hidden_aion) < profile.index(shared_allow)
     assert profile.index(hidden_tools) < profile.index(shared_allow)
-
-
-def test_linux_container_sandbox_drops_privileges_without_namespaces(
-    tmp_path: Path,
-) -> None:
-    executable = tmp_path / "setpriv"
-    executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    executable.chmod(executable.stat().st_mode | 0o111)
-    account = pwd.getpwuid(os.getuid())
-    workspace_file = tmp_path / "artifact.bin"
-    workspace_file.write_bytes(b"artifact")
-    backend = SandboxBackend(
-        tmp_path,
-        executable=str(executable),
-        platform_name="Linux",
-        sandbox_user=account.pw_name,
-    )
-
-    backend.prepare()
-    command = backend.command("id", tmp_path)
-
-    assert backend.available is True
-    assert command[:4] == [
-        str(executable),
-        f"--reuid={account.pw_uid}",
-        f"--regid={account.pw_gid}",
-        "--clear-groups",
-    ]
-    assert "--no-new-privs" in command
-    assert "--bounding-set=-all" in command
-    assert command[-4:] == ["--noprofile", "--norc", "-lc", "id"]
 
 
 def test_windows_backend_is_reserved_without_an_unsafe_fallback(tmp_path: Path) -> None:

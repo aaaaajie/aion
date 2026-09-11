@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -119,21 +120,86 @@ def _requirements_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _make_read_only(root: Path) -> None:
-    for directory, directories, files in os.walk(root):
+def _base_release(release_id: str) -> Path:
+    release_id = _validate_release_id(release_id)
+    target = _symlink_target(CURRENT)
+    if target != f"releases/{release_id}":
+        raise ReleaseError("incremental base release is not the current release")
+    release = RELEASES / release_id
+    if not release.is_dir():
+        raise ReleaseError("incremental base release was not found")
+    return release
+
+
+def _same_base_file(item: Path, source: Path, base: Path) -> bool:
+    candidate = base / item.relative_to(source)
+    try:
+        return candidate.is_file() and os.path.samefile(item, candidate)
+    except OSError:
+        return False
+
+
+def _is_root_owned(path: Path) -> bool:
+    metadata = path.stat()
+    return metadata.st_uid == 0 and metadata.st_gid == 0
+
+
+def _validate_release_symlink(path: Path, root: Path) -> None:
+    """Allow only symlinks whose resolved target stays inside the release."""
+    try:
+        target = path.resolve(strict=True)
+        target.relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise ReleaseError(f"release symlink escapes or is invalid: {path}") from exc
+    if not _is_root_owned(path):
+        raise ReleaseError(f"release symlink is not root-owned: {path}")
+
+
+def _finalize_permissions(root: Path, base: Path) -> None:
+    """Finalize only incoming inodes; never chmod a file shared with base."""
+    for directory, directories, files in os.walk(root, followlinks=False):
         path = Path(directory)
+        if path.is_symlink():
+            _validate_release_symlink(path, root)
+            continue
+        if not _is_root_owned(path):
+            raise ReleaseError(f"release path is not root-owned: {path}")
         path.chmod(0o755)
         for name in directories:
-            (path / name).chmod(0o755)
+            item = path / name
+            if item.is_symlink():
+                _validate_release_symlink(item, root)
+                continue
+            if not _is_root_owned(item):
+                raise ReleaseError(f"release path is not root-owned: {item}")
+            item.chmod(0o755)
         for name in files:
             item = path / name
-            executable = bool(item.stat().st_mode & 0o111)
-            item.chmod(0o755 if executable else 0o644)
+            if item.is_symlink():
+                _validate_release_symlink(item, root)
+                continue
+            metadata = item.stat()
+            if not _is_root_owned(item):
+                raise ReleaseError(f"release path is not root-owned: {item}")
+            if _same_base_file(item, root, base):
+                expected = 0o755 if metadata.st_mode & 0o111 else 0o644
+                if stat.S_IMODE(metadata.st_mode) != expected:
+                    raise ReleaseError(
+                        f"hard-linked base file has unexpected permissions: {item}"
+                    )
+                continue
+            item.chmod(0o755 if metadata.st_mode & 0o111 else 0o644)
 
 
-def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
+def _prepare(
+    release_id: str,
+    incoming: Path,
+    venv_id: str,
+    base_release_id: str,
+) -> None:
     release_id = _validate_release_id(release_id)
     venv_id = _validate_venv_id(venv_id)
+    base = _base_release(base_release_id)
     source = incoming.resolve()
     expected_parent = (RELEASES / f".incoming-{release_id}").resolve()
     if source != expected_parent or not source.is_dir():
@@ -195,6 +261,8 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
             "-m",
             "compileall",
             "-q",
+            "-x",
+            r"(^|/)(node_modules|__pycache__)(/|$)",
             str(source / "agent"),
             str(source / "tools"),
             str(source / "challenges_sdk"),
@@ -204,8 +272,9 @@ def _prepare(release_id: str, incoming: Path, venv_id: str) -> None:
     )
     for cache in source.rglob("__pycache__"):
         shutil.rmtree(cache)
+    _finalize_permissions(source, base)
     (source / ".venv-id").write_text(f"{venv_id}\n", encoding="ascii")
-    _make_read_only(source)
+    (source / ".venv-id").chmod(0o644)
     final = RELEASES / release_id
     if final.exists():
         raise ReleaseError("release id already exists")
@@ -362,15 +431,6 @@ def _history() -> list[str]:
     return [item for item in value if isinstance(item, str) and RELEASE_PATTERN.fullmatch(item)]
 
 
-def _migrate_legacy_flat() -> None:
-    destination = APP_ROOT / "legacy-flat"
-    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name in SOURCE_NAMES:
-        source = APP_ROOT / name
-        if source.exists() and not (destination / name).exists():
-            os.replace(source, destination / name)
-
-
 def _prune(history: list[str]) -> None:
     keep = set(history[-3:])
     current_target = _symlink_target(CURRENT)
@@ -396,7 +456,6 @@ def _commit() -> None:
     history.append(release_id)
     _atomic_json(HISTORY_FILE, history[-3:])
     PENDING_FILE.unlink(missing_ok=True)
-    _migrate_legacy_flat()
     _prune(history[-3:])
     print(release_id)
 
@@ -411,7 +470,9 @@ def _current(as_json: bool) -> None:
     if as_json:
         print(json.dumps(data, sort_keys=True))
     else:
-        print(data["current"] or "legacy-flat")
+        if not data["current"]:
+            raise ReleaseError("current release is not installed")
+        print(data["current"])
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -421,6 +482,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--release-id", required=True)
     prepare.add_argument("--incoming", type=Path, required=True)
     prepare.add_argument("--venv-id", required=True)
+    prepare.add_argument("--base-release-id", required=True)
     activate = subparsers.add_parser("activate")
     activate.add_argument("--release-id", required=True)
     subparsers.add_parser("commit")
@@ -436,7 +498,12 @@ def main() -> None:
     args = _build_parser().parse_args()
     try:
         if args.command == "prepare":
-            _prepare(args.release_id, args.incoming, args.venv_id)
+            _prepare(
+                args.release_id,
+                args.incoming,
+                args.venv_id,
+                args.base_release_id,
+            )
         elif args.command == "activate":
             _activate(args.release_id)
         elif args.command == "commit":

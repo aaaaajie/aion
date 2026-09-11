@@ -1,27 +1,11 @@
-"""Authoritative per-run state storage and scheduling services."""
+"""Authoritative state, Agent contracts and resource admission."""
 
 from .database import SCHEMA_VERSION, StateDatabase
 from .agent_store import AgentStateStore
 from .capabilities import Capability, CapabilityRegistry
-from .service import (
-    BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
-    BOOTSTRAP_MAX_ROUNDS,
-    BOOTSTRAP_MISSION,
-    BOOTSTRAP_REPORT_ONLY_ROUND,
-    BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
-    BOOTSTRAP_TARGETED_ROUND,
-    BOOTSTRAP_SUCCESS_CRITERIA,
-    BOOTSTRAP_CHECKPOINT_LIMIT,
-    INITIAL_EXECUTION_MISSION,
-    INITIAL_EXECUTION_SUCCESS_CRITERIA,
-    BOOTSTRAP_SCALE_INTERVAL_SECONDS,
-    DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE,
-    MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE,
-    StateService,
-    derive_phase,
-)
+from .service import StateService
 from .wakeup import StateSignalBus
-from .scheduling import ChallengeScheduler, ResourceController, StagnationManager
+from .scheduling import ResourceController
 from .resources import (
     ACTIVE_CHALLENGE_WORK_STATUSES,
     MAX_CHALLENGE_SLOTS,
@@ -34,60 +18,12 @@ from .resources import (
 )
 from .schemas import (
     AgentReportInput,
+    ReviewAgentReportInput,
     CHALLENGE_DIRECTION_VALUES,
     CapabilityContext,
-    ChallengeDispatchInput,
     ChallengeImport,
     ChallengeSyncResult,
-    ExecutionTaskInput,
+    WorkerTaskInput,
+    WorkerUpdateInput,
     FindingInput,
-    HypothesisOutcome,
-    HypothesisInput,
-    TaskStage,
 )
-
-__all__ = [
-    "SCHEMA_VERSION",
-    "AgentStateStore",
-    "Capability",
-    "CapabilityRegistry",
-    "AgentReportInput",
-    "CHALLENGE_DIRECTION_VALUES",
-    "CapabilityContext",
-    "ChallengeDispatchInput",
-    "ChallengeImport",
-    "ChallengeSyncResult",
-    "ExecutionTaskInput",
-    "FindingInput",
-    "HypothesisOutcome",
-    "HypothesisInput",
-    "TaskStage",
-    "StateDatabase",
-    "StateService",
-    "DEFAULT_BOOTSTRAP_AGENTS_PER_CHALLENGE",
-    "MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE",
-    "BOOTSTRAP_SCALE_INTERVAL_SECONDS",
-    "BOOTSTRAP_CYCLE_TIMEOUT_SECONDS",
-    "BOOTSTRAP_MAX_ROUNDS",
-    "BOOTSTRAP_TARGETED_ROUND",
-    "BOOTSTRAP_REPORT_ONLY_ROUND",
-    "BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS",
-    "BOOTSTRAP_MISSION",
-    "BOOTSTRAP_SUCCESS_CRITERIA",
-    "BOOTSTRAP_CHECKPOINT_LIMIT",
-    "INITIAL_EXECUTION_MISSION",
-    "INITIAL_EXECUTION_SUCCESS_CRITERIA",
-    "StateSignalBus",
-    "derive_phase",
-    "ResourceController",
-    "StagnationManager",
-    "ChallengeScheduler",
-    "ACTIVE_CHALLENGE_WORK_STATUSES",
-    "MAX_CHALLENGE_SLOTS",
-    "RELEASED_CONTAINER_STATUSES",
-    "challenge_start_gate",
-    "challenge_work_active",
-    "checkpoint_target_status",
-    "container_capacity_summary",
-    "container_slot_occupied",
-]

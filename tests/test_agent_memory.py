@@ -24,7 +24,12 @@ from agent.memory.context import (
     should_update_memory,
     tool_result_for_model,
 )
-from agent.memory.models import ActiveSkillState, Checkpoint, OperationState, TargetState
+from agent.memory.models import (
+    ActiveSkillState,
+    Checkpoint,
+    OperationState,
+    TargetState,
+)
 from agent.memory.redaction import redact_tool_payload, redact_value
 from agent.memory.summarizer import SessionMemorySummarizer
 from agent.runner import AgentRunner, AgentRunnerError
@@ -32,7 +37,7 @@ from agent.tooling import ToolDispatchOutcome, ToolRegistry, ToolSpec
 from agent.state import AgentStateStore, StateService
 from agent.state.models import DEFAULT_SESSION_MEMORY
 from agent.state.schemas import ChallengeImport
-from agent.subagents.models import ExecutionReport
+from agent.state import AgentReportInput
 
 
 def _settings(**overrides: Any) -> AgentSettings:
@@ -49,18 +54,19 @@ def test_context_budget_defaults_to_one_million_tokens() -> None:
     budget = ContextBudget()
     assert budget.context_window_tokens == 1_000_000
     assert budget.absolute_prompt_tokens("chief") == 959_040
-    assert budget.absolute_prompt_tokens("challenge") == 959_040
-    assert budget.absolute_prompt_tokens("execution") == 975_424
+    assert budget.absolute_prompt_tokens("solver") == 959_040
+    assert budget.absolute_prompt_tokens("worker") == 975_424
     assert budget.max_output_tokens("chief") == 32_768
-    assert budget.max_output_tokens("execution") == 16_384
-    assert budget.max_output_tokens("execution", bootstrap=True) == 32_768
+    assert budget.max_output_tokens("worker") == 16_384
     assert ROLE_CONTEXT_PROFILES["chief"].soft_prompt_tokens == 128_000
-    assert ROLE_CONTEXT_PROFILES["challenge"].soft_prompt_tokens == 96_000
-    assert ROLE_CONTEXT_PROFILES["execution"].soft_prompt_tokens == 64_000
+    assert ROLE_CONTEXT_PROFILES["solver"].soft_prompt_tokens == 96_000
+    assert ROLE_CONTEXT_PROFILES["worker"].soft_prompt_tokens == 64_000
     assert _settings().context_budget.context_window_tokens == 1_000_000
 
 
-def test_context_window_override_is_optional_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_context_window_override_is_optional_and_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("AION_CONTEXT_WINDOW_TOKENS", "50000")
     assert _settings().context_window_tokens == 50_000
 
@@ -109,95 +115,10 @@ def test_context_estimation_and_tool_result_limits() -> None:
     assert should_autocompact(64_000, soft_prompt_tokens=64_000)
 
 
-def test_live_context_replaces_previous_runtime_update() -> None:
-    messages = [
-        {"role": "user", "content": "before"},
-        {
-            "role": "user",
-            "content": '# Runtime shared Bootstrap update\n{"through_sequence":1}',
-        },
-    ]
-    AgentRunner._replace_live_context_message(
-        messages, {"through_sequence": 2, "reports": []}
-    )
-    encoded = json.dumps(messages)
-    assert encoded.count("Runtime shared Bootstrap update") == 1
-    assert '"through_sequence": 2' in messages[-1]["content"]
-
-
-def test_bootstrap_tool_surface_converges_by_round_budget() -> None:
+def test_http_requests_are_never_auto_replayed() -> None:
     runner = object.__new__(AgentRunner)
-    runner.bootstrap_mode = True
-    runner._report_recovery_used = False
-    runner._disabled_tool_names = set()
-    definitions = [
-        {"function": {"name": name}}
-        for name in (
-            "system_http_probe",
-            "system_http_request",
-            "system_http_response",
-            "system_http_output",
-            "system_web_path_probe",
-            "system_network_discovery",
-            "skill_search",
-            "execution_report",
-            "bootstrap_checkpoint",
-            "bootstrap_cycle_yield",
-            "evidence_read",
-        )
-    ]
-
-    runner._current_round_number = 1
-    assert len(runner._active_tool_definitions(definitions)) == len(definitions)
-
-    runner._current_round_number = 9
-    targeted = {
-        item["function"]["name"]
-        for item in runner._active_tool_definitions(definitions)
-    }
-    assert targeted == {
-        "system_http_request",
-        "system_http_response",
-        "system_http_output",
-        "execution_report",
-        "bootstrap_checkpoint",
-        "bootstrap_cycle_yield",
-        "evidence_read",
-    }
-
-    runner._current_round_number = 20
-    report_only = {
-        item["function"]["name"]
-        for item in runner._active_tool_definitions(definitions)
-    }
-    assert report_only == {
-        "execution_report",
-        "bootstrap_checkpoint",
-        "bootstrap_cycle_yield",
-        "evidence_read",
-        "system_http_request",
-        "system_http_response",
-        "system_http_output",
-    }
-
-
-def test_exact_http_call_reuses_successful_result() -> None:
-    runner = object.__new__(AgentRunner)
-    runner._http_result_cache = {}
-    item = SimpleNamespace(
-        name="system_http_request",
-        arguments={"method": "GET", "url": "http://target/"},
-        result=None,
-        replayed=False,
-    )
-    key = runner._http_replay_key(item)
-    assert key is not None
-    runner._http_result_cache[key] = {"ok": True, "data": {"status": 200}}
-
-    runner._apply_http_replay_cache([item])
-
-    assert item.replayed is True
-    assert item.result == {"ok": True, "data": {"status": 200}}
+    assert not hasattr(runner, "_http_result_cache")
+    assert not hasattr(runner, "_apply_http_replay_cache")
 
 
 @pytest.mark.asyncio
@@ -213,21 +134,22 @@ async def test_sqlmap_request_dedup_is_enforced_across_execution_agents(
     chief = await service.register_agent("run", role="chief")
     controller = await service.register_agent(
         "run",
-        role="challenge",
+        role="solver",
         parent_id=chief["agent_id"],
         unique_code="target",
     )
     execution = await service.register_agent(
         "run",
-        role="execution",
+        role="worker",
         parent_id=controller["agent_id"],
         unique_code="target",
         mission="sql injection check",
+        task_key="fixture-task",
     )
     runner = AgentRunner(
         _settings(),
         ToolRegistry([]),
-        role="execution",
+        role="worker",
         agent_id=execution["agent_id"],
         state_service=service,
     )
@@ -261,42 +183,6 @@ async def test_sqlmap_request_dedup_is_enforced_across_execution_agents(
     assert second.result["error"]["code"] == "duplicate_expensive_request"
     await runner.close()
     await service.close()
-
-
-def test_challenge_dispatch_has_one_argument_recovery() -> None:
-    runner = object.__new__(AgentRunner)
-    runner.role = "challenge"
-    runner._challenge_dispatch_argument_failure_streak = 0
-    runner._challenge_dispatch_correction_pending = False
-    item = SimpleNamespace(
-        name="challenge_dispatch",
-        arguments=None,
-        result={
-            "ok": False,
-            "error": {
-                "stage": "schema",
-                "code": "invalid_arguments",
-            },
-        },
-    )
-
-    runner._apply_challenge_dispatch_recovery_budget([item])
-    assert item.result["error"]["code"] == "challenge_dispatch_invalid_arguments"
-    second_item = SimpleNamespace(
-        name="challenge_dispatch",
-        arguments=None,
-        result={
-            "ok": False,
-            "error": {
-                "stage": "schema",
-                "code": "invalid_arguments",
-            },
-        },
-    )
-    runner._apply_challenge_dispatch_recovery_budget([second_item])
-    assert second_item.result["error"]["code"] == "challenge_dispatch_invalid_arguments"
-    assert second_item.result["error"]["retry"]["allowed"] is True
-    assert runner._challenge_dispatch_correction_pending is True
 
 
 def test_session_memory_is_structured_and_bounded() -> None:
@@ -382,9 +268,10 @@ def test_skill_instructions_are_removed_from_summary_input_but_checkpointed() ->
         ],
     )
     assert checkpoint.schema_version == 2
-    assert checkpoint.model_dump(mode="json")["active_skills"][0][
-        "content_sha256"
-    ] == content_hash
+    assert (
+        checkpoint.model_dump(mode="json")["active_skills"][0]["content_sha256"]
+        == content_hash
+    )
 
     messages = [
         {
@@ -606,88 +493,6 @@ async def test_role_checkpoint_does_not_duplicate_full_run_graph(
 
 
 @pytest.mark.asyncio
-async def test_execution_compaction_never_calls_model_summarizer(tmp_path: Path) -> None:
-    service = StateService(tmp_path / "state.sqlite3", run_root=tmp_path)
-    await service.create_run(
-        "execution-compact-run",
-        challenges=[
-            ChallengeImport(
-                unique_code="compact-challenge",
-                description="context compaction test",
-            )
-        ],
-    )
-    chief = await service.register_agent(
-        "execution-compact-run", role="chief", initial_prompt="chief"
-    )
-    challenge = await service.register_agent(
-        "execution-compact-run",
-        role="challenge",
-        parent_id=chief["agent_id"],
-        unique_code="compact-challenge",
-        initial_prompt="challenge",
-    )
-    execution = await service.register_agent(
-        "execution-compact-run",
-        role="execution",
-        parent_id=challenge["agent_id"],
-        unique_code="compact-challenge",
-        mission="bounded task",
-        initial_prompt="bounded task",
-    )
-    store = await AgentStateStore.open(
-        service,
-        run_id="execution-compact-run",
-        agent_id=execution["agent_id"],
-        run_dir=tmp_path / "execution-compact-run",
-    )
-    runner = AgentRunner(
-        _settings(),
-        ToolRegistry([]),
-        role="execution",
-        agent_id=execution["agent_id"],
-        state_service=service,
-    )
-    update_summary = AsyncMock(side_effect=AssertionError("summary must not run"))
-    runner._update_summary = update_summary  # type: ignore[method-assign]
-    runner._schedule_summary(store, [], last_summary_tokens=48_000)
-    assert runner._summary_task is None
-
-    recent = await runner._compact(
-        store,
-        base_system_prompt="system",
-        initial_user_message={"role": "user", "content": "assignment"},
-        messages=[
-            {"role": "system", "content": "system"},
-            {"role": "system", "content": "memory"},
-            {"role": "system", "content": "checkpoint"},
-            {"role": "user", "content": "assignment"},
-            *[
-                {"role": "tool", "tool_call_id": f"call-{index}", "content": "x" * 2_000}
-                for index in range(50)
-            ],
-            {"role": "assistant", "content": "prepare report"},
-        ],
-        max_tokens=64_000,
-        recent_message_tokens=8_000,
-        allow_model_summary=False,
-    )
-    assert recent is not None
-    update_summary.assert_not_awaited()
-    events = await service.list_agent_events(
-        "execution-compact-run", execution["agent_id"]
-    )
-    assert any(
-        item["event_type"] == "context_micro_compacted"
-        and item["payload"]["reason"] == "execution_deterministic"
-        for item in events
-    )
-    assert not any(item["event_type"] == "memory_update_failed" for item in events)
-    await runner.close()
-    await service.close()
-
-
-@pytest.mark.asyncio
 async def test_soft_context_is_sent_and_only_provider_capacity_is_hard(
     tmp_path: Path,
 ) -> None:
@@ -803,7 +608,8 @@ async def test_same_model_summarizer_uses_no_tools() -> None:
                 "choices": [
                     {
                         "message": {
-                            "content": DEFAULT_SESSION_MEMORY + "\n# Current State\nupdated"
+                            "content": DEFAULT_SESSION_MEMORY
+                            + "\n# Current State\nupdated"
                         }
                     }
                 ]
@@ -880,8 +686,10 @@ async def test_deepseek_max_policy_preserves_reasoning_for_tool_roundtrip(
     run_root = tmp_path / "runs"
     service = StateService(run_root / "deepseek" / "state.sqlite3", run_root=run_root)
     await service.create_run("deepseek", model=settings.llm_model, prompt="task")
-    agent = await service.register_agent("deepseek", role="chief", initial_prompt="task")
-    await service.transition_controller("deepseek", agent["agent_id"], "running")
+    agent = await service.register_agent(
+        "deepseek", role="chief", initial_prompt="task"
+    )
+    await service.transition_agent("deepseek", agent["agent_id"], "running")
     store = await AgentStateStore.open(
         service,
         run_id="deepseek",
@@ -945,9 +753,9 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
 
             return [
                 ToolSpec(
-                    "execution_report",
+                    "worker_report",
                     "submit the structured execution report",
-                    ExecutionReport,
+                    AgentReportInput,
                     report,
                     lambda _arguments: (),
                 )
@@ -981,7 +789,10 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
                     "choices": [
                         {
                             "finish_reason": "length",
-                            "message": {"role": "assistant", "content": "partial again"},
+                            "message": {
+                                "role": "assistant",
+                                "content": "partial again",
+                            },
                         }
                     ]
                 },
@@ -1005,7 +816,7 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
                                     "id": "report-call",
                                     "type": "function",
                                     "function": {
-                                        "name": "execution_report",
+                                        "name": "worker_report",
                                         "arguments": json.dumps(
                                             {
                                                 "status": "completed",
@@ -1030,17 +841,18 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
     chief = await service.register_agent("truncated", role="chief")
     challenge = await service.register_agent(
         "truncated",
-        role="challenge",
+        role="solver",
         parent_id=chief["agent_id"],
         unique_code="c-01",
     )
     execution = await service.register_agent(
         "truncated",
-        role="execution",
+        role="worker",
         parent_id=challenge["agent_id"],
         unique_code="c-01",
         timeout_seconds=1_800,
         initial_prompt="task",
+        task_key="fixture-task",
     )
     store = await AgentStateStore.open(
         service,
@@ -1056,8 +868,8 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
         run_root=tmp_path,
         state_service=service,
         agent_id=execution["agent_id"],
-        role="execution",
-        require_structured_report=True,
+        role="worker",
+        required_report_tool="worker_report",
     )
 
     if expected_error is None:
@@ -1067,18 +879,19 @@ async def test_execution_length_response_uses_one_strict_reasoning_recovery(
         with pytest.raises(AgentRunnerError) as failure:
             await runner.run_session("task", store=store)
         assert failure.value.code == expected_error
+    requests = [body for body in requests if body.get("tools")]
     assert len(requests) == 2
     assert requests[1]["thinking"] == {"type": "enabled"}
     assert requests[1]["reasoning_effort"] == "max"
     assert "temperature" not in requests[1]
     assert requests[1]["max_tokens"] == 4_096
-    assert [
-        item["function"]["name"] for item in requests[1]["tools"]
-    ] == ["execution_report"]
+    assert [item["function"]["name"] for item in requests[1]["tools"]] == [
+        "worker_report"
+    ]
     events = await service.list_agent_events("truncated", execution["agent_id"])
-    assert [
-        item["event_type"] for item in events
-    ].count("llm_length_report_recovery") == 1
+    assert [item["event_type"] for item in events].count(
+        "llm_length_report_recovery"
+    ) == 1
 
     await runner.close()
     await client.aclose()
@@ -1122,7 +935,7 @@ async def test_deepseek_tool_call_without_reasoning_is_rejected_before_handler(
     service = StateService(run_root / "missing" / "state.sqlite3", run_root=run_root)
     await service.create_run("missing", model=settings.llm_model, prompt="task")
     agent = await service.register_agent("missing", role="chief", initial_prompt="task")
-    await service.transition_controller("missing", agent["agent_id"], "running")
+    await service.transition_agent("missing", agent["agent_id"], "running")
     store = await AgentStateStore.open(
         service,
         run_id="missing",
@@ -1165,7 +978,15 @@ class _FakeTools:
             self.calls.append(("system_read_file", values))
             return self.responses.get("system_read_file", {"ok": True, "data": {}})
 
-        return [ToolSpec("system_read_file", "test", ReadArguments, handler, lambda _arguments: ())]
+        return [
+            ToolSpec(
+                "system_read_file",
+                "test",
+                ReadArguments,
+                handler,
+                lambda _arguments: (),
+            )
+        ]
 
     async def close(self) -> None:
         return None
@@ -1180,11 +1001,12 @@ class _ControllerWaitTools:
             model_config = ConfigDict(extra="forbid", strict=True)
 
         specs = []
-        for name in ("challenge_wait", "challenge_observe"):
+        for name in ("solver_wait", "solver_observe"):
+
             async def handler(arguments: BaseModel, *, tool_name: str = name) -> Any:
                 self.calls.append(tool_name)
                 result = {"ok": True, "data": {"name": tool_name}}
-                if tool_name == "challenge_wait":
+                if tool_name == "solver_wait":
                     return ToolDispatchOutcome(result=result, yield_session=True)
                 return result
 
@@ -1195,7 +1017,7 @@ class _ControllerWaitTools:
                     EmptyArguments,
                     handler,
                     access_claims=lambda _arguments: (),
-                    requires_solo=name == "challenge_wait",
+                    requires_solo=name == "solver_wait",
                 )
             )
         return specs
@@ -1205,8 +1027,12 @@ class _ControllerWaitTools:
 
 
 @pytest.mark.asyncio
-async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Path) -> None:
-    fake_tools = _FakeTools({"system_read_file": {"ok": True, "data": {"content": "ok"}}})
+async def test_runner_persists_tool_loop_without_persisting_api_key(
+    tmp_path: Path,
+) -> None:
+    fake_tools = _FakeTools(
+        {"system_read_file": {"ok": True, "data": {"content": "ok"}}}
+    )
     registry = ToolRegistry([fake_tools])
     settings = _settings()
     calls = 0
@@ -1257,7 +1083,7 @@ async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Pa
     chief = await service.register_agent(
         "run-agent", role="chief", initial_prompt="complete local task"
     )
-    await service.transition_controller("run-agent", chief["agent_id"], "running")
+    await service.transition_agent("run-agent", chief["agent_id"], "running")
     store = await AgentStateStore.open(
         service,
         run_id="run-agent",
@@ -1287,7 +1113,9 @@ async def test_runner_persists_tool_loop_without_persisting_api_key(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Path) -> None:
+async def test_controller_wait_yields_without_an_extra_model_round(
+    tmp_path: Path,
+) -> None:
     tools = _ControllerWaitTools()
     requests = 0
 
@@ -1307,7 +1135,7 @@ async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Pat
                                     "id": "wait-1",
                                     "type": "function",
                                     "function": {
-                                        "name": "challenge_wait",
+                                        "name": "solver_wait",
                                         "arguments": "{}",
                                     },
                                 }
@@ -1346,7 +1174,7 @@ async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Pat
     result = await runner.run_session("wait", store=store)
     assert result.yield_reason == "controller_wait"
     assert requests == 1
-    assert tools.calls == ["challenge_wait"]
+    assert tools.calls == ["solver_wait"]
 
     tool_messages, requested_yield = await runner._execute_tool_calls(
         store,
@@ -1354,12 +1182,12 @@ async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Pat
             {
                 "id": "wait-parallel",
                 "type": "function",
-                "function": {"name": "challenge_wait", "arguments": "{}"},
+                "function": {"name": "solver_wait", "arguments": "{}"},
             },
             {
                 "id": "state-parallel",
                 "type": "function",
-                "function": {"name": "challenge_observe", "arguments": "{}"},
+                "function": {"name": "solver_observe", "arguments": "{}"},
             },
         ],
     )
@@ -1368,7 +1196,7 @@ async def test_controller_wait_yields_without_an_extra_model_round(tmp_path: Pat
     assert rejected["error"]["code"] == "solo_tool_must_be_only_call"
     blocked = json.loads(tool_messages[1]["content"])
     assert blocked["error"]["code"] == "blocked_by_solo_tool"
-    assert tools.calls == ["challenge_wait"]
+    assert tools.calls == ["solver_wait"]
 
     await runner.close()
     await client.aclose()

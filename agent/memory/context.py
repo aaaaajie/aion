@@ -37,7 +37,9 @@ def rough_token_count(value: Any) -> int:
     """Conservatively estimate tokens without adding a tokenizer dependency."""
 
     if not isinstance(value, str):
-        value = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        value = json.dumps(
+            value, ensure_ascii=False, default=str, separators=(",", ":")
+        )
     byte_count = len(value.encode("utf-8"))
     return max(0, math.ceil(byte_count / 3))
 
@@ -60,7 +62,6 @@ def request_message_budget(
     context_budget: ContextBudget,
     tool_definitions: Sequence[Mapping[str, Any]],
     role: str | None = None,
-    bootstrap: bool = False,
     calibration_ratio: float = REQUEST_PROMPT_CALIBRATION_INITIAL,
 ) -> int:
     """Return a transcript budget below the provider's absolute input limit."""
@@ -69,8 +70,7 @@ def request_message_budget(
         rough_token_count(tool_definitions) * TOOL_TOKEN_ESTIMATE_MULTIPLIER
     )
     calibrated_capacity = math.floor(
-        context_budget.absolute_prompt_tokens(role, bootstrap=bootstrap)
-        / max(1.0, calibration_ratio * 1.05)
+        context_budget.absolute_prompt_tokens(role) / max(1.0, calibration_ratio * 1.05)
     )
     budget = calibrated_capacity - estimated_tools
     if budget < 8_000:
@@ -101,7 +101,9 @@ def truncate_text(value: str, max_chars: int) -> str:
     return value[:head] + marker + value[-tail:]
 
 
-def tool_result_for_model(result: Any, max_chars: int = DEFAULT_MODEL_RESULT_CHARS) -> str:
+def tool_result_for_model(
+    result: Any, max_chars: int = DEFAULT_MODEL_RESULT_CHARS
+) -> str:
     """Serialize a tool result while keeping prompt growth bounded."""
 
     encoded = json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -124,7 +126,9 @@ def tool_result_for_model(result: Any, max_chars: int = DEFAULT_MODEL_RESULT_CHA
 
 
 def summary_tool_call_limit(role: str | None) -> int:
-    return ROLE_SUMMARY_TOOL_CALL_LIMITS.get(role or "execution", SUMMARY_UPDATE_TOOL_CALLS)
+    return ROLE_SUMMARY_TOOL_CALL_LIMITS.get(
+        role or "execution", SUMMARY_UPDATE_TOOL_CALLS
+    )
 
 
 def should_update_memory(
@@ -244,10 +248,13 @@ def _parse_sections(content: str) -> dict[str, str]:
 
 def _restore_required_headings(content: str) -> str:
     sections = _parse_sections(content)
-    return "\n\n".join(
-        f"# {section}\n\n{sections.get(section, '')}".rstrip()
-        for section in REQUIRED_MEMORY_SECTIONS
-    ) + "\n"
+    return (
+        "\n\n".join(
+            f"# {section}\n\n{sections.get(section, '')}".rstrip()
+            for section in REQUIRED_MEMORY_SECTIONS
+        )
+        + "\n"
+    )
 
 
 def _safe_recent_messages(

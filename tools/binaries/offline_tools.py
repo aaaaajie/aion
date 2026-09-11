@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -101,12 +102,12 @@ def _locked_packages(lock: Path) -> list[str]:
 
 def _missing_wheels(lock: Path, wheelhouse: Path) -> list[str]:
     files = {path.name.lower() for path in wheelhouse.iterdir() if path.is_file()}
-    # The wheelhouse is generated with pip, so use its package metadata parser
-    # rather than trying to reproduce wheel filename normalization here.
+    # Wheel project names normalize dots, hyphens and underscores alike.
+    # Keep this bootstrap check independent of packages not yet installed.
     missing: list[str] = []
     for requirement in _locked_packages(lock):
         package, version = requirement.split("==", 1)
-        normalized = package.replace("-", "_").lower()
+        normalized = re.sub(r"[-_.]+", "_", package).lower()
         if not any(
             name.startswith(f"{normalized}-{version.lower()}-")
             or name.startswith(f"{normalized}_{version.lower()}-")

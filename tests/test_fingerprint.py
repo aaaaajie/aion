@@ -1,6 +1,7 @@
 """Tests for the TscanPlus/Yakit fingerprint engine and tool."""
 
 from __future__ import annotations
+from tests.resource_runtime import another_resource_agent
 
 import base64
 import json
@@ -33,9 +34,7 @@ from tools.system.policy import SystemToolError, WorkspacePolicy
 from tests.resource_runtime import install_resource_runtime
 
 
-async def _manager(
-    root: Path, handler
-) -> tuple[StateService, HttpProbeManager, str]:
+async def _manager(root: Path, handler) -> tuple[StateService, HttpProbeManager, str]:
     run_root = root / "runs"
     service = StateService(run_root / "run-1" / "state.sqlite3", run_root=run_root)
     await service.create_run("run-1")
@@ -158,7 +157,9 @@ def test_passive_yakit_keyword_body_and_header() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generic_login_words_are_low_confidence_and_suppressed_by_default() -> None:
+async def test_generic_login_words_are_low_confidence_and_suppressed_by_default() -> (
+    None
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -289,7 +290,9 @@ def test_ehole_regular_and_multiple_favicon_candidates(
         patterns=(r"server:\s*nginx", r"x-powered-by:\s*php"),
         regexes=(
             fingerprint_module.re.compile(r"server:\s*nginx", fingerprint_module.re.I),
-            fingerprint_module.re.compile(r"x-powered-by:\s*php", fingerprint_module.re.I),
+            fingerprint_module.re.compile(
+                r"x-powered-by:\s*php", fingerprint_module.re.I
+            ),
         ),
     )
     matched = engine._match_ehole(
@@ -310,16 +313,19 @@ def test_ehole_regular_and_multiple_favicon_candidates(
         location="body",
         patterns=("11", "22", "33"),
     )
-    assert engine._match_ehole(
-        favicon,
-        PassiveProbe(
-            url="https://target.test/",
-            status=200,
-            headers={},
-            body_text="",
-            favicon_bytes=b"icon",
-        ),
-    ) is not None
+    assert (
+        engine._match_ehole(
+            favicon,
+            PassiveProbe(
+                url="https://target.test/",
+                status=200,
+                headers={},
+                body_text="",
+                favicon_bytes=b"icon",
+            ),
+        )
+        is not None
+    )
 
 
 def test_ehole_invalid_regex_is_skipped_with_diagnostics(
@@ -368,7 +374,9 @@ def test_active_matchers_and_not_contains() -> None:
         body_text='{"status":"UP","_links":{"self":{}}}',
         content_type="application/json",
     )
-    names = [match.name for match in engine.matching_rules_for("/actuator/health", probe)]
+    names = [
+        match.name for match in engine.matching_rules_for("/actuator/health", probe)
+    ]
     assert "SpringBoot-Actuator" in names
 
     excluded = ActiveProbe(
@@ -489,9 +497,7 @@ async def test_fingerprint_tool_lifecycle(tmp_path: Path) -> None:
     assert len(page["results"]) == 1
     assert page["next_cursor"] > 0
 
-    second = await service.register_agent(
-        "run-1", role="chief", initial_prompt="second"
-    )
+    second = await another_resource_agent(service, "run-1")
     second_id = second["agent_id"]
     with pytest.raises(SystemToolError) as caught:
         await manager.output(second_id, interaction_id=result["interaction_id"])
@@ -507,16 +513,16 @@ async def test_fingerprint_tool_lifecycle(tmp_path: Path) -> None:
 
     stopped = await manager.stop(agent_id, interaction_id=result["interaction_id"])
     assert stopped["interaction_id"] == result["interaction_id"]
-    cleaned = await manager.cleanup(
-        agent_id, interaction_id=result["interaction_id"]
-    )
+    cleaned = await manager.cleanup(agent_id, interaction_id=result["interaction_id"])
     assert cleaned["cleaned"] is True
     await manager.finish_run()
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_path_probe_does_not_issue_implicit_fingerprint_requests(tmp_path: Path) -> None:
+async def test_path_probe_does_not_issue_implicit_fingerprint_requests(
+    tmp_path: Path,
+) -> None:
     requested_paths: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:

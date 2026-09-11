@@ -1,0 +1,16 @@
+FROM aion:tool-enhancement
+COPY agent /opt/aion/agent
+COPY tools/cyberchef /opt/aion/tools/cyberchef
+COPY tools/binaries/cyberchef /opt/aion/tools/binaries/cyberchef
+COPY tools/binaries/bin/cyberchef /opt/aion/tools/binaries/bin/cyberchef
+COPY tools/binaries/manifest.json tools/binaries/enhanced-assets.sha256.json /opt/aion/tools/binaries/
+COPY scripts/build_cyberchef_python.py scripts/check_cyberchef_toolchain.py /opt/aion/scripts/
+RUN rm -rf /opt/aion/tools/binaries/cyberchef/node_modules \
+    && rm -f /opt/aion/tools/binaries/bin/node \
+        /opt/aion/tools/binaries/cyberchef/cli.mjs \
+        /opt/aion/tools/binaries/cyberchef/build.sh \
+        /opt/aion/tools/binaries/cyberchef/package.json \
+        /opt/aion/tools/binaries/cyberchef/package-lock.json \
+        /opt/aion/tools/binaries/cyberchef/NODE-LICENSE
+RUN --network=none python /opt/aion/scripts/build_cyberchef_python.py
+RUN --network=none python /opt/aion/scripts/check_cyberchef_toolchain.py

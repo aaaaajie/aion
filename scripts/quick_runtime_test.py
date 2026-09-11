@@ -154,23 +154,18 @@ class GuardedAgentRunner(AgentRunner):
         if role == "chief":
             guard = (
                 "TEST HARNESS RULES: This is a controlled CTF capability test. "
-                "Refresh the configured local catalog, create only the Challenge "
+                "Refresh the configured local catalog, start only the Solver "
                 "Agents named in the user prompt, and read their reports. The "
                 "catalog adapter is local-only: do not connect to any competition "
                 "platform or request platform operations."
             )
-        elif role == "challenge":
+        elif role == "solver":
             guard = (
-                "TEST HARNESS RULES: This is an authorized assessment of the "
-                "configured CTF target. Do not connect to a competition platform, "
-                "start or stop a target, request a platform Hint, submit a Flag, or "
-                "close the challenge. Begin a cycle, decompose the mission into "
-                "useful non-duplicated Execution tasks, and create as many short-lived "
-                "Execution Agents as the evidence warrants. After creating them, "
-                "wait for and consume every execution report, including failures. "
-                "Record blockers and decide on non-duplicating follow-up work before "
-                "ending the cycle. Use only the configured target addresses; do not "
-                "invent additional targets."
+                "TEST HARNESS RULES: Work only on the configured authorized target. "
+                "Solve directly with technical tools. Delegate independent execute or "
+                "review Workers only when useful, using explicit task keys. Preserve "
+                "evidence and report progress. Do not request platform hints, submit "
+                "answers, start or stop targets, or invent additional targets."
             )
         else:
             guard = (
@@ -182,7 +177,7 @@ class GuardedAgentRunner(AgentRunner):
                 "addresses and do not invent targets. Do not connect to a competition "
                 "platform, start or stop a target, request a platform Hint, submit a "
                 "Flag, or close a challenge. Record concrete evidence and finally "
-                "call execution_report with a concise, honest summary; never include "
+                "call worker_report with a concise, honest summary; never include "
                 "a candidate Flag in the report."
             )
         guarded_prompt = f"{prompt or ''}\n\n{guard}"
@@ -196,7 +191,7 @@ class GuardedAgentRunner(AgentRunner):
 
 ROLE_DISABLED_TOOLS: dict[str, frozenset[str]] = {
     "chief": frozenset({"chief_request_hint"}),
-    "challenge": frozenset({"challenge_submit_flag", "challenge_close_challenge"}),
+    "solver": frozenset({"solver_submit_flag", "chief_close_challenges"}),
 }
 
 TERMINAL_AGENT_STATUSES = frozenset(
@@ -225,9 +220,7 @@ class LocalChallengeBenchmark:
     """Offline Benchmark-shaped adapter backed by the configured CTF slots."""
 
     def __init__(self, challenges: list[dict[str, Any]]) -> None:
-        self._challenges = {
-            item["unique_code"]: dict(item) for item in challenges
-        }
+        self._challenges = {item["unique_code"]: dict(item) for item in challenges}
         self._started: set[str] = set()
 
     async def _execute(
@@ -302,6 +295,7 @@ class LocalChallengeBenchmark:
             ("benchmark_submit_flag", _LocalSubmitFlag, "write"),
             ("benchmark_close_challenge", _LocalUniqueCode, "write"),
         ):
+
             async def handler(
                 arguments: BaseModel, tool_name: str = name
             ) -> dict[str, Any]:
@@ -331,7 +325,9 @@ class LocalChallengeBenchmark:
             "flag_count": 0,
             "correct_flag_count": 0,
             "is_completed": False,
-            "container_status": "running" if unique_code in self._started else "stopped",
+            "container_status": "running"
+            if unique_code in self._started
+            else "stopped",
             "container_addr": challenge["container_addr"],
         }
 
@@ -366,9 +362,7 @@ def _selected_challenges(override: str | None) -> list[dict[str, Any]]:
     for index, item in enumerate(values, start=1):
         name = str(item.get("name", "")).strip()
         if not name:
-            raise ValueError(
-                f"fill CHALLENGES[{index - 1}]['name'] before running"
-            )
+            raise ValueError(f"fill CHALLENGES[{index - 1}]['name'] before running")
         description = str(item.get("description", "")).strip()
         if not description:
             raise ValueError(
@@ -378,14 +372,13 @@ def _selected_challenges(override: str | None) -> list[dict[str, Any]]:
         if isinstance(raw_address, str):
             addresses = [raw_address.strip()] if raw_address.strip() else []
         elif isinstance(raw_address, list):
-            addresses = [str(value).strip()
-                         for value in raw_address if str(value).strip()]
+            addresses = [
+                str(value).strip() for value in raw_address if str(value).strip()
+            ]
         else:
             addresses = []
         if not addresses:
-            raise ValueError(
-                f"fill CHALLENGES[{index - 1}]['address'] before running"
-            )
+            raise ValueError(f"fill CHALLENGES[{index - 1}]['address'] before running")
         item["name"] = name
         item["unique_code"] = name
         item["description"] = description
@@ -425,7 +418,7 @@ def _print_overview(overview: dict[str, Any], state_path: Path) -> None:
     report_count = 0
     execution_count = 0
     for agent in overview["agents"]:
-        if agent["role"] == "execution":
+        if agent["role"] == "worker":
             execution_count += 1
             if agent["last_report_sequence"]:
                 report_count += 1
@@ -443,10 +436,10 @@ def _print_overview(overview: dict[str, Any], state_path: Path) -> None:
             f"work={challenge['work_status']}"
         )
     print(f"[quick-test] execution_agents: {execution_count}")
-    print(f"[quick-test] execution_reports: {report_count}")
+    print(f"[quick-test] worker_reports: {report_count}")
 
 
-def _execution_phase_complete(
+def _requested_work_complete(
     overview: dict[str, Any], expected_codes: set[str]
 ) -> bool:
     """Return true only after child reports reached their Challenge parent."""
@@ -454,15 +447,10 @@ def _execution_phase_complete(
     execution_agents = [
         item
         for item in overview["agents"]
-        if item["role"] == "execution" and item["unique_code"] in expected_codes
+        if item["role"] == "worker" and item["unique_code"] in expected_codes
     ]
-    if not execution_agents:
-        return False
-    if {item["unique_code"] for item in execution_agents} != expected_codes:
-        return False
     if not all(
-        item["status"] in TERMINAL_AGENT_STATUSES
-        and bool(item["last_report_sequence"])
+        item["status"] in TERMINAL_AGENT_STATUSES and bool(item["last_report_sequence"])
         for item in execution_agents
     ):
         return False
@@ -470,26 +458,23 @@ def _execution_phase_complete(
     challenge_agents = {
         item["agent_id"]: item
         for item in overview["agents"]
-        if item["role"] == "challenge" and item["unique_code"] in expected_codes
+        if item["role"] == "solver" and item["unique_code"] in expected_codes
     }
     if {item["unique_code"] for item in challenge_agents.values()} != expected_codes:
         return False
     # Consuming the current batch is not the end of a Challenge Agent's
     # lifecycle.  It may still be deciding whether to create follow-up
-    # Execution Agents, update the cycle, or continue observing the target.
+    # Workers or continue observing the target.
     # Only let the harness close the Runtime after the parent has explicitly
     # reached a terminal state as well.
     if not all(
-        item["status"] in TERMINAL_AGENT_STATUSES
-        for item in challenge_agents.values()
+        item["status"] in TERMINAL_AGENT_STATUSES for item in challenge_agents.values()
     ):
         return False
     for code in expected_codes:
-        children = [
-            item
-            for item in execution_agents
-            if item["unique_code"] == code
-        ]
+        children = [item for item in execution_agents if item["unique_code"] == code]
+        if not children:
+            continue
         parent_ids = {item.get("parent_id") for item in children}
         if None in parent_ids or len(parent_ids) != 1:
             return False
@@ -499,18 +484,13 @@ def _execution_phase_complete(
         latest_report = max(
             int(item.get("last_report_sequence") or 0) for item in children
         )
-        cursors = parent.get("report_cursors") or {}
-        consumed_through = int(
-            cursors.get("execution", parent.get("report_cursor", 0)) or 0
-        )
+        consumed_through = int(parent.get("report_cursor", 0))
         if consumed_through < latest_report:
             return False
     return True
 
 
-def _unconsumed_report_count(
-    overview: dict[str, Any], expected_codes: set[str]
-) -> int:
+def _unconsumed_report_count(overview: dict[str, Any], expected_codes: set[str]) -> int:
     """Count persisted child reports not yet consumed by their parent."""
 
     agents = overview["agents"]
@@ -518,18 +498,13 @@ def _unconsumed_report_count(
     count = 0
     for item in agents:
         if (
-            item["role"] != "execution"
+            item["role"] != "worker"
             or item["unique_code"] not in expected_codes
             or not item.get("last_report_sequence")
         ):
             continue
         parent = parents.get(item.get("parent_id"), {})
-        cursor = int(
-            (parent.get("report_cursors") or {}).get(
-                "execution", parent.get("report_cursor", 0)
-            )
-            or 0
-        )
+        cursor = int(parent.get("report_cursor", 0))
         if cursor < int(item["last_report_sequence"]):
             count += 1
     return count
@@ -628,7 +603,7 @@ async def run_test(
         print(f"[quick-test] chief_agent_id: {chief_id}")
         if monitor_enabled:
             state_path = settings.run_root / run_id / "state.sqlite3"
-            monitor = RuntimeMonitor(state_path, run_id, port=monitor_port)
+            monitor = RuntimeMonitor(state_path, run_id, port=monitor_port, workspace_root=PROJECT_ROOT)
             print(f"[quick-test] monitor: {monitor.start()}")
             print("[quick-test] monitor is local-only; open the URL above in a browser")
             monitor_started = True
@@ -647,12 +622,13 @@ async def run_test(
                     )
                     result_message = f"challenge agent failed: {unique_code}"
                     break
-                started_agents.append(
-                    (unique_code, result["data"]["agent_id"]))
+                started_agents.append((unique_code, result["data"]["agent_id"]))
                 print(f"[quick-test] challenge agent started: {unique_code}")
             else:
                 result_code = 0
-                result_message = "passive SQLite lifecycle and local challenge startup completed"
+                result_message = (
+                    "passive SQLite lifecycle and local challenge startup completed"
+                )
         else:
             assert runtime.state_service is not None
             deadline = (
@@ -667,18 +643,23 @@ async def run_test(
                 actual_codes = {
                     item["unique_code"]
                     for item in overview["agents"]
-                    if item["role"] == "challenge" and item["unique_code"]
+                    if item["role"] == "solver" and item["unique_code"]
                 }
                 if expected_codes.issubset(actual_codes):
                     for item in overview["agents"]:
-                        if item["role"] == "challenge" and item["unique_code"] in expected_codes:
+                        if (
+                            item["role"] == "solver"
+                            and item["unique_code"] in expected_codes
+                        ):
                             started_agents.append(
-                                (item["unique_code"], item["agent_id"]))
+                                (item["unique_code"], item["agent_id"])
+                            )
                     break
                 await asyncio.sleep(1)
             if len(started_agents) != len(expected_codes):
                 print(
-                    "[quick-test] Chief did not create all configured Challenge Agents")
+                    "[quick-test] Chief did not create all configured Challenge Agents"
+                )
                 result_message = "Chief did not create all configured Challenge Agents"
             else:
                 print("[quick-test] Chief created the configured Challenge Agents")
@@ -695,7 +676,7 @@ async def run_test(
             while deadline is None or asyncio.get_running_loop().time() < deadline:
                 await runtime.ensure_healthy()
                 overview = await runtime.state_service.get_overview(run_id)
-                if _execution_phase_complete(overview, expected_codes):
+                if _requested_work_complete(overview, expected_codes):
                     result_code = 0
                     result_message = (
                         "configured target assessment completed; SQLite reports persisted; "
@@ -713,22 +694,21 @@ async def run_test(
             execution_agents = [
                 item
                 for item in overview["agents"]
-                if item["role"] == "execution"
-                and item["unique_code"] in expected_codes
+                if item["role"] == "worker" and item["unique_code"] in expected_codes
             ]
             if not execution_agents:
                 result_code = 1
-                result_message = "no Execution Agent was created for the configured targets"
-            elif not _execution_phase_complete(overview, expected_codes):
+                result_message = (
+                    "no Execution Agent was created for the configured targets"
+                )
+            elif not _requested_work_complete(overview, expected_codes):
                 result_code = 1
                 pending = sum(
                     item["status"] not in TERMINAL_AGENT_STATUSES
                     or not item["last_report_sequence"]
                     for item in execution_agents
                 )
-                pending_consumption = _unconsumed_report_count(
-                    overview, expected_codes
-                )
+                pending_consumption = _unconsumed_report_count(overview, expected_codes)
                 result_message = (
                     f"{pending} Execution Agent(s) are still queued, running, or missing a report; "
                     f"{pending_consumption} report(s) are waiting for Challenge consumption"
@@ -748,19 +728,28 @@ async def run_test(
                     challenge = next(
                         (
                             item
-                            for item in await runtime.state_service.list_challenges(run_id)
+                            for item in await runtime.state_service.list_challenges(
+                                run_id
+                            )
                             if item["unique_code"] == unique_code
                         ),
                         None,
                     )
-                    if challenge and challenge["container_status"] in {"starting", "running"}:
-                        close_result = await runtime.supervisor.close_challenge(challenge_agent_id)
+                    if challenge and challenge["container_status"] in {
+                        "starting",
+                        "running",
+                    }:
+                        close_result = await runtime.supervisor.close_challenge(
+                            challenge_agent_id
+                        )
                         if close_result.get("ok"):
                             print(
-                                f"[quick-test] local challenge slot closed: {unique_code}")
+                                f"[quick-test] local challenge slot closed: {unique_code}"
+                            )
                         else:
                             print(
-                                f"[quick-test] local challenge slot close failed: {unique_code}")
+                                f"[quick-test] local challenge slot close failed: {unique_code}"
+                            )
         finally:
             await runtime.close()
             if network_manager is not None:
@@ -770,12 +759,12 @@ async def run_test(
                     monitor.freeze(result_code, message=result_message)
                     print(f"[quick-test] monitor frozen: {monitor.url}")
                     if not monitor_exit_on_complete and not interrupted:
-                        print(
-                            "[quick-test] press Ctrl-C to close the frozen monitor")
+                        print("[quick-test] press Ctrl-C to close the frozen monitor")
                         await _wait_for_monitor_exit()
                 except Exception as exc:
                     print(
-                        f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}")
+                        f"[quick-test] monitor unavailable: {type(exc).__name__}: {exc}"
+                    )
                 finally:
                     monitor.close()
 

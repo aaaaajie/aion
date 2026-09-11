@@ -9,12 +9,14 @@ from pydantic import BaseModel
 
 from agent.tooling import AccessClaim, ToolSpec
 
+from .experiments import HttpReplayArguments, HttpCompareArguments, replay, compare
 from .manager import AgentHttpClient
 from .models import (
     FingerprintArguments,
     HttpAnalyzeArguments,
     HttpCleanupArguments,
     HttpOutputArguments,
+    HttpPlanArguments,
     HttpProbeArguments,
     HttpRequestArguments,
     HttpResponseArguments,
@@ -31,18 +33,78 @@ class HttpTools:
 
     def tool_specs(self) -> list[ToolSpec]:
         return [
-            self._spec("system_http_request", "Send one fresh HTTP request from top-level method/URL fields. Reuse session_id for ordered multi-step protocols; poll the returned interaction_id instead of replaying work.", HttpRequestArguments, self._client.request, self._request_claims, self._page_projection),
-            self._spec("system_http_probe", "Generate at most 5,000 independent requests from a finite matrix. Send one JSON object whose top-level cases value is an array; each case is flat and owns variables/combine. Keep concurrency/rate_limit_per_second/wait_seconds at the top level. Do not send an arguments wrapper, request nesting, top-level variables/combine, per-case controls, session_id, comments, trailing commas, or JSON encoded as a string. Escape quotes, backslashes, and newlines in string values. Example: {\"cases\":[{\"method\":\"GET\",\"url\":\"http://host/{{path}}\",\"variables\":{\"path\":{\"values\":[\"/\",\"/admin\"],\"encoding\":\"path\"}},\"combine\":\"product\"}],\"concurrency\":8,\"wait_seconds\":20}. Use system_http_request with session_id for ordered multi-step protocols.", HttpProbeArguments, self._client.probe, self._new_interaction_claims, self._page_projection),
-            self._spec("system_web_path_probe", "Run bounded web path discovery for one base URL. Preserve interaction_id and poll for status.", PathProbeArguments, self._client.path_probe, self._scan_claims, self._page_projection),
-            self._spec("system_web_fingerprint", "Identify the web technology stack using passive and optional active evidence.", FingerprintArguments, self._client.fingerprint, self._scan_claims, self._page_projection),
-            self._spec("system_http_analyze", "Create or read on-demand deterministic analysis for an existing HTTP interaction without resending traffic.", HttpAnalyzeArguments, self._client.analyze, self._interaction_write, self._page_projection),
-            self._spec("system_http_output", "Poll compact response and analysis records for an existing interaction. This never resends traffic.", HttpOutputArguments, self._client.output, self._interaction_read, self._page_projection),
-            self._spec("system_http_response", "Read an exact owned response Body by byte range.", HttpResponseArguments, self._client.response, self._interaction_read),
-            self._spec("system_http_stop", "Cancel an owned queued, running, or analyzing interaction while preserving stored output.", HttpStopArguments, self._client.stop, self._interaction_write),
+            self._spec("system_http_replay", "Replay a saved owned request 请求复用; replace explicit fields, retain current session cookies.", HttpReplayArguments, lambda a: replay(self._client, a), lambda a: (AccessClaim("write", "http-replay"),), requires_solo=True),
+            self._spec("system_http_compare", "Compare saved responses 响应对比: status, redirect, cookie attributes and body differences; no network requests.", HttpCompareArguments, lambda a: compare(self._client, a), lambda a: (AccessClaim("read", "http-evidence"),)),
+            self._spec(
+                "system_http_request",
+                "登录 login 会话 session: Send one fresh HTTP request from top-level method/URL fields. Reuse session_id for ordered multi-step protocols; poll the returned interaction_id instead of replaying work.",
+                HttpRequestArguments,
+                self._client.request,
+                self._request_claims,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_http_probe",
+                'Generate at most 5,000 independent requests from a finite matrix. Send one JSON object whose top-level cases value is an array; each case is flat and owns variables/combine. Keep concurrency/rate_limit_per_second/wait_seconds at the top level. Do not send an arguments wrapper, request nesting, top-level variables/combine, per-case controls, session_id, comments, trailing commas, or JSON encoded as a string. Escape quotes, backslashes, and newlines in string values. Example: {"cases":[{"method":"GET","url":"http://host/{{path}}","variables":{"path":{"values":["/","/admin"],"encoding":"path"}},"combine":"product"}],"concurrency":8,"wait_seconds":20}. Use system_http_request with session_id for ordered multi-step protocols.',
+                HttpProbeArguments,
+                self._client.probe,
+                self._new_interaction_claims,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_http_plan",
+                "Validate and preview system_http_request or system_http_probe arguments without sending HTTP or creating runtime work. Returns counts and up to five credential-masked previews.",
+                HttpPlanArguments,
+                self._client.plan,
+                lambda _arguments: (),
+            ),
+            self._spec(
+                "system_web_path_probe",
+                "Run bounded web path discovery for one base URL. When evidence supports it, use packaged_wordlists with a named CTF list (web-paths-quick.txt, file-names-quick.txt, http-params-quick.txt, or linux-lfi.txt); use wordlist_paths only for Agent workspace files. Explicit and page-derived lists are capped by max_candidates=256 by default. Preserve interaction_id and poll for status.",
+                PathProbeArguments,
+                self._client.path_probe,
+                self._scan_claims,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_web_fingerprint",
+                "Identify the web technology stack using passive and optional active evidence.",
+                FingerprintArguments,
+                self._client.fingerprint,
+                self._scan_claims,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_http_analyze",
+                "Create or read on-demand deterministic analysis for an existing HTTP interaction without resending traffic.",
+                HttpAnalyzeArguments,
+                self._client.analyze,
+                self._interaction_write,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_http_output",
+                "Poll compact response and analysis records for an existing interaction. This never resends traffic.",
+                HttpOutputArguments,
+                self._client.output,
+                self._interaction_read,
+                self._page_projection,
+            ),
+            self._spec(
+                "system_http_response",
+                "Read an exact owned response Body by byte range.",
+                HttpResponseArguments,
+                self._client.response,
+                self._interaction_read,
+            ),
+            self._spec(
+                "system_http_stop",
+                "Cancel an owned queued, running, or analyzing interaction while preserving stored output.",
+                HttpStopArguments,
+                self._client.stop,
+                self._interaction_write,
+            ),
         ]
-
-    async def close(self) -> None:
-        await self._client.close()
 
     @staticmethod
     def _spec(
@@ -52,6 +114,7 @@ class HttpTools:
         operation: Callable[[Any], Awaitable[dict[str, Any]]],
         claims: Callable[[BaseModel], tuple[AccessClaim, ...]],
         projector: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        requires_solo: bool = False,
     ) -> ToolSpec:
         async def handler(arguments: BaseModel) -> Any:
             return await operation(arguments)
@@ -63,6 +126,7 @@ class HttpTools:
             handler,
             access_claims=claims,
             result_projector=projector,
+            requires_solo=requires_solo,
         )
 
     @staticmethod
@@ -107,12 +171,17 @@ class HttpTools:
                 "resource_status",
                 "cursor",
                 "next_cursor",
+                "page_end_cursor",
+                "has_more",
+                "read_scope",
                 "recommended_wait_seconds",
                 "recommended_action",
                 "is_terminal",
                 "can_cleanup",
                 "connection_pool",
                 "request_catalog",
+                "read_result",
+                "result_state",
             )
             if key in data
         }

@@ -64,9 +64,11 @@ result, or treat a model explanation as evidence. If a dependency is unavailable
 dispatch no substitute fiction; report the missing dependency and keep the branch
 inconclusive.
 
-## Final handoff
+## Preserve the result
 
-The Challenge Agent should dispatch concrete work and consume reports. It should
-not invent flags, credentials, URLs, source locations, or exploitability claims.
-Use the existing challenge report and state-update tools to preserve the finding
-status and evidence references.
+Solver and execute Worker share this planning catalog. Continue dependent steps in
+the same Agent; Solver may explicitly delegate independent work. Never invent
+flags, credentials, URLs, source locations, or exploitability claims. Worker uses
+`worker_update` for progress and `worker_report` once for its terminal outcome;
+Solver uses `solver_progress` and decides separately whether to submit an answer.
+Preserve evidence references and distinguish verified findings from hypotheses.

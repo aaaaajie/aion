@@ -13,7 +13,7 @@ Expected path:
    service, collect a bounded banner/health response, then close the channel.
 4. Close the SSH session; record session/channel IDs, evidence references, and
    cleanup status without copying secrets into the report.
-5. Finish with one `execution_report` and use `INCONCLUSIVE` when the service is
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) and use `INCONCLUSIVE` when the service is
    reachable but its security effect is not established.
 
 Acceptance: no second hop or broad post-access enumeration is started.

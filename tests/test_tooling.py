@@ -11,7 +11,8 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.runner import AgentRunner
-from agent.subagents.models import ChallengeDispatchArguments, ExecutionReport
+from agent.subagents.models import DelegateArguments
+from agent.state import AgentReportInput
 from agent.tooling import (
     AccessClaim,
     ToolExecutor,
@@ -57,43 +58,20 @@ def call(name: str, arguments: str, call_id: str = "call") -> dict[str, Any]:
     return {"id": call_id, "function": {"name": name, "arguments": arguments}}
 
 
-def test_probe_argument_recovery_budget_allows_one_correction() -> None:
+def test_probe_argument_errors_preserve_fields_and_allow_further_corrections() -> None:
     runner = AgentRunner.__new__(AgentRunner)
-    runner._probe_argument_failure_streak = 0
-    runner._probe_recovery_exhausted = False
-    first = PreparedToolCall(
-        0,
-        "first",
-        "system_http_probe",
-        10,
-        result=tool_error(
-            "parse",
-            "invalid_json",
-            "invalid",
-            retry_allowed=True,
-            retry_action="rewrite_arguments",
-        ),
-    )
-    runner._apply_probe_recovery_budget([first])
-    assert first.result["error"]["retry"]["allowed"] is True
-
-    second = PreparedToolCall(
-        0,
-        "second",
-        "system_http_probe",
-        10,
-        result=tool_error(
-            "schema",
-            "invalid_arguments",
-            "invalid",
-            retry_allowed=True,
-            retry_action="rewrite_arguments",
-        ),
-    )
-    runner._apply_probe_recovery_budget([second])
-    assert second.result["error"]["code"] == "probe_argument_recovery_exhausted"
-    assert second.result["error"]["retry"]["allowed"] is False
-    assert runner._probe_recovery_exhausted is True
+    runner._invalid_argument_digests = {}
+    for digest, stage in (("first", "parse"), ("second", "schema"), ("third", "schema")):
+        item = PreparedToolCall(0, digest, "system_http_probe", 10,
+            raw_arguments_digest=digest, result=tool_error(stage, "invalid_arguments", "invalid",
+                retry_allowed=True, retry_action="rewrite_arguments", details={"fields": ["body"]}))
+        runner._annotate_repeated_arguments([item])
+        assert item.result["error"]["code"] == "invalid_arguments"
+        assert item.result["error"]["details"]["fields"] == ["body"]
+        assert item.result["error"]["retry"]["allowed"]
+    valid = PreparedToolCall(0, "valid", "system_http_probe", 10, arguments=Arguments(value=1))
+    runner._annotate_repeated_arguments([valid])
+    assert not runner._invalid_argument_digests
 
 
 @pytest.mark.asyncio
@@ -108,10 +86,10 @@ async def test_tool_executor_accepts_synchronous_and_async_handlers() -> None:
 
 
 def test_best_effort_tool_arguments_serialize_without_pydantic_warnings() -> None:
-    dispatch = ChallengeDispatchArguments.model_validate(
-        {"summary": "dispatch", "tasks": [{"objective": "collect baseline"}]}
+    dispatch = DelegateArguments.model_validate(
+        {"tasks": [{"task_key": "baseline", "objective": "collect baseline"}]}
     )
-    report = ExecutionReport.model_validate(
+    report = AgentReportInput.model_validate(
         {
             "status": "completed",
             "summary": "done",
@@ -125,17 +103,13 @@ def test_best_effort_tool_arguments_serialize_without_pydantic_warnings() -> Non
     assert not [
         item for item in captured if "PydanticSerialization" in str(item.message)
     ]
-    assert dispatch_payload["tasks"] == [{"objective": "collect baseline"}]
-    assert report_payload["findings"] == [
-        {"summary": "a finding", "evidence_refs": []}
-    ]
+    assert dispatch_payload["tasks"][0]["task_key"] == "baseline"
+    assert report_payload["findings"][0]["summary"] == "a finding"
 
 
-def test_probe_argument_recovery_rejects_an_exact_duplicate() -> None:
+def test_repeated_arguments_annotate_an_exact_duplicate() -> None:
     runner = AgentRunner.__new__(AgentRunner)
-    runner._probe_argument_failure_streak = 0
-    runner._probe_recovery_exhausted = False
-    runner._probe_invalid_argument_digest = None
+    runner._invalid_argument_digests = {}
     first = PreparedToolCall(
         0,
         "first",
@@ -150,7 +124,7 @@ def test_probe_argument_recovery_rejects_an_exact_duplicate() -> None:
             retry_action="rewrite_arguments",
         ),
     )
-    runner._apply_probe_recovery_budget([first])
+    runner._annotate_repeated_arguments([first])
     duplicate = PreparedToolCall(
         0,
         "duplicate",
@@ -165,10 +139,10 @@ def test_probe_argument_recovery_rejects_an_exact_duplicate() -> None:
             retry_action="rewrite_arguments",
         ),
     )
-    runner._apply_probe_recovery_budget([duplicate])
-    assert duplicate.result["error"]["code"] == "probe_argument_recovery_exhausted"
-    assert duplicate.result["error"]["details"]["same_arguments"] is True
-    assert duplicate.result["error"]["retry"]["allowed"] is False
+    runner._annotate_repeated_arguments([duplicate])
+    assert duplicate.result["error"]["code"] == "invalid_arguments"
+    assert duplicate.result["error"]["details"]["repeated_arguments"] is True
+    assert duplicate.result["error"]["retry"]["allowed"] is True
 
 
 @pytest.mark.asyncio
@@ -194,7 +168,9 @@ async def test_invalid_json_and_schema_errors_never_reach_handler() -> None:
     assert invalid_json.result["error"]["retry"]["tool"] == "test_tool"
     assert invalid_json.result["error"]["details"]["required"] == ["value"]
     assert invalid_schema.result["error"]["stage"] == "schema"
-    paths = {item["path"] for item in invalid_schema.result["error"]["details"]["fields"]}
+    paths = {
+        item["path"] for item in invalid_schema.result["error"]["details"]["fields"]
+    }
     assert paths == {"value", "extra"}
 
 
@@ -210,7 +186,9 @@ def test_tool_definition_is_generated_from_the_input_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_independent_calls_run_concurrently_and_results_keep_model_order() -> None:
+async def test_independent_calls_run_concurrently_and_results_keep_model_order() -> (
+    None
+):
     entered = 0
     release = asyncio.Event()
 
@@ -235,7 +213,9 @@ async def test_independent_calls_run_concurrently_and_results_keep_model_order()
 
 
 @pytest.mark.asyncio
-async def test_failed_write_blocks_later_same_resource_but_not_independent_work() -> None:
+async def test_failed_write_blocks_later_same_resource_but_not_independent_work() -> (
+    None
+):
     calls: list[str] = []
 
     async def handler(arguments: BaseModel) -> dict[str, Any]:
@@ -260,7 +240,9 @@ async def test_failed_write_blocks_later_same_resource_but_not_independent_work(
 
     provider = Provider(
         handler,
-        claims=lambda arguments: (AccessClaim("write", f"resource:{arguments.resource}"),),
+        claims=lambda arguments: (
+            AccessClaim("write", f"resource:{arguments.resource}"),
+        ),
     )
     results = await ToolExecutor(ToolRegistry([provider])).execute(
         [
@@ -288,15 +270,22 @@ async def test_independent_control_tools_can_share_one_model_response() -> None:
     class StateProvider:
         def tool_specs(self) -> list[ToolSpec]:
             return [
-                ToolSpec("challenge_observe", "observe", Empty, handler, lambda _arguments: ()),
-                ToolSpec("challenge_dispatch", "dispatch", Empty, handler, lambda _arguments: ()),
+                ToolSpec(
+                    "solver_observe", "observe", Empty, handler, lambda _arguments: ()
+                ),
+                ToolSpec(
+                    "solver_delegate", "dispatch", Empty, handler, lambda _arguments: ()
+                ),
             ]
 
         async def close(self) -> None:
             return None
 
     results = await ToolExecutor(ToolRegistry([StateProvider()])).execute(
-        [call("challenge_observe", "{}", "observe"), call("challenge_dispatch", "{}", "dispatch")]
+        [
+            call("solver_observe", "{}", "observe"),
+            call("solver_delegate", "{}", "dispatch"),
+        ]
     )
     assert len(invoked) == 2
     assert all(item.result["ok"] for item in results)
@@ -306,7 +295,9 @@ def test_large_result_store_is_private_atomic_and_pageable(tmp_path: Path) -> No
     owner = ToolResultStore(tmp_path / "run", "agent-a")
     content = json.dumps({"data": "x" * 30_000})
     result_ref = owner.persist(content)
-    path = next((tmp_path / "run" / "agents" / "agent-a" / "tool-results").glob("*.json"))
+    path = next(
+        (tmp_path / "run" / "agents" / "agent-a" / "tool-results").glob("*.json")
+    )
     assert path.read_text(encoding="utf-8") == content
     assert os.stat(path).st_mode & 0o777 == 0o600
 
@@ -314,12 +305,20 @@ def test_large_result_store_is_private_atomic_and_pageable(tmp_path: Path) -> No
     chunks: list[str] = []
     while True:
         page = owner.read(
-            ToolResultReadArguments(result_ref=result_ref, offset=offset, limit_chars=8_000)
+            ToolResultReadArguments(
+                result_ref=result_ref, offset=offset, limit_chars=8_000
+            )
         )
         chunks.append(page["content"])
         if page["eof"]:
+            assert page["read_result"] is None
             break
-        offset = page["next_offset"]
+        followup = page["read_result"]
+        assert followup["tool"] == "tool_result_read"
+        args = ToolResultReadArguments.model_validate(followup["arguments"])
+        assert args.result_ref == result_ref
+        assert args.offset == page["next_offset"]
+        offset = args.offset
     assert "".join(chunks) == content
 
     other = ToolResultStore(tmp_path / "run", "agent-b")
@@ -342,7 +341,7 @@ def test_large_result_keeps_evidence_projection(tmp_path: Path) -> None:
         },
     }
     projected, result_ref, original_chars = AgentRunner._project_model_result(
-        "challenge_observe",
+        "solver_observe",
         result,
         ToolResultStore(tmp_path / "run", "agent-a"),
     )
@@ -350,3 +349,22 @@ def test_large_result_keeps_evidence_projection(tmp_path: Path) -> None:
     assert original_chars > 12_000
     assert projected["evidence_refs"] == [evidence_ref]
     assert projected["result_ref"] == result_ref
+
+
+def test_deferred_result_has_executable_read_instruction(tmp_path):
+    store = ToolResultStore(tmp_path, "solver")
+    original = {"ok": True, "data": {"output": "中" * 18000 + "decisive-tail"}}
+    projected, ref, _ = AgentRunner._project_model_result("system_shell", original, store)
+    compacted = AgentRunner._compact_tool_messages([
+        {"role": "tool", "tool_call_id": "shell", "content": json.dumps(projected)}])
+    compacted_result = json.loads(compacted[0]["content"])
+    assert compacted_result["result_ref"] == ref
+    assert compacted_result["read_result"] == projected["read_result"]
+    chunks = []
+    instruction = compacted_result["read_result"]
+    while instruction:
+        assert instruction["tool"] == "tool_result_read"
+        page = store.read(ToolResultReadArguments.model_validate(instruction["arguments"]))
+        chunks.append(page["content"])
+        instruction = page["read_result"]
+    assert json.loads("".join(chunks)) == original

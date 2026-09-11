@@ -32,9 +32,11 @@ FROM python:3.11-slim-trixie
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/aion/tools/binaries/playwright-browsers \
+    SEMGREP_SEND_METRICS=off \
+    SEMGREP_ENABLE_VERSION_CHECK=0 \
     PYTHONPATH=/opt/aion \
     AION_TOOLCHAIN_ROOT=/opt/aion/tools/binaries \
-    AION_LINUX_SANDBOX_USER=aion-sandbox \
     PATH=/opt/aion/tools/binaries/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/var/lib/aion/home
 
@@ -44,6 +46,7 @@ WORKDIR /opt/aion
 # Python dependencies are installed exclusively from the bundled wheelhouse.
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
+        bubblewrap \
         binutils \
         ca-certificates \
         file \
@@ -83,6 +86,7 @@ COPY challenges_sdk ./challenges_sdk
 COPY third_party ./third_party
 COPY tools ./tools
 COPY scripts/online_runtime.py ./scripts/online_runtime.py
+COPY scripts/build_cyberchef_python.py scripts/check_enhanced_toolchain.py scripts/check_cyberchef_toolchain.py ./scripts/
 COPY --from=radare2-build /opt/radare2/lib-runtime ./tools/binaries/radare2-runtime/lib
 COPY --from=radare2-build /opt/radare2/share/radare2-runtime ./tools/binaries/radare2-runtime/share/radare2
 
@@ -98,21 +102,26 @@ RUN PIP_NO_INDEX=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL= \
     PIP_EXTRA_INDEX_URL= \
-    python tools/binaries/offline_tools.py install \
-    && PYTHONPATH=/opt/aion python -m compileall -q \
+    python tools/binaries/offline_tools.py install
+
+RUN --network=none python scripts/build_cyberchef_python.py
+
+# System libraries are installed on the connected image builder only.
+RUN python -m playwright install-deps chromium
+
+RUN PYTHONPATH=/opt/aion python -m compileall -q \
         agent challenges_sdk scripts \
         tools/agents tools/artifact tools/benchmark tools/binary tools/http \
-        tools/network tools/pentest tools/system tools/binaries/*.py tools/binaries/sqlmap \
+        tools/network tools/pentest tools/system tools/browser tools/source tools/cyberchef tools/binaries/*.py tools/binaries/sqlmap \
     && PYTHONPATH=/opt/aion python -c \
         "import json; from tools.binaries.validation import check_tool_chain; report = check_tool_chain(); print(json.dumps(report, ensure_ascii=False, sort_keys=True)); assert report['ok'], json.dumps(report, ensure_ascii=False)"
 
-RUN groupadd --system aion-sandbox \
-    && useradd --system --gid aion-sandbox --no-create-home \
-        --home-dir /nonexistent --shell /usr/sbin/nologin aion-sandbox \
-    && mkdir -p -m 0700 /var/lib/aion/home /var/lib/aion/workspace /var/lib/aion/runs \
+RUN --network=none python scripts/check_enhanced_toolchain.py
+RUN --network=none python scripts/check_cyberchef_toolchain.py
+
+RUN mkdir -p -m 0700 /var/lib/aion/home /var/lib/aion/workspace /var/lib/aion/runs \
     && chmod 0755 /opt/aion/tools/binaries/bin/* \
-    && test -x /usr/bin/setpriv \
-    && id aion-sandbox
+    && test -x /usr/bin/bwrap
 
 COPY docker/entrypoint-hosted.sh /usr/local/bin/aion-hosted-entrypoint
 RUN chmod 0755 /usr/local/bin/aion-hosted-entrypoint

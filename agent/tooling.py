@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
+
+current_tool_call_id: ContextVar[str | None] = ContextVar("tool_call_id", default=None)
 import hashlib
 import inspect
 import json
 import logging
 import os
+import difflib
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -28,11 +33,12 @@ from challenges_sdk import (
 
 from agent.state.errors import StateError
 
-
 ToolHandler = Callable[[BaseModel], Awaitable[Any] | Any]
 ClaimResolver = Callable[[BaseModel], Sequence["AccessClaim"]]
 ResultProjector = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 LOGGER = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class AccessClaim:
     """One logical resource read or write used for in-turn scheduling."""
@@ -88,9 +94,7 @@ def _compact_schema(value: Any) -> Any:
     """Drop presentation-only JSON Schema titles, preserving validation."""
     if isinstance(value, dict):
         return {
-            key: _compact_schema(item)
-            for key, item in value.items()
-            if key != "title"
+            key: _compact_schema(item) for key, item in value.items() if key != "title"
         }
     if isinstance(value, list):
         return [_compact_schema(item) for item in value]
@@ -196,38 +200,96 @@ class ToolRegistry:
         providers: Sequence[Any],
         *,
         allowed_tools: set[str] | frozenset[str] | None = None,
+        compact: bool = False,
     ) -> None:
         self.providers = list(providers)
         self.allowed_tools = set(allowed_tools) if allowed_tools is not None else None
+        self.compact = compact
+        self._all_specs: dict[str, ToolSpec] = {}
         self._specs: dict[str, ToolSpec] = {}
         for provider in self.providers:
             for spec in provider.tool_specs():
-                if self.allowed_tools is not None and spec.name not in self.allowed_tools:
-                    continue
-                if spec.name in self._specs:
+                if spec.name in self._all_specs:
                     raise ValueError(f"duplicate tool specification: {spec.name}")
-                self._specs[spec.name] = spec
-        self._definitions = tuple(spec.definition() for spec in self._specs.values())
+                self._all_specs[spec.name] = spec
+                if self.allowed_tools is None or spec.name in self.allowed_tools:
+                    self._specs[spec.name] = spec
+        self._dynamic_exposed: OrderedDict[str, None] = OrderedDict()
+        self._base_names: tuple[str, ...] = ()
+        self._base_name_set: frozenset[str] = frozenset()
+        if compact:
+            from .tool_surface import DIRECT_TOOLS, search_spec
 
+            self._base_names = tuple(
+                name for name in self._specs if name in DIRECT_TOOLS
+            )
+            self._base_name_set = frozenset(self._base_names)
+            catalog = search_spec(
+                dict(self._specs),
+                on_exact=self.expose_tool,
+                known_specs=self._all_specs,
+            )
+            self._specs[catalog.name] = catalog
+        else:
+            self._base_names = tuple(self._specs)
+            self._base_name_set = frozenset(self._base_names)
     def definitions(self) -> list[dict[str, Any]]:
-        # Definitions are immutable for a Registry lifetime. A JSON round-trip
-        # returns a defensive copy without rebuilding Pydantic schemas on every
-        # controller wake.
+        """Return the current role-scoped native tool surface."""
+        names = list(self._base_names)
+        if self.compact:
+            names.append("tool_search")
+            names.extend(self._dynamic_exposed)
+        else:
+            names = list(self._specs)
+        definitions = [self._specs[name].definition() for name in names if name in self._specs]
         return json.loads(
-            json.dumps(self._definitions, ensure_ascii=False, separators=(",", ":"))
+            json.dumps(definitions, ensure_ascii=False, separators=(",", ":"))
         )
+
+    admission_closed = False
 
     def has_tool(self, name: str) -> bool:
         return name in self._specs
+
+    def is_known(self, name: str) -> bool:
+        return name in self._all_specs
+
+    def is_exposed(self, name: str) -> bool:
+        if not self.compact:
+            return name in self._specs
+        return name in self._base_name_set or name == "tool_search" or name in self._dynamic_exposed
+
+    def expose_tool(self, name: str) -> dict[str, Any]:
+        """Expose one allowed non-base tool for the next model turn."""
+        if name not in self._specs:
+            return {"surfaced": False, "evicted": None, "slots": list(self._dynamic_exposed)}
+        if not self.compact or name in self._base_name_set or name == "tool_search":
+            return {"surfaced": True, "evicted": None, "slots": list(self._dynamic_exposed)}
+        evicted = None
+        if name in self._dynamic_exposed:
+            self._dynamic_exposed.move_to_end(name)
+        else:
+            if len(self._dynamic_exposed) >= 3:
+                evicted, _ = self._dynamic_exposed.popitem(last=False)
+            self._dynamic_exposed[name] = None
+        return {"surfaced": True, "evicted": evicted, "slots": list(self._dynamic_exposed)}
+
+    def restore_exposed(self, names: Sequence[str]) -> None:
+        for name in names:
+            if name in self._specs:
+                self.expose_tool(name)
 
     def get(self, name: str) -> ToolSpec | None:
         return self._specs.get(name)
 
     async def close(self) -> None:
-        for provider in self.providers:
-            close = getattr(provider, "close", None)
-            if close is not None:
-                await close()
+        results = await asyncio.gather(
+            *(p.close() for p in self.providers if hasattr(p, "close")),
+            return_exceptions=True,
+        )
+        failures = [r for r in results if isinstance(r, Exception)]
+        if failures:
+            raise ExceptionGroup("Tool resource cleanup failed", failures)
 
 
 class ToolExecutor:
@@ -239,7 +301,9 @@ class ToolExecutor:
         self.registry = registry
         self.max_concurrency = max_concurrency
 
-    async def execute(self, tool_calls: Sequence[Mapping[str, Any]]) -> list[PreparedToolCall]:
+    async def execute(
+        self, tool_calls: Sequence[Mapping[str, Any]]
+    ) -> list[PreparedToolCall]:
         prepared = self.prepare(tool_calls)
         return await self.execute_prepared(prepared)
 
@@ -250,7 +314,73 @@ class ToolExecutor:
 
         prepared = [self._prepare(index, item) for index, item in enumerate(tool_calls)]
         self._enforce_solo(prepared)
+        for item in prepared:
+            if item.result is not None:
+                self._mark_not_started(item.result)
         return prepared
+
+    @staticmethod
+    def _mark_not_started(result: dict[str, Any]) -> None:
+        error = result.get("error")
+        if not isinstance(error, Mapping):
+            return
+        details = dict(error.get("details")) if isinstance(error.get("details"), Mapping) else {}
+        details["execution_status"] = "not_started"
+        result["error"] = {
+            **dict(error),
+            "message": str(error.get("message") or "")
+            + " The requested tool was not executed; do not assume its intended changes exist.",
+            "details": details,
+        }
+
+    def _next_call(self, name: str | None, arguments: Any = None) -> dict[str, Any]:
+        """Return a native next call only when its arguments pass validation."""
+        search_spec = self.registry.get("tool_search")
+        if search_spec is None and name == "tool_search":
+            return {"next_tool": None, "next_arguments": {}}
+        if name == "tool_search":
+            candidate = arguments if isinstance(arguments, dict) else {}
+            try:
+                search_spec.input_model.model_validate(candidate)
+            except (AttributeError, ValidationError):
+                candidate = {"query": ""}
+            return {"next_tool": "tool_search", "next_arguments": candidate}
+        spec = self.registry.get(name or "") if name else None
+        if spec is not None and isinstance(arguments, dict):
+            try:
+                spec.input_model.model_validate(arguments)
+            except ValidationError:
+                pass
+            else:
+                return {"next_tool": spec.name, "next_arguments": arguments}
+        if isinstance(name, str) and self.registry.has_tool(name):
+            return {"next_tool": "tool_search", "next_arguments": {"name": name}}
+        return {"next_tool": "tool_search", "next_arguments": {}}
+
+    def _unknown_tool_details(self, name: str) -> dict[str, Any]:
+        names = sorted(
+            item for item in self.registry._specs
+            if item != "tool_search"
+        )
+        suggestions = difflib.get_close_matches(name, names, n=3, cutoff=0.45)
+        details = {"candidates": suggestions}
+        if suggestions:
+            details.update(self._next_call("tool_search", {"name": suggestions[0]}))
+        else:
+            details.update(self._next_call("tool_search", {"query": name[:200]}))
+        return details
+
+    def _ensure_error_guidance(self, result: dict[str, Any], name: str) -> dict[str, Any]:
+        error = result.get("error")
+        if not isinstance(error, Mapping) or error.get("stage") not in {"parse", "schema", "semantic"}:
+            return result
+        raw_details = error.get("details")
+        details = dict(raw_details) if isinstance(raw_details, Mapping) else {}
+        if "next_tool" not in details:
+            details.update(self._next_call("tool_search", {"name": name}))
+            error = {**dict(error), "details": details}
+            return {**result, "error": error}
+        return result
 
     async def execute_prepared(
         self, prepared: Sequence[PreparedToolCall]
@@ -269,7 +399,8 @@ class ToolExecutor:
             deferred: list[PreparedToolCall] = []
             for item in pending:
                 if len(selected) >= self.max_concurrency or any(
-                    self._claims_conflict(item.claims, other.claims) for other in selected
+                    self._claims_conflict(item.claims, other.claims)
+                    for other in selected
                 ):
                     deferred.append(item)
                     continue
@@ -281,6 +412,7 @@ class ToolExecutor:
                         retry_allowed=True,
                         retry_action="rewrite_arguments",
                     )
+                    self._mark_not_started(item.result)
                     item.concurrency_wave = wave
                     continue
                 selected.append(item)
@@ -288,7 +420,10 @@ class ToolExecutor:
                 pending = deferred
                 continue
             await asyncio.gather(
-                *(self._invoke(item, batch_started=batch_started, wave=wave) for item in selected)
+                *(
+                    self._invoke(item, batch_started=batch_started, wave=wave)
+                    for item in selected
+                )
             )
             for item in selected:
                 if item.result is not None and item.result.get("ok") is False:
@@ -306,13 +441,20 @@ class ToolExecutor:
     def _prepare(self, index: int, tool_call: Mapping[str, Any]) -> PreparedToolCall:
         function = tool_call.get("function")
         tool_call_id = str(tool_call.get("id") or "unknown")
-        if not isinstance(function, Mapping) or not isinstance(function.get("name"), str):
+        if not isinstance(function, Mapping) or not isinstance(
+            function.get("name"), str
+        ):
             return PreparedToolCall(
                 index=index,
                 tool_call_id=tool_call_id,
                 name="unknown",
                 raw_arguments_length=0,
-                result=tool_error("schema", "invalid_tool_call", "Tool call is missing a function name"),
+                result=tool_error(
+                    "schema",
+                    "invalid_tool_call",
+                    "Tool call is missing a function name",
+                    details=self._next_call("tool_search", {}),
+                ),
             )
         name = str(function["name"])
         raw = function.get("arguments", "{}")
@@ -330,10 +472,30 @@ class ToolExecutor:
             spec=spec,
         )
         if spec is None:
+            if self.registry.is_known(name):
+                item.result = tool_error(
+                    "permission",
+                    "tool_not_allowed_for_role",
+                    "This Agent role cannot use that tool",
+                    details={"tool": name},
+                )
+            else:
+                item.result = tool_error(
+                    "schema",
+                    "unknown_tool",
+                    "Unknown Agent tool",
+                    details=self._unknown_tool_details(name),
+                )
+            return item
+        if not self.registry.is_exposed(name):
             item.result = tool_error(
-                "permission" if self.registry.allowed_tools is not None else "schema",
-                "tool_not_allowed_for_role" if self.registry.allowed_tools is not None else "unknown_tool",
-                "This Agent role cannot use that tool" if self.registry.allowed_tools is not None else "Unknown Agent tool",
+                "permission",
+                "tool_not_exposed",
+                "Search this exact tool name first; it will be available as a native function on the next model turn",
+                retry_allowed=True,
+                retry_action="search_tool",
+                retry_tool="tool_search",
+                details={"tool": name, "next_tool": "tool_search", "next_arguments": {"name": name}},
             )
             return item
         if not isinstance(raw, str):
@@ -341,8 +503,12 @@ class ToolExecutor:
                 name,
                 "parse",
                 "Tool arguments must be a JSON-encoded object",
-                retry_allowed=True, retry_action="rewrite_arguments",
-                details={"raw_length": raw_length, "required": self._required_fields(spec)},
+                retry_allowed=True,
+                retry_action="rewrite_arguments",
+                details={
+                    "raw_length": raw_length,
+                    "required": self._required_fields(spec),
+                },
             )
             return item
         try:
@@ -352,7 +518,8 @@ class ToolExecutor:
                 name,
                 "parse",
                 "Tool arguments are not valid JSON",
-                retry_allowed=True, retry_action="rewrite_arguments",
+                retry_allowed=True,
+                retry_action="rewrite_arguments",
                 details={
                     "json_error": exc.msg,
                     "line": exc.lineno,
@@ -368,7 +535,8 @@ class ToolExecutor:
                 name,
                 "schema",
                 "Tool arguments must be a JSON object",
-                retry_allowed=True, retry_action="rewrite_arguments",
+                retry_allowed=True,
+                retry_action="rewrite_arguments",
                 details={"required": self._required_fields(spec)},
             )
             return item
@@ -382,9 +550,16 @@ class ToolExecutor:
                 "schema",
                 "invalid_arguments",
                 "Tool arguments failed schema validation",
-                retry_allowed=True, retry_action="rewrite_arguments",
-                details={"fields": fields},
+                retry_allowed=True,
+                retry_action="rewrite_arguments",
+                details={"fields": fields, "allowed_fields": list(spec.input_model.model_fields)},
+                arguments=value,
             )
+            if "arguments" not in spec.input_model.model_fields and set(value) == {"arguments"}:
+                suggestion = self._next_call(name, value["arguments"])
+                if suggestion["next_tool"] == name:
+                    item.result["error"]["details"].update(suggestion)
+                    item.result["error"]["message"] += " Remove the extra arguments wrapper and call the tool directly."
         except Exception as exc:
             item.result = map_exception(
                 exc,
@@ -393,8 +568,8 @@ class ToolExecutor:
             )
         return item
 
-    @staticmethod
     def _argument_error(
+        self,
         name: str,
         stage: str,
         code_or_message: str,
@@ -403,6 +578,7 @@ class ToolExecutor:
         retry_allowed: bool,
         retry_action: str,
         details: Any,
+        arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if message is None:
             code = "invalid_json"
@@ -410,6 +586,15 @@ class ToolExecutor:
         else:
             code = code_or_message
             error_message = message
+        details_map = dict(details) if isinstance(details, Mapping) else {"fields": details}
+        correction = {
+            "system_http_response": " Read response bodies with interaction_id and request_id from receipts, using offset_bytes/length_bytes (bytes), not offset/limit_chars.",
+            "system_http_output": " List results with interaction_id from the receipt and cursor/limit; offset is not supported.",
+            "system_http_analyze": " Analyze an existing interaction_id; paginate with cursor/limit, not offset. Use system_http_response for response-body bytes.",
+            "system_http_probe": " Each case needs its own method and url; put form fields inside body: {type: form, value: {field: value}}.",
+            "solver_review": " new_information is a value of assessment, not a separate field; put the finding in summary.",
+        }.get(name, "")
+        error_message += correction
         if name == "system_http_probe":
             error_message = (
                 f"{error_message}. Rewrite the arguments as a JSON object with "
@@ -418,8 +603,8 @@ class ToolExecutor:
                 "Do not retry the same raw arguments; use system_http_request for "
                 "an ordered session."
             )
-            details = {
-                **(dict(details) if isinstance(details, Mapping) else {}),
+            details_map = {
+                **details_map,
                 "canonical_shape": {
                     "cases": [
                         {
@@ -439,6 +624,43 @@ class ToolExecutor:
                 },
                 "ordered_session_tool": "system_http_request",
             }
+        from .tool_examples import examples_for
+
+        examples = examples_for(name)
+        if examples:
+            details_map["examples"] = examples
+        if name == "solver_review":
+            error_message += " Correct the listed fields. Ordinary progress observations may omit validation; use it for verified conclusions or ruled-out hypotheses."
+            if arguments is not None and "summary_zh" in arguments:
+                error_message += " Use summary, not summary_zh."
+            details_map["minimal_example"] = examples[0]
+        candidate = dict(arguments) if isinstance(arguments, dict) else None
+        if candidate is not None and name in {"system_http_request", "system_http_probe"}:
+            if isinstance(candidate.get("wait_seconds"), (int, float)) and candidate["wait_seconds"] > 20:
+                candidate["wait_seconds"] = 20
+            if name == "system_http_probe":
+                for field in ("concurrency", "rate_limit_per_second"):
+                    if field in candidate and candidate[field] is None:
+                        candidate.pop(field)
+        if candidate is not None and name == "tool_result_read":
+            if isinstance(candidate.get("limit_chars"), (int, float)) and candidate["limit_chars"] > 10_000:
+                candidate["limit_chars"] = 10_000
+        semantic_requires_new_input = code in {
+            "unknown_template_variable",
+            "invalid_workspace_path",
+            "file_not_found",
+            "tool_result_not_found",
+        }
+        next_call = (
+            self._next_call("tool_search", {"name": name})
+            if semantic_requires_new_input
+            else self._next_call(name, candidate)
+        )
+        details_map.update(next_call)
+        if next_call["next_tool"] == "tool_search":
+            error_message += " Use the exact schema returned by tool_search before retrying."
+        else:
+            error_message += " Retry with the native tool and the corrected arguments shown."
         return tool_error(
             stage,
             code,
@@ -446,15 +668,23 @@ class ToolExecutor:
             retry_allowed=retry_allowed,
             retry_action=retry_action,
             retry_tool=name,
-            details=details,
+            details=details_map,
         )
 
-    async def _invoke(self, item: PreparedToolCall, *, batch_started: float, wave: int) -> None:
+    async def _invoke(
+        self, item: PreparedToolCall, *, batch_started: float, wave: int
+    ) -> None:
         assert item.spec is not None and item.arguments is not None
         started = monotonic()
         item.queue_latency_ms = int((started - batch_started) * 1_000)
         item.concurrency_wave = wave
+        token = current_tool_call_id.set(item.tool_call_id)
         try:
+            if self.registry.admission_closed:
+                item.result = tool_error(
+                    "conflict", "agent_inactive", "Agent tool admission is closed"
+                )
+                return
             value = item.spec.handler(item.arguments)
             if inspect.isawaitable(value):
                 value = await value
@@ -480,6 +710,17 @@ class ToolExecutor:
                 tool_call_id=item.tool_call_id,
                 tool_name=item.name,
             )
+        finally:
+            current_tool_call_id.reset(token)
+        error = (item.result or {}).get("error") or {}
+        if (item.name in {"system_http_probe", "system_http_request"}
+                and error.get("stage") == "semantic" and error.get("details", {}).get("fields")):
+            item.result = self._argument_error(
+                item.name, "semantic", error["code"], error["message"],
+                retry_allowed=error["retry"]["allowed"], retry_action=error["retry"]["action"],
+                details=error["details"],
+                arguments=serialize_tool_arguments(item.arguments, exclude_unset=True, exclude_none=True),
+            )
         if item.spec.result_projector is not None and item.result is not None:
             try:
                 item.result_projection = dict(item.spec.result_projector(item.result))
@@ -490,12 +731,18 @@ class ToolExecutor:
                     "result_projection_failed",
                     "The tool result could not be prepared safely",
                 )
+        if item.result is not None:
+            item.result = self._ensure_error_guidance(item.result, item.name)
         item.execution_latency_ms = int((monotonic() - started) * 1_000)
         item.total_latency_ms = int((monotonic() - batch_started) * 1_000)
 
     @staticmethod
     def _required_fields(spec: ToolSpec) -> list[str]:
-        return [name for name, field_info in spec.input_model.model_fields.items() if field_info.is_required()]
+        return [
+            name
+            for name, field_info in spec.input_model.model_fields.items()
+            if field_info.is_required()
+        ]
 
     @staticmethod
     def _resource_keys_overlap(left: str, right: str) -> bool:
@@ -506,7 +753,9 @@ class ToolExecutor:
         if left.startswith("workspace:") and right.startswith("workspace:"):
             try:
                 left_path = Path(left.removeprefix("workspace:")).resolve(strict=False)
-                right_path = Path(right.removeprefix("workspace:")).resolve(strict=False)
+                right_path = Path(right.removeprefix("workspace:")).resolve(
+                    strict=False
+                )
                 return (
                     left_path == right_path
                     or left_path in right_path.parents
@@ -517,7 +766,9 @@ class ToolExecutor:
         return False
 
     @classmethod
-    def _claims_conflict(cls, left: Sequence[AccessClaim], right: Sequence[AccessClaim]) -> bool:
+    def _claims_conflict(
+        cls, left: Sequence[AccessClaim], right: Sequence[AccessClaim]
+    ) -> bool:
         for first in left:
             for second in right:
                 same = cls._resource_keys_overlap(first.key, second.key)
@@ -526,7 +777,9 @@ class ToolExecutor:
         return False
 
     @classmethod
-    def _depends_on_failed_write(cls, claims: Sequence[AccessClaim], failed: set[str]) -> bool:
+    def _depends_on_failed_write(
+        cls, claims: Sequence[AccessClaim], failed: set[str]
+    ) -> bool:
         return any(
             cls._resource_keys_overlap(claim.key, failed_key)
             for claim in claims
@@ -558,11 +811,15 @@ class ToolExecutor:
                     same_arguments=True,
                 )
 
+
 class ToolResultReadArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    result_ref: str = Field(pattern=r"^tool_result:tool_result_[0-9a-f]{32}$")
-    offset: int = Field(default=0, ge=0)
-    limit_chars: int = Field(default=8_000, ge=1, le=10_000)
+    result_ref: str = Field(
+        pattern=r"^tool_result:tool_result_[0-9a-f]{32}$",
+        description="Exact result_ref returned by a large tool result; copy it verbatim.",
+    )
+    offset: int = Field(default=0, ge=0, description="Character offset returned by the prior read.")
+    limit_chars: int = Field(default=8_000, ge=1, le=10_000, description="Maximum 10,000 characters per read.")
 
 
 class ToolResultStore:
@@ -605,7 +862,8 @@ class ToolResultStore:
             from tools.system.policy import SystemToolError
 
             raise SystemToolError(
-                error_type="not_found", code="tool_result_not_found",
+                error_type="not_found",
+                code="tool_result_not_found",
                 message="Tool result reference does not exist for this Agent",
             ) from exc
         start = min(arguments.offset, len(content))
@@ -615,6 +873,11 @@ class ToolResultStore:
             "offset": start,
             "content": content[start:end],
             "next_offset": end if end < len(content) else None,
+            "read_result": {
+                "tool": "tool_result_read",
+                "arguments": {"result_ref": arguments.result_ref, "offset": end,
+                              "limit_chars": arguments.limit_chars},
+            } if end < len(content) else None,
             "eof": end >= len(content),
             "original_chars": len(content),
         }
@@ -642,9 +905,6 @@ class ToolResultTools:
                 ),
             )
         ]
-
-    async def close(self) -> None:
-        return None
 
 
 def validation_details(exc: ValidationError) -> list[dict[str, Any]]:
@@ -731,12 +991,21 @@ def map_exception(
         stage = (
             "conflict"
             if exc.status_code == 409
-            else "permission"
-            if exc.status_code in {401, 403}
-            else "internal"
-            if exc.status_code >= 500
-            else "semantic"
+            else (
+                "permission"
+                if exc.status_code in {401, 403}
+                else "internal" if exc.status_code >= 500 else "semantic"
+            )
         )
+        details = dict(exc.detail)
+        if exc.code in {"invalid_evidence_ref", "evidence_not_accessible"}:
+            details.update(
+                {
+                    "next_tool": "evidence_search",
+                    "next_arguments": {"query": "", "offset": 0, "limit": 20},
+                    "reference_rule": "Copy an exact evidence_ref from context_refs or evidence_search; never synthesize one.",
+                }
+            )
         return tool_error(
             stage,
             exc.code,
@@ -744,19 +1013,32 @@ def map_exception(
             retry_allowed=retry_allowed if exc.status_code == 409 else False,
             retry_action=retry_action if exc.status_code == 409 else "none",
             retry_tool=retry_tool if exc.status_code == 409 else None,
-            details=dict(exc.detail),
+            details=details,
         )
     if isinstance(exc, SystemToolError):
         retry_allowed, retry_action, retry_tool = _conflict_retry(exc.code)
-        stage = "permission" if exc.error_type == "permission" else "conflict" if exc.error_type == "conflict" else "semantic" if exc.error_type in {"validation", "not_found"} else "internal" if exc.error_type == "internal" else "execution"
+        message, details = exc.message, dict(exc.detail)
+        stage = (
+            "permission"
+            if exc.error_type == "permission"
+            else (
+                "conflict"
+                if exc.error_type == "conflict"
+                else (
+                    "semantic"
+                    if exc.error_type in {"validation", "not_found"}
+                    else "internal" if exc.error_type == "internal" else "execution"
+                )
+            )
+        )
         return tool_error(
             stage,
             exc.code,
-            exc.message,
+            message,
             retry_allowed=retry_allowed if exc.error_type == "conflict" else False,
             retry_action=retry_action if exc.error_type == "conflict" else "none",
             retry_tool=retry_tool if exc.error_type == "conflict" else None,
-            details=exc.detail,
+            details=details,
         )
     if isinstance(exc, SkillCatalogError):
         return tool_error(
@@ -804,7 +1086,9 @@ def map_exception(
         )
     if isinstance(exc, ChallengesSDKError):
         return tool_error(
-            "internal", "sdk_error", "The benchmark SDK could not complete the operation"
+            "internal",
+            "sdk_error",
+            "The benchmark SDK could not complete the operation",
         )
     error_ref = f"tool_error_{uuid4().hex}"
     LOGGER.exception(

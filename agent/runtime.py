@@ -18,10 +18,8 @@ from agent.state import (
     AgentReportInput,
     CapabilityContext,
     CapabilityRegistry,
-    ChallengeScheduler,
     ResourceController,
     StateService,
-    StagnationManager,
     challenge_work_active,
 )
 from agent.state.clock import utc_now
@@ -65,7 +63,6 @@ class AgentRuntime:
         capability_registry: CapabilityRegistry | None = None,
         psutil_module: Any = psutil,
         clock: Callable[[], datetime] = utc_now,
-        stagnation_interval_seconds: float = 30.0,
         projection_interval_seconds: float = 1.0,
         catalog_reconcile_interval_seconds: float = 120.0,
     ) -> None:
@@ -78,14 +75,11 @@ class AgentRuntime:
         # state root (for example, a benchmark harness), but the default must
         # not silently point back at the repository when ``project_root`` is
         # customized.
-        self.run_root = (
-            run_root or self.project_root / ".aion" / "runs"
-        ).resolve()
+        self.run_root = (run_root or self.project_root / ".aion" / "runs").resolve()
         self.runner_factory = runner_factory
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.psutil_module = psutil_module
         self.clock = clock
-        self.stagnation_interval_seconds = stagnation_interval_seconds
         self.projection_interval_seconds = projection_interval_seconds
         self.catalog_reconcile_interval_seconds = catalog_reconcile_interval_seconds
         self.run_id: str | None = None
@@ -93,9 +87,8 @@ class AgentRuntime:
         self.state_service: StateService | None = None
         self.supervisor: AgentSupervisor | None = None
         self.resource_controller: ResourceController | None = None
-        self.stagnation_manager: StagnationManager | None = None
         self._background_tasks: list[asyncio.Task[None]] = []
-        self._execution_watchers: dict[str, asyncio.Task[None]] = {}
+        self._worker_watchers: dict[str, asyncio.Task[None]] = {}
         self._network_watch_task: asyncio.Task[None] | None = None
         self._network_failure_event: asyncio.Event | None = None
         self._network_failure: Exception | None = None
@@ -121,6 +114,8 @@ class AgentRuntime:
         run_id: str | None = None,
         resume: bool = False,
     ) -> str:
+        if resume and self.settings.selected_challenge_codes is not None:
+            raise ValueError("Resume cannot replace selected_challenge_codes")
         if self.state_service is not None:
             raise RuntimeError("AgentRuntime is already started")
         run_id = run_id or uuid4().hex
@@ -177,7 +172,6 @@ class AgentRuntime:
             )
             supervisor_kwargs["resource_controller"] = self.resource_controller
             self.supervisor = AgentSupervisor(self.settings, **supervisor_kwargs)
-            self.stagnation_manager = StagnationManager(service, clock=self.clock)
             self.chief_agent_id = await self.supervisor.prepare_chief(
                 prompt, run_id=run_id, resume=resume
             )
@@ -189,12 +183,7 @@ class AgentRuntime:
             asyncio.create_task(
                 self._admission_loop(), name=f"aion-admission-{run_id}"
             ),
-            asyncio.create_task(
-                self._stagnation_loop(), name=f"aion-stagnation-{run_id}"
-            ),
-            asyncio.create_task(
-                self._projection_loop(), name=f"aion-outbox-{run_id}"
-            ),
+            asyncio.create_task(self._projection_loop(), name=f"aion-outbox-{run_id}"),
         ]
         return self.chief_agent_id
 
@@ -316,11 +305,11 @@ class AgentRuntime:
             return decision
         try:
             assert self.supervisor is not None
-            await self.supervisor.launch_execution_agent(agent_id)
+            await self.supervisor.launch_worker(agent_id)
             started = await controller.mark_started(agent_id)
-            self._execution_watchers[agent_id] = asyncio.create_task(
-                self._watch_execution(agent_id),
-                name=f"aion-execution-watch-{agent_id}",
+            self._worker_watchers[agent_id] = asyncio.create_task(
+                self._watch_worker(agent_id),
+                name=f"aion-worker-watch-{agent_id}",
             )
             return started
         except Exception:
@@ -330,19 +319,19 @@ class AgentRuntime:
                 self._run_id(), agent_id
             )
             if runtime["agent"].get("terminal_report_id") is None:
-                await self.state_service.finalize_execution_agent(
+                context = CapabilityContext(
+                    run_id=self._run_id(),
+                    agent_id=agent_id,
+                    role="worker",
+                    unique_code=runtime["agent"]["unique_code"],
+                )
+                await self.state_service.finalize_worker(
                     self._run_id(),
                     agent_id,
-                    CapabilityContext(
-                        run_id=self._run_id(),
-                        agent_id=agent_id,
-                        role="execution",
-                        unique_code=runtime["agent"]["unique_code"],
-                    ),
+                    context,
                     AgentReportInput(
                         status="failed",
-                        summary="Execution Agent could not be started",
-                        hypothesis_outcome="inconclusive",
+                        summary="Worker could not be started",
                     ),
                     allow_inactive=True,
                 )
@@ -399,100 +388,6 @@ class AgentRuntime:
                 break
         return results
 
-    async def stagnation_once(self) -> list[dict[str, Any]]:
-        if self.stagnation_manager is None or self.state_service is None:
-            raise RuntimeError("AgentRuntime is not started")
-        challenges = await self.state_service.list_challenges(self._run_id())
-        results: list[dict[str, Any]] = []
-        for challenge in challenges:
-            hint_available = (
-                self.supervisor is None
-                or self.supervisor.benchmark_capability_available("get_hint")
-            )
-            hint_result = (
-                await self.state_service.evaluate_hint_eligibility(
-                    self._run_id(), challenge["unique_code"]
-                )
-                if hint_available
-                else {
-                    "hint_signal": {
-                        "eligible": False,
-                        "reason": "hint_unavailable",
-                        "no_progress_seconds": 0,
-                        "run_elapsed_seconds": 0,
-                        "remaining_seconds": 0,
-                    },
-                    "newly_eligible": False,
-                    "event_sequence": None,
-                }
-            )
-            if hint_result.get("event_sequence") is not None:
-                await self.state_service.signal_challenge_changes(
-                    self._run_id(),
-                    [challenge["unique_code"]],
-                    int(hint_result["event_sequence"]),
-                )
-            if (
-                challenge.get("work_status") == "paused"
-                and challenge.get("slot_occupied")
-                and self.supervisor is not None
-            ):
-                release = await self.supervisor.release_paused_container(
-                    challenge["unique_code"],
-                    reason=str(challenge.get("pause_reason") or "stagnation_timeout"),
-                    caller_id=self.chief_agent_id,
-                )
-                results.append({"unique_code": challenge["unique_code"], "hint": hint_result, "release": release})
-                continue
-            if not challenge_work_active(challenge):
-                results.append({"unique_code": challenge["unique_code"], "hint": hint_result, "action": "none"})
-                continue
-            result = await self.stagnation_manager.evaluate(
-                self._run_id(), challenge["unique_code"]
-            )
-            result["hint"] = hint_result
-            results.append(result)
-            if result.get("action") == "pause_stagnation" and self.supervisor is not None:
-                await self.supervisor.stop_challenge_work(
-                    challenge["unique_code"],
-                    reason=str(result.get("pause_reason") or "stagnation_timeout"),
-                )
-                result["release"] = await self.supervisor.release_paused_container(
-                    challenge["unique_code"],
-                    reason=str(result.get("pause_reason") or "stagnation_timeout"),
-                    caller_id=self.chief_agent_id,
-                )
-            if result.get("event_sequence") is not None:
-                await self.state_service.signal_challenge_changes(
-                    self._run_id(),
-                    [challenge["unique_code"]],
-                    int(result["event_sequence"]),
-                )
-        await self._restart_exhausted_challenges()
-        if self.supervisor is not None:
-            results.extend(await self.supervisor.scale_bootstraps())
-        return results
-
-    async def _restart_exhausted_challenges(self) -> None:
-        """Start the next solving round when every unfinished challenge is paused."""
-
-        if self.supervisor is None or self.state_service is None or self.chief_agent_id is None:
-            return
-        scheduled = await ChallengeScheduler(self.state_service, clock=self.clock).select(
-            self._run_id()
-        )
-        restart_codes = [
-            str(item["unique_code"])
-            for item in scheduled
-            if item.get("restart_required") is True
-        ]
-        if not restart_codes:
-            return
-        await self.supervisor.launch_challenges(
-            self.chief_agent_id,
-            restart_codes,
-        )
-
     async def project_once(self) -> int:
         if self.state_service is None:
             raise RuntimeError("AgentRuntime is not started")
@@ -525,13 +420,13 @@ class AgentRuntime:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
-        for task in self._execution_watchers.values():
+        for task in self._worker_watchers.values():
             task.cancel()
-        if self._execution_watchers:
+        if self._worker_watchers:
             await asyncio.gather(
-                *self._execution_watchers.values(), return_exceptions=True
+                *self._worker_watchers.values(), return_exceptions=True
             )
-        self._execution_watchers.clear()
+        self._worker_watchers.clear()
         supervisor_error: Exception | None = None
         if self.supervisor is not None:
             try:
@@ -609,16 +504,6 @@ class AgentRuntime:
             if shutdown_wait in done:
                 return
             signal_sequence = signal_wait.result()
-
-    async def _stagnation_loop(self) -> None:
-        while True:
-            try:
-                await self.stagnation_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                await self._record_loop_diagnostic("stagnation", exc)
-            await asyncio.sleep(self.stagnation_interval_seconds)
 
     async def _record_loop_diagnostic(self, loop_name: str, exc: Exception) -> None:
         fingerprint = f"{loop_name}:{type(exc).__name__}:{str(exc)[:200]}"
@@ -704,10 +589,10 @@ class AgentRuntime:
     async def _wait_for_agents(self, chief_id: str) -> dict[str, Any]:
         assert self.supervisor is not None
         result = await self.supervisor.wait_agent(chief_id)
-        await self.supervisor.wait_for_quiescence()
+        await self.supervisor.wait_for_agents()
         return result
 
-    async def _watch_execution(self, agent_id: str) -> None:
+    async def _watch_worker(self, agent_id: str) -> None:
         try:
             assert self.supervisor is not None
             await self.supervisor.wait_agent(agent_id)
@@ -727,7 +612,7 @@ class AgentRuntime:
             except Exception:
                 pass
         finally:
-            self._execution_watchers.pop(agent_id, None)
+            self._worker_watchers.pop(agent_id, None)
 
     def _resource(self) -> ResourceController:
         if self.resource_controller is None:

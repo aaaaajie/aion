@@ -155,7 +155,16 @@ def _resolve_run_id(value: str) -> str:
     return _latest_run() if value == "latest" else value
 
 
-def _start(mode: str, requested_run_id: str | None) -> None:
+def _start(
+    mode: str, requested_run_id: str | None,
+    selected_challenge_codes: list[str] | None = None,
+) -> None:
+    if selected_challenge_codes is not None:
+        if mode != "fresh":
+            raise ControlError("Resume cannot replace selected_challenge_codes")
+        if not selected_challenge_codes or any(not code.strip() or len(code.strip()) > 256 for code in selected_challenge_codes):
+            raise ControlError("Selected challenge codes must be non-empty")
+        selected_challenge_codes = list(dict.fromkeys(code.strip() for code in selected_challenge_codes))
     if _is_active():
         raise ControlError("AION is already active")
     if not (APP_ROOT / "current" / "scripts" / "online_runtime.py").is_file():
@@ -180,7 +189,8 @@ def _start(mode: str, requested_run_id: str | None) -> None:
         token = ""
         _atomic_write(
             LAUNCH_FILE,
-            json.dumps({"mode": mode, "run_id": run_id}, separators=(",", ":")),
+            json.dumps({"mode": mode, "run_id": run_id,
+                        "selected_challenge_codes": selected_challenge_codes}, separators=(",", ":")),
         )
         _run(["systemctl", "start", SERVICE_NAME])
         _wait_for_run_ready(run_id)
@@ -529,6 +539,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start = subparsers.add_parser("start")
     start.add_argument("--fresh", action="store_true", required=True)
     start.add_argument("--run-id")
+    start.add_argument("--challenge-code", action="append", dest="selected_challenge_codes")
     start.add_argument("--benchmark-token-stdin", action="store_true", required=True)
 
     resume = subparsers.add_parser("resume")
@@ -559,7 +570,7 @@ def main() -> None:
         _require_root()
         args = _build_parser().parse_args()
         if args.command == "start":
-            _start("fresh", args.run_id)
+            _start("fresh", args.run_id, args.selected_challenge_codes)
         elif args.command == "resume":
             _start("resume", args.run_id)
         elif args.command == "pause":

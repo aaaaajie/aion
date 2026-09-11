@@ -1,1 +1,1 @@
-"""Strategy and planning skills for Challenge Agents."""
+"""Planning knowledge shared by Solver and execute Workers."""

@@ -48,6 +48,7 @@ from third_party.dirsearch.urlutils import (
 from tools.system.policy import SystemToolError, WorkspacePolicy
 
 from .models import HttpAuth
+from .wordlists import resolve_packaged_wordlist
 
 
 QUICK_TEMPLATES = ("admin", "api", "auth", "backups", "db", "logs")
@@ -121,6 +122,8 @@ class PathProbeOptions:
     extensions: tuple[str, ...] = ()
     force_extensions: bool = False
     wordlist_paths: tuple[str, ...] = ()
+    packaged_wordlists: tuple[str, ...] = ()
+    max_candidates: int = 256
     exclude_paths: tuple[str, ...] = ()
     include_status_codes: frozenset[int] = frozenset()
     exclude_status_codes: frozenset[int] = frozenset({404})
@@ -148,6 +151,8 @@ class PathProbeOptions:
             "extensions": list(self.extensions),
             "force_extensions": self.force_extensions,
             "wordlist_paths": list(self.wordlist_paths),
+            "packaged_wordlists": list(self.packaged_wordlists),
+            "max_candidates": self.max_candidates,
             "exclude_paths": list(self.exclude_paths),
             "include_status_codes": sorted(self.include_status_codes),
             "exclude_status_codes": sorted(self.exclude_status_codes),
@@ -178,6 +183,8 @@ class PathProbeOptions:
             extensions=tuple(data.get("extensions") or ()),
             force_extensions=bool(data.get("force_extensions", False)),
             wordlist_paths=tuple(data.get("wordlist_paths") or ()),
+            packaged_wordlists=tuple(data.get("packaged_wordlists") or ()),
+            max_candidates=int(data.get("max_candidates") or 256),
             exclude_paths=tuple(data.get("exclude_paths") or ()),
             include_status_codes=frozenset(data.get("include_status_codes") or ()),
             exclude_status_codes=frozenset(data.get("exclude_status_codes") or {404}),
@@ -307,8 +314,13 @@ class PathProbeEngine:
         excluded = self._excluded_set()
         seen: set[str] = set()
         extensions = self._effective_extensions()
+        explicit_wordlist = bool(
+            self.options.wordlist_paths or self.options.packaged_wordlists
+        )
+        emitted = 0
 
         def emit(raw: str) -> Iterator[str]:
+            nonlocal emitted
             value = raw.strip().lstrip("/")
             if not value or value.startswith("#"):
                 return
@@ -320,22 +332,24 @@ class PathProbeEngine:
             ):
                 variants.extend([value + "/", *(f"{value}.{ext}" for ext in extensions)])
             for candidate in variants:
+                if explicit_wordlist and emitted >= self.options.max_candidates:
+                    return
                 if candidate in excluded or candidate in seen:
                     continue
                 seen.add(candidate)
+                emitted += 1
                 yield candidate
 
-        if self.options.wordlist_paths:
-            for raw_path in self.options.wordlist_paths:
-                source = self.policy.resolve(raw_path, must_exist=True)
-                if not source.is_file():
-                    raise _validation("wordlist_not_file", "Wordlist source must be a file")
+        if explicit_wordlist:
+            for source in self._wordlist_sources():
                 with source.open("r", encoding="utf-8") as lines:
                     for line in lines:
                         for expanded in expand_template_line(
                             line.rstrip("\r\n"), extensions=extensions
                         ):
                             yield from emit(expanded)
+                        if emitted >= self.options.max_candidates:
+                            return
             return
 
         preset = PROFILE_PRESETS[self.options.profile]
@@ -349,6 +363,24 @@ class PathProbeEngine:
             template = WordlistTemplate([f"%CATEGORY:{category}%"])
             for rendered in template.render(extensions=extensions):
                 yield from emit(rendered)
+
+    def _wordlist_sources(self) -> Iterator[Path]:
+        """Resolve Agent workspace lists and trusted release lists separately."""
+
+        for raw_path in self.options.wordlist_paths:
+            source = self.policy.resolve(raw_path, must_exist=True)
+            if not source.is_file():
+                raise _validation("wordlist_not_file", "Wordlist source must be a file")
+            yield source
+
+        if not self.options.packaged_wordlists:
+            return
+        seen: set[str] = set()
+        for name in self.options.packaged_wordlists:
+            if name in seen:
+                continue
+            seen.add(name)
+            yield resolve_packaged_wordlist(name)
 
     def build_paths(self) -> list[str]:
         return list(self.iter_paths())

@@ -11,7 +11,7 @@ Expected path:
 3. Run `scripts/score_cases.py` for each variant and preserve the JSON output.
 4. Compare attack success, blocking, false-positive, normal-pass, tool-boundary,
    leakage, latency, and cost values using identical denominators.
-5. Finish with one `execution_report` whose summary contains the structured JSON
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) whose summary contains the structured JSON
    metrics and whose detail contains baseline/defense evidence references.
 
 Acceptance: missing measurements remain null or inconclusive; they are not zero.

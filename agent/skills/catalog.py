@@ -13,13 +13,13 @@ from typing import Any, Literal, Mapping, Sequence
 import yaml
 
 
-SkillRole = Literal["challenge", "execution"]
+SkillRole = Literal["solver", "worker"]
 SkillCategory = Literal["common", "challenge", "execution"]
 
 SKILL_CATEGORIES: tuple[SkillCategory, ...] = ("common", "challenge", "execution")
 ROLE_CATEGORIES: dict[SkillRole, frozenset[SkillCategory]] = {
-    "challenge": frozenset({"common", "challenge"}),
-    "execution": frozenset({"common", "execution"}),
+    "solver": frozenset(SKILL_CATEGORIES),
+    "worker": frozenset(SKILL_CATEGORIES),
 }
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_SKILL_NAME_CHARS = 64
@@ -148,7 +148,6 @@ class SkillRecord:
     name: str
     description: str
     when_to_use: str
-    auto_activate_for: frozenset[SkillRole]
     category: SkillCategory
     root: Path
     instructions: str
@@ -189,14 +188,19 @@ class SkillRecord:
             return payload
         resources = [item for item in self.resources if item.path != "SKILL.md"]
         for item in resources[:MAX_INLINE_RESOURCES]:
-            candidate = {**payload, "resources": [*payload["resources"], item.public(self.skill_id)]}
+            candidate = {
+                **payload,
+                "resources": [*payload["resources"], item.public(self.skill_id)],
+            }
             if len(self._encoded(candidate)) > MAX_INVOKE_RESULT_CHARS:
                 break
             payload = candidate
         if len(self._encoded(payload)) > MAX_INVOKE_RESULT_CHARS:
             instructions = str(payload.get("instructions") or "")
             overflow = len(self._encoded(payload)) - MAX_INVOKE_RESULT_CHARS + 32
-            payload["instructions"] = _truncate(instructions, max(0, len(instructions) - overflow))
+            payload["instructions"] = _truncate(
+                instructions, max(0, len(instructions) - overflow)
+            )
         return payload
 
     @staticmethod
@@ -294,11 +298,6 @@ class SkillCatalog:
             )
         return skill
 
-    def auto_skills(self, role: SkillRole) -> tuple[SkillRecord, ...]:
-        return tuple(
-            skill for skill in self.available(role) if role in skill.auto_activate_for
-        )
-
     def listing(
         self,
         role: SkillRole,
@@ -308,10 +307,7 @@ class SkillCatalog:
     ) -> str:
         excluded = set(excluded_ids)
         skills = [
-            skill
-            for skill in self.available(role)
-            if role not in skill.auto_activate_for
-            and skill.skill_id not in excluded
+            skill for skill in self.available(role) if skill.skill_id not in excluded
         ]
         ranked = self._rank(skills, selection_text, include_unmatched=True)
         return self._build_listing([skill for _, skill in ranked[:MAX_LISTING_SKILLS]])
@@ -346,8 +342,8 @@ class SkillCatalog:
                     for skill_id in pack_for_direction(normalized_direction).skills
                 }
         skills: list[SkillRecord] = []
-        for skill in self.available("execution"):
-            if "execution" in skill.auto_activate_for or skill.skill_id in excluded:
+        for skill in self.available("worker"):
+            if skill.skill_id in excluded:
                 continue
             if self._violates_routing_boundary(skill, selection_text):
                 continue
@@ -369,9 +365,11 @@ class SkillCatalog:
             item = skill.public()
             explicit = self._explicit_match(skill, selection_text)
             overlap = self._term_overlap(skill, selection_text)
-            strength = "strong" if explicit or (
-                top_unique and score == top_score and overlap >= 2
-            ) else ("weak" if overlap else "none")
+            strength = (
+                "strong"
+                if explicit or (top_unique and score == top_score and overlap >= 2)
+                else ("weak" if overlap else "none")
+            )
             item["match_strength"] = strength
             item["recommended"] = (
                 strength == "strong" and score == top_score and top_unique
@@ -394,7 +392,8 @@ class SkillCatalog:
             )
         if len(normalized_query) > 500:
             raise SkillCatalogError(
-                "skill_search_query_invalid", "Skill search query must not exceed 500 characters"
+                "skill_search_query_invalid",
+                "Skill search query must not exceed 500 characters",
             )
         if limit < 1 or limit > MAX_SEARCH_RESULTS:
             raise SkillCatalogError(
@@ -405,8 +404,7 @@ class SkillCatalog:
         skills = [
             skill
             for skill in self.available(role)
-            if role not in skill.auto_activate_for
-            and skill.skill_id not in excluded
+            if skill.skill_id not in excluded
             and not self._violates_routing_boundary(skill, normalized_query)
         ]
         ranked = self._rank(skills, normalized_query, include_unmatched=False)
@@ -489,7 +487,8 @@ class SkillCatalog:
                 ) from exc
             if not resolved.is_file():
                 raise SkillCatalogError(
-                    "skill_resource_not_file", "The requested skill resource is not a file"
+                    "skill_resource_not_file",
+                    "The requested skill resource is not a file",
                 )
             try:
                 text = resolved.read_text(encoding="utf-8")
@@ -558,7 +557,10 @@ class SkillCatalog:
                 )
             records.append(skill)
             seen.add(skill_id)
-        if sum(len(item.activation_view) for item in records) > MAX_ACTIVE_CONTEXT_CHARS:
+        if (
+            sum(len(item.activation_view) for item in records)
+            > MAX_ACTIVE_CONTEXT_CHARS
+        ):
             raise SkillCatalogError(
                 "skill_context_budget_exceeded",
                 "Activated Skill instructions exceed the Agent context budget",
@@ -575,16 +577,19 @@ class SkillCatalog:
                     "skill_category_missing",
                     f"The required skill category is missing: {category}",
                 )
-            for skill_root in sorted(category_root.iterdir(), key=lambda item: item.name):
+            for skill_root in sorted(
+                category_root.iterdir(), key=lambda item: item.name
+            ):
                 if not skill_root.is_dir() or skill_root.name == "__pycache__":
                     continue
                 # Finder-style duplicate directories are workspace artifacts,
                 # not published Skill IDs. Ignore them only when the canonical
                 # sibling is present; every other invalid folder remains a
                 # startup error.
-                if skill_root.name.endswith(" copy") and (
-                    category_root / skill_root.name.removesuffix(" copy")
-                ).is_dir():
+                if (
+                    skill_root.name.endswith(" copy")
+                    and (category_root / skill_root.name.removesuffix(" copy")).is_dir()
+                ):
                     continue
                 if skill_root.is_symlink():
                     raise SkillCatalogError(
@@ -599,8 +604,8 @@ class SkillCatalog:
                         f"Skill is missing SKILL.md: {category}/{skill_root.name}",
                     )
                 try:
-                    name, description, when_to_use, auto_activate_for, instructions = (
-                        self._skill_file(instructions_path)
+                    name, description, when_to_use, instructions = self._skill_file(
+                        instructions_path
                     )
                 except SkillCatalogError as exc:
                     exc.detail.setdefault("path", str(instructions_path))
@@ -624,7 +629,6 @@ class SkillCatalog:
                     "name": name,
                     "description": description,
                     "when_to_use": when_to_use,
-                    "auto_activate_for": sorted(auto_activate_for),
                     "instructions": instructions,
                     "resources": [
                         {
@@ -641,7 +645,6 @@ class SkillCatalog:
                     name=name,
                     description=description,
                     when_to_use=when_to_use,
-                    auto_activate_for=auto_activate_for,
                     category=category,
                     root=skill_root.resolve(strict=True),
                     instructions=instructions,
@@ -677,9 +680,7 @@ class SkillCatalog:
                 skills[skill_id] = record
         return skills
 
-    def _skill_file(
-        self, path: Path
-    ) -> tuple[str, str, str, frozenset[SkillRole], str]:
+    def _skill_file(self, path: Path) -> tuple[str, str, str, str]:
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -693,7 +694,9 @@ class SkillCatalog:
             )
         try:
             end = next(
-                index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+                index
+                for index, line in enumerate(lines[1:], start=1)
+                if line.strip() == "---"
             )
         except StopIteration as exc:
             raise SkillCatalogError(
@@ -719,25 +722,14 @@ class SkillCatalog:
             description, "skill_description_invalid", "Skill description"
         )
         if when_to_use_raw is None:
-            when_to_use = self._when_to_use_from_body(instructions="\n".join(lines[end + 1 :]))
+            when_to_use = self._when_to_use_from_body(
+                instructions="\n".join(lines[end + 1 :])
+            )
             if not when_to_use:
                 when_to_use = description
         else:
             when_to_use = self._normalized_text(
                 when_to_use_raw, "skill_when_to_use_invalid", "Skill when_to_use"
-            )
-        auto_raw = metadata.get("auto_activate_for", [])
-        if not isinstance(auto_raw, list) or any(
-            not isinstance(item, str) or item not in ROLE_CATEGORIES for item in auto_raw
-        ):
-            raise SkillCatalogError(
-                "skill_auto_activate_for_invalid",
-                "Skill auto_activate_for must contain only challenge or execution",
-            )
-        if len(set(auto_raw)) != len(auto_raw):
-            raise SkillCatalogError(
-                "skill_auto_activate_for_invalid",
-                "Skill auto_activate_for must not contain duplicates",
             )
         instructions = "\n".join(lines[end + 1 :]).strip()
         if not instructions:
@@ -753,7 +745,6 @@ class SkillCatalog:
             name,
             description,
             when_to_use,
-            frozenset(auto_raw),
             instructions,
         )
 
@@ -798,7 +789,11 @@ class SkillCatalog:
     def _resources(self, skill_root: Path) -> tuple[SkillResource, ...]:
         values: list[SkillResource] = []
         for path in sorted(skill_root.rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or path.suffix == ".pyc"
+            ):
                 continue
             relative = path.relative_to(skill_root).as_posix()
             first = PurePosixPath(relative).parts[0]
@@ -839,9 +834,7 @@ class SkillCatalog:
         return normalized or None
 
     @staticmethod
-    def _activation_view(
-        description: str, when_to_use: str, instructions: str
-    ) -> str:
+    def _activation_view(description: str, when_to_use: str, instructions: str) -> str:
         if len(instructions) <= MAX_INLINE_INSTRUCTIONS_CHARS:
             return instructions
         headings: list[str] = []
@@ -889,7 +882,9 @@ class SkillCatalog:
             if normalized_query:
                 if normalized_query in {name, skill_id}:
                     score += 100_000
-                if name.startswith(normalized_query) or skill_id.startswith(normalized_query):
+                if name.startswith(normalized_query) or skill_id.startswith(
+                    normalized_query
+                ):
                     score += 50_000
                 if normalized_query in haystack:
                     score += 20_000

@@ -41,6 +41,7 @@ class AgentStateStore:
         self.run_dir = run_dir
         self.manifest = manifest
         self.checkpoint = checkpoint
+        self.experiment_reviews = {}
         self.events_path = run_dir / "events.jsonl"
         self.checkpoint_path = run_dir / "checkpoint.json"
         self.memory_path = run_dir / "session_memory.md"
@@ -64,7 +65,7 @@ class AgentStateStore:
         if role == "chief":
             overview = await service.get_overview(run_id)
             operation_filters: dict[str, str] = {}
-        elif role == "challenge":
+        elif role == "solver":
             overview = await service.get_overview(
                 run_id, unique_code=unique_code, active_agents_only=True
             )
@@ -92,26 +93,24 @@ class AgentStateStore:
             )
             for item in overview["challenges"]
         ]
-        status_map = {
-            "queued": "pending",
-            "starting": "pending",
-            "working": "running",
-            "blocked": "running",
-            "stopping": "running",
-            "cancelled": "stopped",
-        }
+
         agents = [
             AgentNode(
                 agent_id=item["agent_id"],
                 role=item["role"],
                 parent_id=item["parent_id"],
                 unique_code=item["unique_code"],
-                status=status_map.get(item["status"], item["status"]),
+                status=item["status"],
+                mode=item["mode"],
                 sidecar_path=str(run_dir / "agents" / item["agent_id"]),
                 mission=str(item["mission"] or "")[:500],
                 timeout_seconds=item["timeout_seconds"],
                 report_count=1 if item["last_report_sequence"] else 0,
                 last_report_sequence=item["last_report_sequence"],
+                last_heartbeat_at=item.get("last_heartbeat_at"),
+                last_model_activity_at=item.get("last_model_activity_at"),
+                last_tool_activity_at=item.get("last_tool_activity_at"),
+                waiting_sources=item.get("waiting_sources", []),
             )
             for item in overview["agents"]
         ]
@@ -131,116 +130,32 @@ class AgentStateStore:
         ]
         run_status = run["status"]
         authoritative_view: dict[str, Any]
-        if role == "challenge":
+        if role in {"solver", "worker"}:
             context = await service.get_challenge_context(
                 run_id, str(unique_code), compact=True
             )
-            challenge_state = context["challenge"]
-            latest_cycle = (
-                context["recent_cycles"][0]
-                if context.get("recent_cycles")
-                else None
-            )
-            if isinstance(latest_cycle, dict):
-                analysis = latest_cycle.get("analysis")
-                plan = latest_cycle.get("plan")
-                verification = latest_cycle.get("verification")
-                latest_cycle = {
-                    "cycle_id": latest_cycle.get("cycle_id"),
-                    "cycle_number": latest_cycle.get("cycle_number"),
-                    "status": latest_cycle.get("status"),
-                    "version": latest_cycle.get("version"),
-                    "analysis": {
-                        "summary": str(
-                            analysis.get("summary") if isinstance(analysis, dict) else ""
-                        )[:1_000],
-                        "direction": (
-                            analysis.get("direction")
-                            if isinstance(analysis, dict)
-                            else "unknown"
-                        ),
-                    },
-                    "tasks": [
-                        {
-                            "task_key": item.get("task_key"),
-                            "hypothesis_key": item.get("hypothesis_key"),
-                            "task_stage": item.get("task_stage"),
-                            "context_refs": list(item.get("context_refs") or [])[:5],
-                        }
-                        for item in list(
-                            (plan.get("tasks") or []) if isinstance(plan, dict) else []
-                        )[:12]
-                        if isinstance(item, dict)
-                    ],
-                    "verification": {
-                        "summary": str(
-                            verification.get("summary")
-                            if isinstance(verification, dict)
-                            else ""
-                        )[:1_000],
-                        "outcome": (
-                            verification.get("outcome")
-                            if isinstance(verification, dict)
-                            else None
-                        ),
-                    },
-                }
             authoritative_view = {
-                "authority": context["authority"],
-                "challenge": {
-                    "unique_code": challenge_state["unique_code"],
-                    "description": str(challenge_state.get("description") or "")[:2_000],
-                    "direction": challenge_state.get("direction"),
-                    "work_status": challenge_state.get("work_status"),
-                    "is_completed": challenge_state.get("is_completed"),
-                },
-                "finding_refs": [
-                    item["finding_ref"]
-                    for item in list(context.get("findings") or [])[-20:]
-                    if isinstance(item, dict) and item.get("finding_ref")
-                ],
-                "report_refs": [
-                    item["terminal_report_ref"]
-                    for item in list(context.get("task_ledger") or [])[:20]
-                    if isinstance(item, dict) and item.get("terminal_report_ref")
-                ],
-            }
-        elif role == "execution":
-            challenge_state = overview["challenges"][0] if overview["challenges"] else {}
-            authoritative_view = {
+                "challenge": context["challenge"],
+                "tasks": context["tasks"],
+                "findings": context["findings"],
+                "hints": context["hints"],
                 "assignment": {
-                    "agent_id": agent_id,
-                    "kind": agent.get("kind"),
-                    "mission": str(agent.get("mission") or "")[:4_000],
-                    "task_stage": agent.get("task_stage"),
-                    "hypothesis_key": agent.get("hypothesis_key"),
-                    "task_key": agent.get("task_key"),
-                    "branch_key": agent.get("branch_key"),
-                    "success_criteria": list(agent.get("success_criteria") or [])[:20],
-                    "context_refs": list(agent.get("context_refs") or [])[:50],
+                    key: agent.get(key)
+                    for key in (
+                        "agent_id",
+                        "mode",
+                        "mission",
+                        "task_key",
+                        "context_refs",
+                        "success_criteria",
+                    )
                 },
-                "challenge": {
-                    "unique_code": challenge_state.get("unique_code"),
-                    "description": str(challenge_state.get("description") or "")[:2_000],
-                    "direction": challenge_state.get("direction"),
-                    "container_addr": list(challenge_state.get("container_addr") or []),
-                    "evidence_root": challenge_state.get("evidence_root"),
-                },
+                "resource_generation": agent["resource_generation"],
             }
-            if agent.get("kind") == "bootstrap":
-                cursors = dict(agent.get("report_cursors") or {})
-                authoritative_view["bootstrap_shared"] = {
-                    "report_cursor": int(cursors.get("bootstrap_shared", 0) or 0),
-                    "hint_cursor": int(cursors.get("bootstrap_hint", 0) or 0),
-                    "pending_sequence": int(
-                        cursors.get("bootstrap_shared_pending_through", 0) or 0
-                    ),
-                }
         else:
             authoritative_view = {
                 "deadline_at": run["deadline_at"],
                 "container_capacity": overview["container_capacity"],
-                "current_challenge_code": run["current_challenge_code"],
             }
         manifest = RunManifest(
             run_id=run_id,
@@ -256,10 +171,8 @@ class AgentStateStore:
         checkpoint = Checkpoint(
             run_id=run_id,
             status=run_status,
-            phase=run["phase"],
             targets=targets,
             container_capacity=overview["container_capacity"],
-            current_target=run["current_challenge_code"],
             score_snapshot=run["score_snapshot"],
             last_event_sequence=run["last_sequence"],
             last_summarized_event_sequence=agent["last_summarized_sequence"],
@@ -273,7 +186,7 @@ class AgentStateStore:
         )
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         (run_dir / "artifacts").mkdir(parents=True, exist_ok=True, mode=0o700)
-        return cls(
+        store = cls(
             service,
             run_id=run_id,
             agent_id=agent_id,
@@ -281,8 +194,13 @@ class AgentStateStore:
             manifest=manifest,
             checkpoint=checkpoint,
         )
+        if role == "solver":
+            store.experiment_reviews = await service.solver_review_state(run_id, agent_id)
+        return store
 
-    async def append_event(self, event_type: str, payload: dict[str, Any] | None = None) -> RunEvent:
+    async def append_event(
+        self, event_type: str, payload: dict[str, Any] | None = None
+    ) -> RunEvent:
         sequence = await self.service.append_agent_event(
             self.run_id,
             self.agent_id,
@@ -299,9 +217,7 @@ class AgentStateStore:
             payload=payload or {},
         )
 
-    async def append_events(
-        self, events: list[dict[str, Any]]
-    ) -> list[RunEvent]:
+    async def append_events(self, events: list[dict[str, Any]]) -> list[RunEvent]:
         sequences = await self.service.append_agent_events(
             self.run_id, self.agent_id, events
         )
@@ -338,14 +254,12 @@ class AgentStateStore:
             "run_id": self.checkpoint.run_id,
             "role": role,
             "status": self.checkpoint.status,
-            "phase": self.checkpoint.phase,
             "last_event_sequence": self.checkpoint.last_event_sequence,
             "last_summarized_event_sequence": (
                 self.checkpoint.last_summarized_event_sequence
             ),
             "active_skills": [
-                item.model_dump(mode="json")
-                for item in self.checkpoint.active_skills
+                item.model_dump(mode="json") for item in self.checkpoint.active_skills
             ],
         }
         if self.checkpoint.indeterminate_operations:
@@ -353,11 +267,12 @@ class AgentStateStore:
                 item.model_dump(mode="json")
                 for item in self.checkpoint.indeterminate_operations
             ]
+        if self.experiment_reviews.get("hypotheses"):
+            value["experiment_reviews"] = self.experiment_reviews
         if role == "chief":
             value.update(
                 {
                     "container_capacity": self.checkpoint.container_capacity,
-                    "current_target": self.checkpoint.current_target,
                     "score_snapshot": self.checkpoint.score_snapshot,
                     "authority": self.checkpoint.authoritative_view,
                 }

@@ -65,6 +65,10 @@ def _ssh_base() -> list[str]:
         "-o",
         "BatchMode=yes",
         "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=10",
+        "-o",
         "StrictHostKeyChecking=yes",
         "-o",
         f"UserKnownHostsFile={KNOWN_HOSTS}",
@@ -175,12 +179,37 @@ def _requirements_digest() -> str:
     return digest.hexdigest()
 
 
-def _local_verify() -> None:
+def _validate_test_paths(values: Iterable[str]) -> list[str]:
+    paths: list[str] = []
+    for value in values:
+        if not value or value.startswith("-") or "\n" in value or "\r" in value:
+            raise OperatorError("--test-path must be a relative pytest path")
+        path_part = value.split("::", 1)[0]
+        path = (PROJECT_ROOT / path_part).resolve()
+        try:
+            path.relative_to(PROJECT_ROOT / "tests")
+        except ValueError as exc:
+            raise OperatorError("--test-path must be below tests/") from exc
+        if not path.exists():
+            raise OperatorError(f"test path does not exist: {value}")
+        paths.append(value)
+    if not paths:
+        raise OperatorError("at least one test path is required")
+    return paths
+
+
+def _local_verify(test_paths: Iterable[str] | None = None) -> None:
     python = PROJECT_ROOT / ".venv" / "bin" / "python"
     if not python.is_file():
         raise OperatorError("local .venv Python was not found")
-    print("[local] running full pytest", flush=True)
-    _run([str(python), "-m", "pytest", "-q"], cwd=PROJECT_ROOT)
+    if test_paths is None:
+        pytest_args = ["-q"]
+        print("[local] running full pytest", flush=True)
+    else:
+        paths = _validate_test_paths(test_paths)
+        pytest_args = ["-q", *paths]
+        print(f"[local] running targeted pytest: {' '.join(paths)}", flush=True)
+    _run([str(python), "-m", "pytest", *pytest_args], cwd=PROJECT_ROOT)
     print("[local] compiling deployment entry points", flush=True)
     _run(
         [
@@ -265,12 +294,13 @@ def _remote_doctor(*, require_monitor_service: bool = False) -> None:
     _ssh(["bash", "-lc", script])
 
 
-def _stage_release(release_id: str, venv_id: str) -> None:
-    incoming = f"/opt/aion/releases/.incoming-{release_id}"
-    _ssh(["install", "-d", "-m", "0755", incoming])
+def _rsync_command(destination: str, *, base_release_id: str | None = None) -> list[str]:
     command = [
         "rsync",
-        "-a",
+        "--recursive",
+        "--links",
+        "--checksum",
+        "--executability",
         "--delete",
         "--exclude",
         "__pycache__/",
@@ -281,14 +311,64 @@ def _stage_release(release_id: str, venv_id: str) -> None:
         "-e",
         _rsync_shell(),
         *[str(PROJECT_ROOT / name) for name in SOURCE_NAMES],
-        f"{SSH_TARGET}:{incoming}/",
+        destination,
     ]
+    if base_release_id is not None:
+        command[6:6] = ["--link-dest", f"/opt/aion/releases/{base_release_id}"]
+    return command
+
+
+def _print_rsync_preview(output: str) -> None:
+    changed: list[str] = []
+    stats: list[str] = []
+    stat_prefixes = (
+        "Number of files",
+        "Number of created files",
+        "Number of deleted files",
+        "Number of regular files transferred",
+        "Total transferred file size",
+        "Literal data",
+        "Matched data",
+    )
+    for line in output.splitlines():
+        if line.startswith("*deleting") or (
+            len(line) > 2 and line[0] in "<>c" and line[1] in "fL"
+        ):
+            changed.append(line)
+        elif line.startswith(stat_prefixes):
+            stats.append(line)
+    if changed:
+        print("[deploy] changed files:", flush=True)
+        print("\n".join(changed), flush=True)
+    else:
+        print("[deploy] changed files: none", flush=True)
+    if stats:
+        print("[deploy] rsync summary:", flush=True)
+        print("\n".join(stats), flush=True)
+
+
+def _stage_release(
+    release_id: str, venv_id: str, base_release_id: str
+) -> None:
+    incoming = f"/opt/aion/releases/.incoming-{release_id}"
+    if RELEASE_PATTERN.fullmatch(base_release_id) is None:
+        raise OperatorError("remote current release id was invalid")
+    _ssh(["install", "-d", "-m", "0755", incoming])
+    command = _rsync_command(
+        f"{SSH_TARGET}:{incoming}/", base_release_id=base_release_id
+    )
     try:
-        dry_run = [*command[:2], "--dry-run", "--itemize-changes", *command[2:]]
+        preview_command = _rsync_command(f"{SSH_TARGET}:/opt/aion/current/")
+        dry_run = [
+            *preview_command[:1],
+            "--dry-run",
+            "--itemize-changes",
+            "--stats",
+            *preview_command[1:],
+        ]
         preview = _run(dry_run, capture_output=True, cwd=PROJECT_ROOT)
-        print(_decode(preview), end="", flush=True)
+        _print_rsync_preview(_decode(preview))
         _run(command, cwd=PROJECT_ROOT)
-        _ssh(["chown", "-R", "root:root", incoming])
         manager = f"{incoming}/deploy/release_manager.py"
         _ssh(
             [
@@ -301,6 +381,8 @@ def _stage_release(release_id: str, venv_id: str) -> None:
                 incoming,
                 "--venv-id",
                 venv_id,
+                "--base-release-id",
+                base_release_id,
             ]
         )
     except Exception:
@@ -378,7 +460,12 @@ def _restore_vpn() -> None:
     _ssh(["python3", "-c", script], check=False)
 
 
-def _start_remote(mode: str, token: str, run_id: str | None = None) -> str:
+def _start_remote(
+    mode: str, token: str, run_id: str | None = None,
+    selected_challenge_codes: list[str] | None = None,
+) -> str:
+    if mode != "fresh" and selected_challenge_codes is not None:
+        raise OperatorError("Resume cannot replace selected_challenge_codes")
     if mode == "fresh" and run_id is None:
         run_id = f"online-{secrets.token_hex(6)}"
     command = ["aionctl", "start" if mode == "fresh" else "resume"]
@@ -387,6 +474,8 @@ def _start_remote(mode: str, token: str, run_id: str | None = None) -> str:
         command.extend(["--run-id", str(run_id)])
     else:
         command.extend(["--run-id", run_id or "latest", "--benchmark-token-stdin"])
+    for code in selected_challenge_codes or []:
+        command.extend(["--challenge-code", code])
     _ssh(command, input_data=token.encode("utf-8"))
     return str(run_id or "latest")
 
@@ -478,8 +567,10 @@ def _rollback_pending(release_id: str) -> None:
     _ssh(["python3", manager, "rollback-pending"], check=False)
 
 
-def _deploy(token: str, vpn: Path | None) -> None:
-    _local_verify()
+def _deploy(
+    token: str, vpn: Path | None, test_paths: Iterable[str] | None = None
+) -> None:
+    _local_verify(test_paths)
     _remote_doctor()
     before = _remote_state()
     package_hash = _package_hash()
@@ -492,17 +583,16 @@ def _deploy(token: str, vpn: Path | None) -> None:
     source_digest = _source_digest()
     release_id = _release_id(source_digest)
     venv_id = _requirements_digest()
+    base_release_id = before.get("release")
+    if not isinstance(base_release_id, str) or RELEASE_PATTERN.fullmatch(base_release_id) is None:
+        raise OperatorError("remote current release is required for incremental deployment")
     print(f"[deploy] staging release {release_id}", flush=True)
-    _stage_release(release_id, venv_id)
+    _stage_release(release_id, venv_id, base_release_id)
     staged_vpn = _stage_vpn(vpn, release_id) if vpn else None
     activated = False
     try:
         if was_active:
-            if before.get("release"):
-                _ssh(["aionctl", "pause"])
-            else:
-                print("[deploy] first structured release: graceful legacy stop", flush=True)
-                _ssh(["systemctl", "stop", "aion-online.service"])
+            _ssh(["aionctl", "pause"])
         if staged_vpn:
             _switch_vpn(staged_vpn)
         _activate_release(release_id)
@@ -548,13 +638,16 @@ def _replace_vpn_for_start(vpn: Path | None) -> bool:
     return True
 
 
-def _start_command(mode: str, token: str, run_id: str | None, vpn: Path | None) -> None:
+def _start_command(
+    mode: str, token: str, run_id: str | None, vpn: Path | None,
+    selected_challenge_codes: list[str] | None = None,
+) -> None:
     before = _remote_state()
     if before.get("active"):
         raise OperatorError("AION is already active")
     changed_vpn = _replace_vpn_for_start(vpn)
     try:
-        expected = _start_remote(mode, token, run_id)
+        expected = _start_remote(mode, token, run_id, selected_challenge_codes)
         if expected == "latest":
             current = _remote_state().get("run") or {}
             expected = str(current.get("run_id") or "")
@@ -796,10 +889,18 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy = subparsers.add_parser("deploy")
     deploy.add_argument("--benchmark-token", required=True)
     deploy.add_argument("--vpn", type=Path)
+    deploy.add_argument(
+        "--test-path",
+        action="append",
+        dest="test_paths",
+        metavar="PATH",
+        help="run selected pytest paths instead of the full suite; repeatable",
+    )
 
     start = subparsers.add_parser("start")
     start.add_argument("--benchmark-token", required=True)
     start.add_argument("--vpn", type=Path)
+    start.add_argument("--challenge-code", action="append", dest="selected_challenge_codes")
 
     resume = subparsers.add_parser("resume")
     resume.add_argument("--benchmark-token", required=True)
@@ -852,12 +953,12 @@ def main() -> None:
         if args.command == "deploy":
             token = _validate_token(args.benchmark_token)
             args.benchmark_token = ""
-            _deploy(token, args.vpn)
+            _deploy(token, args.vpn, args.test_paths)
             token = ""
         elif args.command == "start":
             token = _validate_token(args.benchmark_token)
             args.benchmark_token = ""
-            _start_command("fresh", token, None, args.vpn)
+            _start_command("fresh", token, None, args.vpn, args.selected_challenge_codes)
             token = ""
         elif args.command == "resume":
             token = _validate_token(args.benchmark_token)

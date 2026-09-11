@@ -55,9 +55,29 @@ class NetworkTools:
             return await self._client.stop(task_id=arguments.task_id)
 
         return [
-            ToolSpec("system_network_discovery", "Discover live hosts, ports, and services. Preserve task_id and poll instead of replaying a scan.", NetworkDiscoveryArguments, discovery, lambda arguments: (AccessClaim("write", f"network-new:{id(arguments)}"),)),
-            ToolSpec("system_network_output", "Poll progress and structured results for an existing network task without starting traffic.", NetworkOutputArguments, output, self._task_read),
-            ToolSpec("system_network_stop", "Stop an owned queued or running network task while preserving results.", NetworkStopArguments, stop, self._task_write),
+            ToolSpec(
+                "system_network_discovery",
+                "Discover live hosts, ports, and services. Preserve task_id and poll instead of replaying a scan.",
+                NetworkDiscoveryArguments,
+                discovery,
+                lambda arguments: (
+                    AccessClaim("write", f"network-new:{id(arguments)}"),
+                ),
+            ),
+            ToolSpec(
+                "system_network_output",
+                "Poll progress and structured results for an existing network task without starting traffic.",
+                NetworkOutputArguments,
+                output,
+                self._task_read,
+            ),
+            ToolSpec(
+                "system_network_stop",
+                "Stop an owned queued or running network task while preserving results.",
+                NetworkStopArguments,
+                stop,
+                self._task_write,
+            ),
         ]
 
     @staticmethod
@@ -67,6 +87,3 @@ class NetworkTools:
     @staticmethod
     def _task_write(arguments: BaseModel) -> tuple[AccessClaim, ...]:
         return (AccessClaim("write", f"network-task:{arguments.task_id}"),)
-
-    async def close(self) -> None:
-        return None

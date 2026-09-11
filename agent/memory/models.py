@@ -24,9 +24,16 @@ TargetStatus = Literal[
     "indeterminate",
 ]
 
-AgentRole = Literal["chief", "challenge", "execution"]
+AgentRole = Literal["chief", "solver", "worker"]
 RunStatus = Literal["active", "paused", "completed", "failed", "interrupted"]
 AgentLifecycleStatus = Literal[
+    "queued",
+    "starting",
+    "working",
+    "blocked",
+    "stopping",
+    "cancelled",
+    "paused",
     "pending",
     "running",
     "waiting",
@@ -36,7 +43,7 @@ AgentLifecycleStatus = Literal[
     "interrupted",
     "indeterminate",
 ]
-SkillActivationMode = Literal["auto", "model"]
+SkillActivationMode = Literal["model", "capability"]
 
 
 class _Model(BaseModel):
@@ -85,6 +92,7 @@ class AgentNode(_Model):
     """Durable metadata for one Agent in the current run's Agent graph."""
 
     agent_id: str = Field(min_length=1)
+    mode: Literal["execute", "review"] = "execute"
     role: AgentRole
     parent_id: str | None = None
     unique_code: str | None = None
@@ -97,12 +105,17 @@ class AgentNode(_Model):
     last_report_sequence: int = Field(default=0, ge=0)
     started_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    last_heartbeat_at: datetime | None = None
+    last_model_activity_at: datetime | None = None
+    last_tool_activity_at: datetime | None = None
+    waiting_sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ActiveSkillState(_Model):
     skill_id: str = Field(min_length=1, max_length=160)
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     activation_mode: SkillActivationMode
+    source_review_sequence: int | None = Field(default=None, ge=1)
     activated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -110,10 +123,8 @@ class Checkpoint(_Model):
     schema_version: int = 2
     run_id: str = Field(min_length=1)
     status: RunStatus = "active"
-    phase: str = "initializing"
     targets: list[TargetState] = Field(default_factory=list)
     container_capacity: dict[str, Any] = Field(default_factory=dict)
-    current_target: str | None = None
     score_snapshot: dict[str, Any] = Field(default_factory=dict)
     last_event_sequence: int = 0
     last_summarized_event_sequence: int = 0

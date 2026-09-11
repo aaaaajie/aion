@@ -81,6 +81,21 @@ def package(source: Path) -> dict[str, Any]:
     for name, raw_entry in binaries.items():
         if not isinstance(raw_entry, dict):
             raise PackagingError(f"invalid manifest entry: {name}")
+        asset_directory = raw_entry.get("asset_directory")
+        if asset_directory:
+            relative = Path(asset_directory)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise PackagingError("unsafe asset directory")
+            asset_source = (source.parent / relative).resolve()
+            asset_source.relative_to(source.parent.resolve())
+            if not asset_source.is_dir():
+                raise PackagingError(f"missing bundled asset tree: {asset_source}")
+            shutil.copytree(asset_source, TOOLCHAIN_ROOT / relative, dirs_exist_ok=True)
+            destination = TOOLCHAIN_ROOT / raw_entry["path"]
+            destination.resolve().relative_to((TOOLCHAIN_ROOT / relative).resolve())
+            raw_entry["sha256"] = _sha256(destination)
+            copied[name] = raw_entry["sha256"]
+            continue
         source_name = str(raw_entry.get("source_name", name))
         source_path = (source / source_name).resolve()
         try:

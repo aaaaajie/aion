@@ -40,6 +40,7 @@
         "pwn_session_io",
         "pwn_session_close",
         "system_shell",
+        "system_task_start",
         "execution_report"
       ]
     },
@@ -63,6 +64,7 @@
         "evidence_read",
         "system_read_file",
         "system_shell",
+        "system_task_start",
         "execution_report"
       ]
     },
@@ -85,6 +87,7 @@
         "evasion_payload_analyze",
         "system_read_file",
         "system_shell",
+        "system_task_start",
         "execution_report"
       ]
     },
@@ -118,6 +121,7 @@
         "pwn_session_io",
         "pwn_session_close",
         "system_shell",
+        "system_task_start",
         "execution_report"
       ]
     },
@@ -143,6 +147,8 @@
         "system_http_output",
         "system_http_response",
         "pentest_service_probe",
+        "pentest_jwt",
+        "pentest_arjun",
         "pentest_auth_brute",
         "pentest_dir_fuzz",
         "pentest_credential_lookup",
@@ -183,15 +189,20 @@
         "system_glob",
         "system_read_file",
         "system_shell",
+        "system_task_start",
         "system_network_discovery",
         "pentest_dir_fuzz",
         "pentest_sqlmap",
+        "pentest_jwt",
+        "pentest_arjun",
         "execution_report"
       ]
     }
   },
   "skills": [
     "challenge/challenge-threat-modeling",
+    "common/ctf-flag-locator",
+    "common/cyberchef-recipes",
     "common/recognize-challenge-direction",
     "common/vulnerability-knowledge-base",
     "common/web-ctf-flow",

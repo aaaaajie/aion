@@ -94,7 +94,9 @@ async def run_smoke(max_rounds: int) -> int:
     await shell_tasks.initialize()
     system_tools = SystemTools(
         root=PROJECT_ROOT,
-        shell=shell_tasks.bind(chief["agent_id"]),
+        shell=shell_tasks.bind(chief["agent_id"], shared_root=shell_tasks.shared_workspace_root("smoke")),
+        agent_work_root=shell_tasks.agent_work_root(chief["agent_id"]),
+        shared_work_root=shell_tasks.shared_workspace_root("smoke"),
     )
     await service.transition_controller(run_id, chief["agent_id"], "running")
     store = await AgentStateStore.open(

@@ -12,7 +12,7 @@ Expected path:
    smallest input per signature.
 4. Reproduce one representative crash with `bin_debug` and collect only focused
    registers/stack evidence.
-5. Finish with one `execution_report` listing iteration/time/output limits,
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) listing iteration/time/output limits,
    signatures, reproductions, and `DEPENDENCY_UNAVAILABLE` if coverage guidance,
    instrumentation, or a harness is absent.
 

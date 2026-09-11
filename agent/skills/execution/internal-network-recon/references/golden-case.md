@@ -12,7 +12,7 @@ Expected path:
 3. Normalize host, port, protocol, banner, confidence, and ownership evidence.
 4. Use `pentest_service_probe` only for one identified service ambiguity; do not
    launch a broad second scan.
-5. Finish with one `execution_report` that records task ID, scope, inventory,
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) that records task ID, scope, inventory,
    chosen next branch, and stop reason.
 
 Acceptance: discovery is not treated as proof of a vulnerability or permission

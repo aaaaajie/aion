@@ -29,10 +29,18 @@ def _create_run_database(
 class _FakeMonitor:
     instances: list["_FakeMonitor"] = []
 
-    def __init__(self, database: Path, run_id: str, *, port: int) -> None:
+    def __init__(
+        self,
+        database: Path,
+        run_id: str,
+        *,
+        port: int,
+        workspace_root: Path | None = None,
+    ) -> None:
         self.database = database
         self.run_id = run_id
         self.port = port
+        self.workspace_root = workspace_root
         self.frozen = False
         self.closed = False
         self.actions: list[str] = []

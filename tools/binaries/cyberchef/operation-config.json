@@ -1,0 +1,1576 @@
+{
+  "From Base64": {
+    "name": "From Base64",
+    "description": "From Base64",
+    "args": [
+      {
+        "name": "alphabet",
+        "type": "string",
+        "description": "Alphabet",
+        "default": "A-Za-z0-9+/="
+      },
+      {
+        "name": "removeNonAlphabetChars",
+        "type": "boolean",
+        "description": "Ignore non-alphabet characters",
+        "default": true
+      },
+      {
+        "name": "urlSafe",
+        "type": "boolean",
+        "description": "URL-safe alphabet",
+        "default": false
+      }
+    ]
+  },
+  "To Base64": {
+    "name": "To Base64",
+    "description": "To Base64",
+    "args": []
+  },
+  "From Base32": {
+    "name": "From Base32",
+    "description": "From Base32",
+    "args": []
+  },
+  "To Base32": {
+    "name": "To Base32",
+    "description": "To Base32",
+    "args": []
+  },
+  "From Base58": {
+    "name": "From Base58",
+    "description": "From Base58",
+    "args": []
+  },
+  "To Base58": {
+    "name": "To Base58",
+    "description": "To Base58",
+    "args": []
+  },
+  "From Hex": {
+    "name": "From Hex",
+    "description": "From Hex",
+    "args": []
+  },
+  "To Hex": {
+    "name": "To Hex",
+    "description": "To Hex",
+    "args": [
+      {
+        "name": "delimiter",
+        "type": "string",
+        "description": "Byte delimiter",
+        "default": " "
+      }
+    ]
+  },
+  "From Binary": {
+    "name": "From Binary",
+    "description": "From Binary",
+    "args": []
+  },
+  "To Binary": {
+    "name": "To Binary",
+    "description": "To Binary",
+    "args": [
+      {
+        "name": "delimiter",
+        "type": "string",
+        "description": "Bit-group delimiter",
+        "default": " "
+      }
+    ]
+  },
+  "From Charcode": {
+    "name": "From Charcode",
+    "description": "From Charcode",
+    "args": []
+  },
+  "To Charcode": {
+    "name": "To Charcode",
+    "description": "To Charcode",
+    "args": []
+  },
+  "URL Decode": {
+    "name": "URL Decode",
+    "description": "URL Decode",
+    "args": []
+  },
+  "URL Encode": {
+    "name": "URL Encode",
+    "description": "URL Encode",
+    "args": []
+  },
+  "From HTML Entity": {
+    "name": "From HTML Entity",
+    "description": "From HTML Entity",
+    "args": []
+  },
+  "To HTML Entity": {
+    "name": "To HTML Entity",
+    "description": "To HTML Entity",
+    "args": []
+  },
+  "Decode text": {
+    "name": "Decode text",
+    "description": "Decode text",
+    "args": [
+      {
+        "name": "encoding",
+        "type": "string",
+        "description": "Source encoding",
+        "default": "UTF-8"
+      }
+    ]
+  },
+  "Encode text": {
+    "name": "Encode text",
+    "description": "Encode text",
+    "args": [
+      {
+        "name": "encoding",
+        "type": "string",
+        "description": "Target encoding",
+        "default": "UTF-8"
+      }
+    ]
+  },
+  "ROT13": {
+    "name": "ROT13",
+    "description": "ROT13",
+    "args": []
+  },
+  "ROT47": {
+    "name": "ROT47",
+    "description": "ROT47",
+    "args": []
+  },
+  "Atbash": {
+    "name": "Atbash",
+    "description": "Atbash",
+    "args": []
+  },
+  "Vigenere Decode": {
+    "name": "Vigenere Decode",
+    "description": "Vigenere Decode",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Vigenere key"
+      }
+    ]
+  },
+  "Vigenere Encode": {
+    "name": "Vigenere Encode",
+    "description": "Vigenere Encode",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Vigenere key"
+      }
+    ]
+  },
+  "A1Z26 Decode": {
+    "name": "A1Z26 Decode",
+    "description": "A1Z26 Decode",
+    "args": []
+  },
+  "A1Z26 Encode": {
+    "name": "A1Z26 Encode",
+    "description": "A1Z26 Encode",
+    "args": []
+  },
+  "XOR": {
+    "name": "XOR",
+    "description": "XOR",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "XOR key",
+        "default": ""
+      },
+      {
+        "name": "inputFormat",
+        "type": "string",
+        "description": "Key encoding",
+        "default": "UTF8"
+      }
+    ]
+  },
+  "AES Encrypt": {
+    "name": "AES Encrypt",
+    "description": "AES Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "keyFormat",
+        "type": "string",
+        "description": "Key encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "ivFormat",
+        "type": "string",
+        "description": "IV encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "Padding mode",
+        "default": "PKCS7"
+      },
+      {
+        "name": "tag",
+        "type": "string",
+        "description": "Authentication tag",
+        "default": ""
+      },
+      {
+        "name": "tagFormat",
+        "type": "string",
+        "description": "Tag encoding",
+        "default": "Hex"
+      }
+    ]
+  },
+  "AES Decrypt": {
+    "name": "AES Decrypt",
+    "description": "AES Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "keyFormat",
+        "type": "string",
+        "description": "Key encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "ivFormat",
+        "type": "string",
+        "description": "IV encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "Padding mode",
+        "default": "PKCS7"
+      },
+      {
+        "name": "tag",
+        "type": "string",
+        "description": "Authentication tag",
+        "default": ""
+      },
+      {
+        "name": "tagFormat",
+        "type": "string",
+        "description": "Tag encoding",
+        "default": "Hex"
+      }
+    ]
+  },
+  "AES Key Wrap": {
+    "name": "AES Key Wrap",
+    "description": "AES Key Wrap",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Key encryption key",
+        "default": ""
+      }
+    ]
+  },
+  "AES Key Unwrap": {
+    "name": "AES Key Unwrap",
+    "description": "AES Key Unwrap",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Key encryption key",
+        "default": ""
+      }
+    ]
+  },
+  "DES Encrypt": {
+    "name": "DES Encrypt",
+    "description": "DES Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "DES Decrypt": {
+    "name": "DES Decrypt",
+    "description": "DES Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "Triple DES Encrypt": {
+    "name": "Triple DES Encrypt",
+    "description": "Triple DES Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "Triple DES Decrypt": {
+    "name": "Triple DES Decrypt",
+    "description": "Triple DES Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "3DES Encrypt": {
+    "name": "3DES Encrypt",
+    "description": "3DES Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "3DES Decrypt": {
+    "name": "3DES Decrypt",
+    "description": "3DES Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "RC2 Encrypt": {
+    "name": "RC2 Encrypt",
+    "description": "RC2 Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "RC2 Decrypt": {
+    "name": "RC2 Decrypt",
+    "description": "RC2 Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "RC4": {
+    "name": "RC4",
+    "description": "RC4",
+    "args": [
+      {
+        "name": "passphrase",
+        "type": "string",
+        "description": "RC4 key",
+        "default": ""
+      },
+      {
+        "name": "inputFormat",
+        "type": "string",
+        "description": "Key encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "outputFormat",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "RC4 Drop": {
+    "name": "RC4 Drop",
+    "description": "RC4 Drop",
+    "args": [
+      {
+        "name": "passphrase",
+        "type": "string",
+        "description": "RC4 key",
+        "default": ""
+      },
+      {
+        "name": "inputFormat",
+        "type": "string",
+        "description": "Key encoding",
+        "default": "UTF8"
+      },
+      {
+        "name": "outputFormat",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "drop",
+        "type": "number",
+        "description": "Bytes to discard",
+        "default": 768
+      }
+    ]
+  },
+  "Blowfish Encrypt": {
+    "name": "Blowfish Encrypt",
+    "description": "Blowfish Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "Blowfish Decrypt": {
+    "name": "Blowfish Decrypt",
+    "description": "Blowfish Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "ChaCha20 Encrypt": {
+    "name": "ChaCha20 Encrypt",
+    "description": "ChaCha20 Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "nonce",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "ChaCha20 Decrypt": {
+    "name": "ChaCha20 Decrypt",
+    "description": "ChaCha20 Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "nonce",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "Salsa20 Encrypt": {
+    "name": "Salsa20 Encrypt",
+    "description": "Salsa20 Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "nonce",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "Salsa20 Decrypt": {
+    "name": "Salsa20 Decrypt",
+    "description": "Salsa20 Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "nonce",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "SM4 Encrypt": {
+    "name": "SM4 Encrypt",
+    "description": "SM4 Encrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "SM4 Decrypt": {
+    "name": "SM4 Decrypt",
+    "description": "SM4 Decrypt",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "Encryption key",
+        "default": ""
+      },
+      {
+        "name": "iv",
+        "type": "string",
+        "description": "Initialization vector",
+        "default": ""
+      },
+      {
+        "name": "mode",
+        "type": "string",
+        "description": "Cipher mode",
+        "default": "CBC"
+      },
+      {
+        "name": "input",
+        "type": "string",
+        "description": "Input encoding",
+        "default": "Raw"
+      },
+      {
+        "name": "output",
+        "type": "string",
+        "description": "Output encoding",
+        "default": "Raw"
+      }
+    ]
+  },
+  "RSA Encrypt": {
+    "name": "RSA Encrypt",
+    "description": "RSA Encrypt",
+    "args": [
+      {
+        "name": "RSA Public Key (PEM)",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "",
+        "default": "OAEP"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-1"
+      }
+    ]
+  },
+  "RSA Decrypt": {
+    "name": "RSA Decrypt",
+    "description": "RSA Decrypt",
+    "args": [
+      {
+        "name": "RSA Private Key (PEM)",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "",
+        "default": "OAEP"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-1"
+      }
+    ]
+  },
+  "RSA Sign": {
+    "name": "RSA Sign",
+    "description": "RSA Sign",
+    "args": [
+      {
+        "name": "RSA Private Key (PEM)",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "",
+        "default": "PKCS1"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "RSA Verify": {
+    "name": "RSA Verify",
+    "description": "RSA Verify",
+    "args": [
+      {
+        "name": "RSA Public Key (PEM)",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "signature",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "signatureFormat",
+        "type": "string",
+        "description": "",
+        "default": "Base64"
+      },
+      {
+        "name": "padding",
+        "type": "string",
+        "description": "",
+        "default": "PKCS1"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "Generate RSA Key Pair": {
+    "name": "Generate RSA Key Pair",
+    "description": "Generate RSA Key Pair",
+    "args": [
+      {
+        "name": "size",
+        "type": "number",
+        "description": "",
+        "default": 2048
+      }
+    ]
+  },
+  "ECDSA Sign": {
+    "name": "ECDSA Sign",
+    "description": "ECDSA Sign",
+    "args": [
+      {
+        "name": "privateKey",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "ECDSA Verify": {
+    "name": "ECDSA Verify",
+    "description": "ECDSA Verify",
+    "args": [
+      {
+        "name": "publicKey",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "signature",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "signatureFormat",
+        "type": "string",
+        "description": "",
+        "default": "Base64"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "Generate ECDSA Key Pair": {
+    "name": "Generate ECDSA Key Pair",
+    "description": "Generate ECDSA Key Pair",
+    "args": [
+      {
+        "name": "curve",
+        "type": "string",
+        "description": "",
+        "default": "secp256r1"
+      }
+    ]
+  },
+  "MD5": {
+    "name": "MD5",
+    "description": "MD5",
+    "args": []
+  },
+  "SHA1": {
+    "name": "SHA1",
+    "description": "SHA1",
+    "args": []
+  },
+  "SHA-1": {
+    "name": "SHA-1",
+    "description": "SHA-1",
+    "args": []
+  },
+  "SHA2": {
+    "name": "SHA2",
+    "description": "SHA2",
+    "args": [
+      {
+        "name": "size",
+        "type": "string",
+        "description": "",
+        "default": "256"
+      }
+    ]
+  },
+  "SHA3": {
+    "name": "SHA3",
+    "description": "SHA3",
+    "args": [
+      {
+        "name": "size",
+        "type": "string",
+        "description": "",
+        "default": "256"
+      }
+    ]
+  },
+  "BLAKE2b": {
+    "name": "BLAKE2b",
+    "description": "BLAKE2b",
+    "args": [
+      {
+        "name": "size",
+        "type": "number",
+        "description": "",
+        "default": 512
+      }
+    ]
+  },
+  "BLAKE2s": {
+    "name": "BLAKE2s",
+    "description": "BLAKE2s",
+    "args": [
+      {
+        "name": "size",
+        "type": "number",
+        "description": "",
+        "default": 256
+      }
+    ]
+  },
+  "RIPEMD-160": {
+    "name": "RIPEMD-160",
+    "description": "RIPEMD-160",
+    "args": []
+  },
+  "HMAC": {
+    "name": "HMAC",
+    "description": "HMAC",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "keyFormat",
+        "type": "string",
+        "description": "",
+        "default": "UTF8"
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "CMAC": {
+    "name": "CMAC",
+    "description": "CMAC",
+    "args": [
+      {
+        "name": "key",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "keyFormat",
+        "type": "string",
+        "description": "",
+        "default": "Hex"
+      },
+      {
+        "name": "algorithm",
+        "type": "string",
+        "description": "",
+        "default": "AES"
+      }
+    ]
+  },
+  "CRC32": {
+    "name": "CRC32",
+    "description": "CRC32",
+    "args": []
+  },
+  "Checksum": {
+    "name": "Checksum",
+    "description": "Checksum",
+    "args": []
+  },
+  "PBKDF2": {
+    "name": "PBKDF2",
+    "description": "PBKDF2",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "Password",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "Salt",
+        "default": ""
+      },
+      {
+        "name": "iterations",
+        "type": "number",
+        "description": "Iterations",
+        "default": 100000
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "Output bytes",
+        "default": 32
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "Hash algorithm",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "Derive PBKDF2 key": {
+    "name": "Derive PBKDF2 key",
+    "description": "Derive PBKDF2 key",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "Password",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "Salt",
+        "default": ""
+      },
+      {
+        "name": "iterations",
+        "type": "number",
+        "description": "Iterations",
+        "default": 100000
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "Output bytes",
+        "default": 32
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "Hash algorithm",
+        "default": "SHA-256"
+      }
+    ]
+  },
+  "HKDF": {
+    "name": "HKDF",
+    "description": "HKDF",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "Password",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "Salt",
+        "default": ""
+      },
+      {
+        "name": "iterations",
+        "type": "number",
+        "description": "Iterations",
+        "default": 100000
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "Output bytes",
+        "default": 32
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "Hash algorithm",
+        "default": "SHA-256"
+      },
+      {
+        "name": "info",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "Derive HKDF key": {
+    "name": "Derive HKDF key",
+    "description": "Derive HKDF key",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "Password",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "Salt",
+        "default": ""
+      },
+      {
+        "name": "iterations",
+        "type": "number",
+        "description": "Iterations",
+        "default": 100000
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "Output bytes",
+        "default": 32
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "Hash algorithm",
+        "default": "SHA-256"
+      },
+      {
+        "name": "info",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "Scrypt": {
+    "name": "Scrypt",
+    "description": "Scrypt",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "Password",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "Salt",
+        "default": ""
+      },
+      {
+        "name": "iterations",
+        "type": "number",
+        "description": "Iterations",
+        "default": 100000
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "Output bytes",
+        "default": 32
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "Hash algorithm",
+        "default": "SHA-256"
+      },
+      {
+        "name": "N",
+        "type": "number",
+        "description": "",
+        "default": 16384
+      },
+      {
+        "name": "r",
+        "type": "number",
+        "description": "",
+        "default": 8
+      },
+      {
+        "name": "p",
+        "type": "number",
+        "description": "",
+        "default": 1
+      }
+    ]
+  },
+  "EVP_BytesToKey": {
+    "name": "EVP_BytesToKey",
+    "description": "EVP_BytesToKey",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "salt",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "keySize",
+        "type": "number",
+        "description": "",
+        "default": 32
+      },
+      {
+        "name": "ivSize",
+        "type": "number",
+        "description": "",
+        "default": 16
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": "MD5"
+      }
+    ]
+  },
+  "Bcrypt": {
+    "name": "Bcrypt",
+    "description": "Bcrypt",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "rounds",
+        "type": "number",
+        "description": "",
+        "default": 12
+      }
+    ]
+  },
+  "Bcrypt Verify": {
+    "name": "Bcrypt Verify",
+    "description": "Bcrypt Verify",
+    "args": [
+      {
+        "name": "password",
+        "type": "string",
+        "description": "",
+        "default": ""
+      },
+      {
+        "name": "hash",
+        "type": "string",
+        "description": "",
+        "default": ""
+      }
+    ]
+  },
+  "Gzip": {
+    "name": "Gzip",
+    "description": "Gzip",
+    "args": []
+  },
+  "Gunzip": {
+    "name": "Gunzip",
+    "description": "Gunzip",
+    "args": []
+  },
+  "Zlib Deflate": {
+    "name": "Zlib Deflate",
+    "description": "Zlib Deflate",
+    "args": []
+  },
+  "Zlib Inflate": {
+    "name": "Zlib Inflate",
+    "description": "Zlib Inflate",
+    "args": []
+  },
+  "Raw Deflate": {
+    "name": "Raw Deflate",
+    "description": "Raw Deflate",
+    "args": []
+  },
+  "Raw Inflate": {
+    "name": "Raw Inflate",
+    "description": "Raw Inflate",
+    "args": []
+  },
+  "PEM to Hex": {
+    "name": "PEM to Hex",
+    "description": "PEM to Hex",
+    "args": []
+  },
+  "Hex to PEM": {
+    "name": "Hex to PEM",
+    "description": "Hex to PEM",
+    "args": []
+  },
+  "PEM to DER": {
+    "name": "PEM to DER",
+    "description": "PEM to DER",
+    "args": []
+  },
+  "DER to PEM": {
+    "name": "DER to PEM",
+    "description": "DER to PEM",
+    "args": []
+  },
+  "PEM to JWK": {
+    "name": "PEM to JWK",
+    "description": "PEM to JWK",
+    "args": []
+  },
+  "JWK to PEM": {
+    "name": "JWK to PEM",
+    "description": "JWK to PEM",
+    "args": []
+  },
+  "Parse ASN.1": {
+    "name": "Parse ASN.1",
+    "description": "Parse ASN.1",
+    "args": []
+  },
+  "Parse X.509 certificate": {
+    "name": "Parse X.509 certificate",
+    "description": "Parse X.509 certificate",
+    "args": []
+  }
+}

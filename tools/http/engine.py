@@ -21,7 +21,9 @@ import httpx
 
 from tools.system.policy import SystemToolError, WorkspacePolicy
 
+from .urls import effective_url
 from .models import HttpProbeCase, HttpRequestSpec, HttpVariableSource
+from .wordlists import resolve_packaged_wordlist
 
 
 MAX_HTTP_PROBE_REQUESTS = 5_000
@@ -98,7 +100,7 @@ class HttpInteractionEngine:
     ) -> None:
         self.policy = policy
         self.transport = transport
-        self._clients: dict[tuple[bool, str | None], httpx.AsyncClient] = {}
+        self._clients: dict[tuple[str, bool, str | None], httpx.AsyncClient] = {}
         self._clients_lock = asyncio.Lock()
         self._network_request_count = 0
         self._connection_ids: set[int] = set()
@@ -114,19 +116,36 @@ class HttpInteractionEngine:
         }
 
     async def aclose(self) -> None:
-        """Close the Run-scoped connection pools."""
+        await self._close_clients(None)
 
+    async def close_agent(self, agent_id: str) -> None:
+        await self._close_clients(agent_id)
+
+    async def _close_clients(self, agent_id: str | None) -> None:
         async with self._clients_lock:
-            clients = list(self._clients.values())
-            self._clients.clear()
-        if clients:
-            await asyncio.gather(
-                *(client.aclose() for client in clients),
-                return_exceptions=True,
-            )
+            clients = [
+                (key, client)
+                for key, client in self._clients.items()
+                if agent_id is None or key[0] == agent_id
+            ]
+        results = await asyncio.gather(
+            *(client.aclose() for _, client in clients), return_exceptions=True
+        )
+        async with self._clients_lock:
+            for (key, client), result in zip(clients, results):
+                if (
+                    not isinstance(result, BaseException)
+                    and self._clients.get(key) is client
+                ):
+                    self._clients.pop(key)
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise ExceptionGroup("HTTP connection cleanup failed", failures)
 
-    async def _client_for(self, spec: HttpRequestSpec) -> httpx.AsyncClient:
-        key = (spec.verify_tls, spec.proxy)
+    async def _client_for(
+        self, spec: HttpRequestSpec, agent_id: str
+    ) -> httpx.AsyncClient:
+        key = (agent_id, spec.verify_tls, spec.proxy)
         client = self._clients.get(key)
         if client is not None:
             return client
@@ -166,11 +185,13 @@ class HttpInteractionEngine:
         )
         self._record_connection(response)
         redirects = 0
+        history = []
         while True:
             cookies.extract_cookies(response)
             next_request = response.next_request if follow_redirects else None
             if next_request is None:
                 client.cookies.clear()
+                response.history = history
                 return response, cookies
             redirects += 1
             if redirects > 20:
@@ -185,6 +206,7 @@ class HttpInteractionEngine:
             cookies.set_cookie_header(next_request)
             await response.aread()
             await response.aclose()
+            history.append(response)
             response = await client.send(
                 next_request,
                 stream=True,
@@ -214,45 +236,59 @@ class HttpInteractionEngine:
         expanded: list[ExpandedRequest] = []
         ordinal = 0
         for case_index, case in enumerate(cases):
-            names = list(case.variables)
-            self._preflight_template(case, declared_names=set(names))
-            sources = [self._source_values(case.variables[name]) for name in names]
-            if case.combine == "zip":
-                lengths = {len(values) for values in sources}
-                if len(lengths) > 1:
+            try:
+                names = list(case.variables)
+                self._preflight_template(case, declared_names=set(names))
+                sources = []
+                for name in names:
+                    try:
+                        sources.append(self._source_values(case.variables[name]))
+                    except SystemToolError as exc:
+                        raise self._at_path(exc, "variables", name)
+                if case.combine == "zip":
+                    lengths = {len(values) for values in sources}
+                    if len(lengths) > 1:
+                        raise self._validation(
+                            "zip_length_mismatch",
+                            "All zip variable sources must contain the same number of values",
+                            path=("variables",),
+                        )
+                    combination_count = next(iter(lengths), 1)
+                    combinations = zip(*sources, strict=True) if sources else [()]
+                else:
+                    combination_count = 1
+                    for values in sources:
+                        combination_count *= len(values)
+                        if combination_count > MAX_HTTP_PROBE_REQUESTS:
+                            break
+                    combinations = itertools.product(*sources) if sources else [()]
+                if len(expanded) + combination_count > MAX_HTTP_PROBE_REQUESTS:
                     raise self._validation(
-                        "zip_length_mismatch",
-                        "All zip variable sources must contain the same number of values",
+                        "http_probe_too_large",
+                        f"HTTP probe expands beyond {MAX_HTTP_PROBE_REQUESTS} requests",
+                        path=("variables",),
                     )
-                combination_count = next(iter(lengths), 1)
-                combinations = zip(*sources, strict=True) if sources else [()]
-            else:
-                combination_count = 1
-                for values in sources:
-                    combination_count *= len(values)
-                    if combination_count > MAX_HTTP_PROBE_REQUESTS:
-                        break
-                combinations = itertools.product(*sources) if sources else [()]
-            if len(expanded) + combination_count > MAX_HTTP_PROBE_REQUESTS:
-                raise self._validation(
-                    "http_probe_too_large",
-                    f"HTTP probe expands beyond {MAX_HTTP_PROBE_REQUESTS} requests",
+                group_id = (
+                    case.request.request_group_id or f"{default_group_id}-case-{case_index}"
                 )
-            group_id = case.request.request_group_id or f"{default_group_id}-case-{case_index}"
-            for combination in combinations:
-                bindings = dict(zip(names, combination, strict=True))
-                ordinal += 1
-                spec = self._render_request(case.request, bindings, case.variables)
-                self._validate_expanded_url(spec.url, case_index=case_index, ordinal=ordinal)
-                expanded.append(
-                    ExpandedRequest(
-                        request_id=f"request-{id_factory()}",
-                        ordinal=ordinal,
-                        spec=spec,
-                        variables=bindings,
-                        request_group_id=group_id,
+                for combination in combinations:
+                    bindings = dict(zip(names, combination, strict=True))
+                    ordinal += 1
+                    spec = self._render_request(case.request, bindings, case.variables)
+                    self._validate_expanded_url(
+                        spec.url, case_index=case_index, ordinal=ordinal
                     )
-                )
+                    expanded.append(
+                        ExpandedRequest(
+                            request_id=f"request-{id_factory()}",
+                            ordinal=ordinal,
+                            spec=spec,
+                            variables=bindings,
+                            request_group_id=group_id,
+                        )
+                    )
+            except SystemToolError as exc:
+                raise self._at_path(exc, "cases", case_index)
         return expanded
 
     @classmethod
@@ -262,37 +298,38 @@ class HttpInteractionEngine:
         """Validate matrix placeholders before reading sources or creating work."""
 
         model = case.request.model_dump(mode="python")
-        strings: list[tuple[str, bool]] = []
+        strings: list[tuple[str, bool, tuple[str | int, ...]]] = []
 
-        def collect(value: Any, *, reject_single: bool = True) -> None:
+        def collect(value: Any, path: tuple[str | int, ...], *, reject_single: bool = True) -> None:
             if isinstance(value, str):
-                strings.append((value, reject_single))
+                strings.append((value, reject_single, path))
             elif isinstance(value, dict):
                 for key, item in value.items():
-                    collect(key, reject_single=reject_single)
-                    collect(item, reject_single=reject_single)
+                    collect(key, (*path, key), reject_single=reject_single)
+                    collect(item, (*path, key), reject_single=reject_single)
             elif isinstance(value, list):
-                for item in value:
-                    collect(item, reject_single=reject_single)
+                for index, item in enumerate(value):
+                    collect(item, (*path, index), reject_single=reject_single)
 
         # A raw body is opaque application data; braces there are not
         # necessarily template syntax. All request-construction fields and
         # structured body types are unambiguous template locations.
         for key in ("method", "url", "query", "headers", "cookies"):
-            collect(model.get(key))
+            collect(model.get(key), (key,))
         body = model.get("body")
         if isinstance(body, dict):
-            collect(body.get("value"), reject_single=body.get("type") != "raw")
+            collect(body.get("value"), ("body", "value"), reject_single=body.get("type") != "raw")
 
         single = re.compile(r"(?<!\{)\{([A-Za-z_]\w*)\}(?!\})")
         double = re.compile(r"\{\{([A-Za-z_]\w*)\}\}")
         used: set[str] = set()
-        for value, reject_single in strings:
+        for value, reject_single, path in strings:
             malformed = single.search(value) if reject_single else None
             if malformed:
                 raise cls._validation(
                     "invalid_template_syntax",
                     f"Use {{{{{malformed.group(1)}}}}} for matrix variables; single-brace placeholders are not accepted",
+                    path=path,
                 )
             for match in double.finditer(value):
                 name = match.group(1)
@@ -300,20 +337,27 @@ class HttpInteractionEngine:
                     raise cls._validation(
                         "unknown_template_variable",
                         f"Template variable '{name}' is not declared in variables",
+                        path=path,
                     )
                 used.add(name)
         unused = sorted(declared_names - used)
         if unused:
-            raise cls._validation(
+            error = cls._validation(
                 "unused_template_variable",
                 f"Declared template variables are not used: {', '.join(unused)}",
             )
+            error.detail["fields"] = [
+                {"path": f"variables.{name}", "code": error.code, "message": error.message}
+                for name in unused
+            ]
+            raise error
 
     async def execute(
         self,
         request: ExpandedRequest,
         *,
         body_path: Path,
+        agent_id: str,
         session_cookies: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         spec = request.spec
@@ -377,18 +421,20 @@ class HttpInteractionEngine:
         line_count = 0
         preview = bytearray()
         response_headers: dict[str, str] = {}
+        set_cookie_headers: list[str] = []
         status_code: int | None = None
         final_url = spec.url
+        redirect_chain = []
+        initial_status_code = None
         outcome = "response"
         error_detail: str | None = None
         response_cookies: list[dict[str, Any]] = []
         last_body_byte: int | None = None
         try:
-            client = await self._client_for(spec)
+            client = await self._client_for(spec, agent_id)
             http_request = httpx.Request(
                 spec.method.upper(),
-                spec.url,
-                params=spec.query,
+                effective_url(spec.url, spec.query),
                 headers=headers,
                 cookies=cookies,
                 extensions={"timeout": timeout.as_dict()},
@@ -403,8 +449,13 @@ class HttpInteractionEngine:
             )
             try:
                 status_code = response.status_code
+                initial_status_code = (response.history[0] if response.history else response).status_code
+                redirect_chain = [{"url": str(hop.url), "status_code": hop.status_code,
+                                   "location": hop.headers.get("location")}
+                                  for hop in response.history]
                 final_url = str(response.url)
                 response_headers = dict(response.headers)
+                set_cookie_headers = response.headers.get_list("set-cookie")
                 with partial_path.open("wb") as output:
                     async for chunk in response.aiter_bytes():
                         output.write(chunk)
@@ -441,11 +492,19 @@ class HttpInteractionEngine:
             message = str(exc).lower()
             if any(
                 marker in message
-                for marker in ("name or service not known", "nodename nor servname", "getaddrinfo")
+                for marker in (
+                    "name or service not known",
+                    "nodename nor servname",
+                    "getaddrinfo",
+                )
             ):
                 outcome = "dns_error"
             else:
-                outcome = "tls_error" if "ssl" in message or "certificate" in message else "connect_error"
+                outcome = (
+                    "tls_error"
+                    if "ssl" in message or "certificate" in message
+                    else "connect_error"
+                )
             error_detail = type(exc).__name__
         except httpx.ProtocolError as exc:
             outcome, error_detail = "protocol_error", type(exc).__name__
@@ -465,7 +524,9 @@ class HttpInteractionEngine:
                 pass
         if body_bytes and last_body_byte != ord("\n"):
             line_count += 1
-        title = self._extract_title(bytes(preview), response_headers.get("content-type", ""))
+        title = self._extract_title(
+            bytes(preview), response_headers.get("content-type", "")
+        )
         result = {
             "type": "response",
             "request_id": request.request_id,
@@ -476,9 +537,15 @@ class HttpInteractionEngine:
             "connection_context_id": spec.connection_context_id,
             "sequence_id": spec.sequence_id,
             "variables": request.variables,
+            "execution_source": "http",
+            "failure_stage": {"response": None, "dns_error": "dns", "tls_error": "tls", "connect_error": "connect", "protocol_error": "http", "storage_error": "storage"}.get(outcome, "unknown"),
             "outcome": outcome,
             "status_code": status_code,
             "final_url": final_url,
+            "initial_url": spec.url,
+            "initial_status_code": initial_status_code,
+            "follow_redirects": spec.follow_redirects,
+            "redirect_chain": redirect_chain,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
             "body_bytes": body_bytes,
             "content_length": self._int_header(response_headers.get("content-length")),
@@ -489,12 +556,15 @@ class HttpInteractionEngine:
             "location": response_headers.get("location"),
             "title": title,
             "headers": response_headers,
+            "set_cookie_headers": set_cookie_headers,
             "error": error_detail,
             "body_file": body_path.name if body_path.exists() else None,
         }
         return result, response_cookies
 
-    def analyze(self, response: dict[str, Any], body_path: Path, *, revision: int) -> dict[str, Any]:
+    def analyze(
+        self, response: dict[str, Any], body_path: Path, *, revision: int
+    ) -> dict[str, Any]:
         data = body_path.read_bytes() if body_path.exists() else b""
         content_type = str(response.get("content_type") or "").lower()
         binary = self._is_binary(data, content_type)
@@ -508,7 +578,9 @@ class HttpInteractionEngine:
             except LookupError:
                 charset = "utf-8"
                 text = data.decode(charset, errors="replace")
-            if "html" in content_type or re.search(r"(?i)<(?:html|body|form)\b", text[:4096]):
+            if "html" in content_type or re.search(
+                r"(?i)<(?:html|body|form)\b", text[:4096]
+            ):
                 parser = _HtmlFeatures()
                 parser.feed(text)
                 summary = {
@@ -580,26 +652,36 @@ class HttpInteractionEngine:
                 raise self._validation(
                     "http_probe_too_large",
                     f"HTTP probe source contains more than {MAX_HTTP_PROBE_REQUESTS} values",
+                    path=("range",),
                 )
             return list(values)
         assert source.file_path is not None
-        path = self.policy.resolve(source.file_path, must_exist=True)
-        if not path.is_file():
-            raise self._validation("variable_file_not_file", "Variable source must be a file")
-        values: list[str] = []
-        with path.open("r", encoding="utf-8") as source_file:
-            for line in source_file:
-                line = line.rstrip("\r\n")
-                value = line.strip() if source.trim else line
-                if source.skip_empty and not value:
-                    continue
-                values.append(value)
-                if len(values) > MAX_HTTP_PROBE_REQUESTS:
-                    raise self._validation(
-                        "http_probe_too_large",
-                        f"HTTP probe source contains more than {MAX_HTTP_PROBE_REQUESTS} values",
-                    )
-        return values
+        try:
+            if source.file_path.startswith("packaged:"):
+                path = resolve_packaged_wordlist(source.file_path.removeprefix("packaged:"))
+            else:
+                path = self.policy.resolve(source.file_path, must_exist=True)
+            if not path.is_file():
+                raise self._validation(
+                    "variable_file_not_file", "Variable source must be a file"
+                )
+            values: list[str] = []
+            with path.open("r", encoding="utf-8") as source_file:
+                for line in source_file:
+                    line = line.rstrip("\r\n")
+                    value = line.strip() if source.trim else line
+                    if source.skip_empty and not value:
+                        continue
+                    values.append(value)
+                    if len(values) > MAX_HTTP_PROBE_REQUESTS:
+                        raise self._validation(
+                            "http_probe_too_large",
+                            f"HTTP probe source contains more than {MAX_HTTP_PROBE_REQUESTS} values",
+                        )
+            return values
+
+        except SystemToolError as exc:
+            raise self._at_path(exc, "file_path")
 
     def _render_request(
         self,
@@ -661,7 +743,9 @@ class HttpInteractionEngine:
             rendered = rendered.replace(f"{{{{{name}}}}}", replacement)
         return rendered
 
-    def _body_arguments(self, spec: HttpRequestSpec) -> tuple[dict[str, Any], list[Any]]:
+    def _body_arguments(
+        self, spec: HttpRequestSpec
+    ) -> tuple[dict[str, Any], list[Any]]:
         if spec.body is None:
             return {}, []
         body = spec.body
@@ -675,10 +759,14 @@ class HttpInteractionEngine:
             try:
                 decoded = base64.b64decode(str(body.value), validate=True)
             except ValueError as exc:
-                raise self._validation("invalid_base64_body", "Raw base64 body is invalid") from exc
+                raise self._validation(
+                    "invalid_base64_body", "Raw base64 body is invalid"
+                ) from exc
             return {"content": decoded}, []
         if not isinstance(body.value, dict):
-            raise self._validation("invalid_multipart", "Multipart body must be an object")
+            raise self._validation(
+                "invalid_multipart", "Multipart body must be an object"
+            )
         files: dict[str, Any] = {}
         opened: list[Any] = []
         for name, item in body.value.items():
@@ -701,30 +789,34 @@ class HttpInteractionEngine:
             return
         if body.type == "form" and not isinstance(body.value, dict):
             raise self._validation(
-                "invalid_form_body", "Form body must be a key/value object"
+                "invalid_form_body", "Form body must be a key/value object", path=("body", "value")
             )
         if body.type == "base64":
             try:
                 base64.b64decode(str(body.value), validate=True)
             except ValueError as exc:
                 raise self._validation(
-                    "invalid_base64_body", "Raw base64 body is invalid"
+                    "invalid_base64_body", "Raw base64 body is invalid", path=("body", "value")
                 ) from exc
         if body.type != "multipart":
             return
         if not isinstance(body.value, dict):
             raise self._validation(
-                "invalid_multipart", "Multipart body must be an object"
+                "invalid_multipart", "Multipart body must be an object", path=("body", "value")
             )
-        for item in body.value.values():
+        for name, item in body.value.items():
             if not isinstance(item, dict) or "file_path" not in item:
                 continue
-            path = self.policy.resolve(str(item["file_path"]), must_exist=True)
-            if not path.is_file():
-                raise self._validation(
-                    "multipart_file_not_file",
-                    "Multipart file source must be a file",
-                )
+            try:
+                path = self.policy.resolve(str(item["file_path"]), must_exist=True)
+                if not path.is_file():
+                    raise self._validation(
+                        "multipart_file_not_file",
+                        "Multipart file source must be a file",
+                    )
+
+            except SystemToolError as exc:
+                raise self._at_path(exc, "body", "value", name, "file_path")
 
     @staticmethod
     def _extract_title(preview: bytes, content_type: str) -> str | None:
@@ -736,7 +828,11 @@ class HttpInteractionEngine:
         except LookupError:
             text = preview.decode("utf-8", errors="replace")
         match = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
-        return None if match is None else " ".join(re.sub(r"<[^>]+>", " ", match.group(1)).split())
+        return (
+            None
+            if match is None
+            else " ".join(re.sub(r"<[^>]+>", " ", match.group(1)).split())
+        )
 
     @staticmethod
     def _charset(content_type: str) -> str:
@@ -746,13 +842,18 @@ class HttpInteractionEngine:
     @staticmethod
     def _is_binary(data: bytes, content_type: str) -> bool:
         media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type.startswith("text/") or media_type in {
-            "application/json",
-            "application/javascript",
-            "application/xml",
-            "application/xhtml+xml",
-            "application/x-www-form-urlencoded",
-        } or media_type.endswith(("+json", "+xml")):
+        if (
+            media_type.startswith("text/")
+            or media_type
+            in {
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "application/xhtml+xml",
+                "application/x-www-form-urlencoded",
+            }
+            or media_type.endswith(("+json", "+xml"))
+        ):
             return False
         if media_type.startswith(("image/", "audio/", "video/", "font/")):
             return True
@@ -846,19 +947,20 @@ class HttpInteractionEngine:
         }
 
     @staticmethod
-    def _assert_resolved(value: Any) -> None:
+    def _assert_resolved(value: Any, path: tuple[str | int, ...] = ()) -> None:
         if isinstance(value, str) and re.search(r"\{\{[A-Za-z_]\w*\}\}", value):
             raise HttpInteractionEngine._validation(
                 "unknown_template_variable",
                 "HTTP request contains an unresolved template variable",
+                path=path,
             )
         if isinstance(value, dict):
             for key, item in value.items():
-                HttpInteractionEngine._assert_resolved(key)
-                HttpInteractionEngine._assert_resolved(item)
+                HttpInteractionEngine._assert_resolved(key, (*path, key))
+                HttpInteractionEngine._assert_resolved(item, (*path, key))
         elif isinstance(value, list):
-            for item in value:
-                HttpInteractionEngine._assert_resolved(item)
+            for index, item in enumerate(value):
+                HttpInteractionEngine._assert_resolved(item, (*path, index))
 
     @staticmethod
     def _validate_expanded_url(url: str, *, case_index: int, ordinal: int) -> None:
@@ -872,7 +974,7 @@ class HttpInteractionEngine:
                     f"Expanded URL for case {case_index}, request {ordinal} "
                     "still contains a template"
                 ),
-                detail=detail,
+                detail={**detail, "fields": [{"path": "url", "code": "invalid_expanded_url", "message": "Expanded URL is invalid"}]},
             )
         try:
             parts = urlsplit(url)
@@ -885,7 +987,7 @@ class HttpInteractionEngine:
                     f"Expanded URL for case {case_index}, request {ordinal} "
                     "has an invalid port"
                 ),
-                detail=detail,
+                detail={**detail, "fields": [{"path": "url", "code": "invalid_expanded_url", "message": "Expanded URL is invalid"}]},
             ) from exc
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
             raise SystemToolError(
@@ -895,7 +997,7 @@ class HttpInteractionEngine:
                     f"Expanded URL for case {case_index}, request {ordinal} "
                     "must have an http(s) scheme and host"
                 ),
-                detail=detail,
+                detail={**detail, "fields": [{"path": "url", "code": "invalid_expanded_url", "message": "Expanded URL is invalid"}]},
             )
 
     @staticmethod
@@ -918,5 +1020,26 @@ class HttpInteractionEngine:
         return f"{result:016x}"
 
     @staticmethod
-    def _validation(code: str, message: str) -> SystemToolError:
-        return SystemToolError(error_type="validation", code=code, message=message)
+    def _at_path(error: SystemToolError, *prefix: str | int) -> SystemToolError:
+        """Attach the structural location known by the failing operation."""
+        fields = error.detail.get("fields") or [
+            {"path": "", "code": error.code, "message": error.message}
+        ]
+        error.detail = {
+            **error.detail,
+            "fields": [
+                {**field, "path": ".".join(
+                    [*(str(part) for part in prefix), *([field["path"]] if field["path"] else [])]
+                )}
+                for field in fields
+            ],
+        }
+        return error
+
+    @classmethod
+    def _validation(
+        cls, code: str, message: str, *, path: tuple[str | int, ...] = ()
+    ) -> SystemToolError:
+        return cls._at_path(
+            SystemToolError(error_type="validation", code=code, message=message), *path
+        )

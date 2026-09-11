@@ -27,9 +27,13 @@ class SkillSearchArguments(_Arguments):
 
 class SkillResourceReadArguments(_Arguments):
     skill_id: str = Field(min_length=1, max_length=160)
-    resource: str = Field(min_length=1, max_length=1_000)
-    offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=400, ge=1, le=MAX_READ_LINES)
+    resource: str = Field(
+        min_length=1,
+        max_length=1_000,
+        description="Exact relative resource path returned by skill_invoke, such as references/workflow.md; do not pass an absolute filesystem path.",
+    )
+    offset: int = Field(default=0, ge=0, description="Line offset returned by the previous page.")
+    limit: int = Field(default=400, ge=1, le=MAX_READ_LINES, description="Maximum resource lines per page.")
 
 
 class SkillTools:

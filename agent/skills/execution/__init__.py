@@ -1,1 +1,1 @@
-"""Hands-on technical skills for Execution Agents."""
+"""Technical knowledge shared by Solver and execute Workers."""

@@ -16,40 +16,44 @@ from scripts.analyze_run_performance import analyze_run
 
 
 def test_competition_context_and_schema_contract() -> None:
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 19
     assert ContextBudget().absolute_prompt_tokens("chief") == 959_040
-    assert ContextBudget().absolute_prompt_tokens("execution") == 975_424
+    assert ContextBudget().absolute_prompt_tokens("worker") == 975_424
     assert {
         role: profile.soft_prompt_tokens
         for role, profile in ROLE_CONTEXT_PROFILES.items()
-    } == {"chief": 128_000, "challenge": 96_000, "execution": 64_000}
+    } == {"chief": 128_000, "solver": 96_000, "worker": 64_000}
 
 
 def test_role_prompts_are_small() -> None:
-    limits = {"chief": 3_000, "challenge": 5_000, "execution": 4_000}
+    limits = {"chief": 3_000, "solver": 5_000, "worker": 4_500}
     for role, limit in limits.items():
         assert len(system_prompt(role)) <= limit
 
 
 def test_execution_surface_is_bounded_and_has_no_cleanup_tools() -> None:
-    tools = AgentPolicy("execution").allowed_tools
+    tools = AgentPolicy("worker").allowed_tools
     assert len(tools) <= 64
     assert not any(name.endswith("cleanup") for name in tools)
     assert "system_create_directory" not in tools
     assert "system_delete_path" not in tools
-    assert {"execution_report", "evidence_read"} <= tools
+    assert {"worker_report", "evidence_read"} <= tools
 
 
 def test_control_prompts_only_name_current_tools() -> None:
     root = Path(__file__).resolve().parents[1] / "agent" / "prompts"
     text = "\n".join(path.read_text(encoding="utf-8") for path in root.glob("*.txt"))
-    assert "challenge_dispatch" in text
-    assert "challenge_observe" in text
-    assert "execution_report" in text
+    assert "solver_delegate" in text
+    assert "solver_submit_flag" in text
+    assert "solver_wait" in text
+    assert "worker_report" in text
+    assert "challenge_request_secondary_bootstrap" not in text
 
 
 @pytest.mark.asyncio
-async def test_admission_drain_interleaves_explicit_resource_and_agent_batches() -> None:
+async def test_admission_drain_interleaves_explicit_resource_and_agent_batches() -> (
+    None
+):
     class Controller:
         def __init__(self) -> None:
             self.resources = [f"work-{index}" for index in range(50)]
@@ -103,7 +107,9 @@ async def test_admission_drain_interleaves_explicit_resource_and_agent_batches()
 
 
 @pytest.mark.asyncio
-async def test_performance_analysis_exposes_competition_failures(tmp_path: Path) -> None:
+async def test_performance_analysis_exposes_competition_failures(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "state.sqlite3"
     service = StateService(database)
     await service.create_run("analysis-run")
@@ -114,12 +120,10 @@ async def test_performance_analysis_exposes_competition_failures(tmp_path: Path)
     await service.append_agent_event(
         "analysis-run",
         agent_id,
-        "agent_report",
+        "worker_reported",
         {
             "findings_received": 3,
-            "findings_normalized": 2,
             "findings_persisted": 2,
-            "findings_dropped": 1,
             "candidate_flag_present": True,
         },
     )
@@ -140,7 +144,7 @@ async def test_performance_analysis_exposes_competition_failures(tmp_path: Path)
         agent_id,
         "tool_result",
         {
-            "tool_name": "challenge_dispatch",
+            "tool_name": "solver_delegate",
             "round": 1,
             "result": {"ok": True, "data": {}},
             "execution_latency_ms": 20,
@@ -151,7 +155,7 @@ async def test_performance_analysis_exposes_competition_failures(tmp_path: Path)
         agent_id,
         "tool_result",
         {
-            "tool_name": "execution_report",
+            "tool_name": "worker_report",
             "round": 2,
             "result": {
                 "ok": False,
@@ -167,8 +171,8 @@ async def test_performance_analysis_exposes_competition_failures(tmp_path: Path)
         "agent_resource_cleanup_failed",
         {
             "failures": [
-                {"manager": "shell", "error_type": "FileNotFoundError"},
-                {"manager": "network", "error_type": "OSError"},
+                {"resource": "shell", "error_type": "FileNotFoundError"},
+                {"resource": "network", "error_type": "OSError"},
             ]
         },
     )
@@ -176,15 +180,13 @@ async def test_performance_analysis_exposes_competition_failures(tmp_path: Path)
     result = analyze_run(database, "analysis-run")
     assert result["findings"] == {
         "received": 3,
-        "normalized": 2,
         "persisted": 2,
-        "dropped": 1,
         "persistence_rate": 0.6667,
     }
     assert result["flags"]["candidate_count"] == 1
-    assert result["competition_flow"]["first_dispatch_success_rate"] == 1.0
-    assert result["critical_tools"]["challenge_dispatch"]["successes"] == 1
-    assert result["critical_tools"]["execution_report"]["failures"] == {
+    assert result["competition_flow"]["first_delegation_success_rate"] == 1.0
+    assert result["critical_tools"]["solver_delegate"]["successes"] == 1
+    assert result["critical_tools"]["worker_report"]["failures"] == {
         "schema:invalid_arguments": 1
     }
     assert result["context_compaction"]["by_role"]["chief"] == {

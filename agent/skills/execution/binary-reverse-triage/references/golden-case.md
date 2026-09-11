@@ -12,7 +12,7 @@ Expected path:
 3. Map one input parser to one state-changing or output path with offsets/functions.
 4. If the platform does not match, skip process/network sessions and report
    `ENTRY_UNREACHABLE` while retaining static evidence.
-5. Finish with one `execution_report` containing artifact hash, architecture,
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) containing artifact hash, architecture,
    protection state, path evidence, and dynamic status.
 
 Acceptance: macOS never starts a Linux dynamic session merely because the file is

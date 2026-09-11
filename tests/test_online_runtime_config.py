@@ -91,7 +91,7 @@ def test_launch_config_is_strict_and_supports_resume(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    assert online._read_launch_config(launch) == ("online-existing", True)
+    assert online._read_launch_config(launch) == ("online-existing", True, None)
 
     launch.write_text(
         json.dumps({"mode": "resume", "run_id": "../escape"}),
@@ -167,3 +167,50 @@ async def test_wait_for_operation_handles_completion_stop_and_timeout() -> None:
 @pytest.mark.asyncio
 async def test_bounded_shutdown_returns_when_cleanup_hangs() -> None:
     await online._bounded_shutdown(asyncio.sleep(1), "fixture", 0.001)
+
+
+@pytest.mark.asyncio
+async def test_online_forwards_repeated_challenge_codes(monkeypatch):
+    captured = {}
+
+    async def fake_run_online(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(online, "run_online", fake_run_online)
+    monkeypatch.setattr(online.sys, "argv", [
+        "online_runtime.py", "--hosted", "--challenge-code", "b",
+        "--challenge-code", "a", "--challenge-code", "b",
+    ])
+    assert await online.async_main() == 0
+    assert captured["selected_challenge_codes"] == ["b", "a"]
+    assert not captured["resume"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [
+    ["--resume", "--run-id", "existing"],
+    ["--launch-config-file", "/unused/launch.json"],
+])
+async def test_online_rejects_scope_overrides(monkeypatch, extra):
+    monkeypatch.setattr(online.sys, "argv", [
+        "online_runtime.py", "--hosted", "--challenge-code", "a", *extra,
+    ])
+    with pytest.raises(SystemExit):
+        await online.async_main()
+
+
+def test_launch_config_scope_is_strict(tmp_path):
+    launch = tmp_path / "launch.json"
+    launch.write_text(json.dumps({"mode": "fresh", "run_id": "run", "selected_challenge_codes": ["b", "a", "b"]}))
+    assert online._read_launch_config(launch) == ("run", False, ["b", "a"])
+    for value in ([], [""], "a", [1]):
+        launch.write_text(json.dumps({"mode": "fresh", "run_id": "run", "selected_challenge_codes": value}))
+        with pytest.raises(ValueError):
+            online._read_launch_config(launch)
+    launch.write_text(json.dumps({"mode": "resume", "run_id": "run", "selected_challenge_codes": ["a"]}))
+    with pytest.raises(ValueError, match="Resume cannot replace"):
+        online._read_launch_config(launch)
+    launch.write_text(json.dumps({"mode": "fresh", "run_id": "run", "unexpected": True}))
+    with pytest.raises(ValueError):
+        online._read_launch_config(launch)

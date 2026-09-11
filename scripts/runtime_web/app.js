@@ -1,11 +1,11 @@
 (() => {
   "use strict";
 
-  const TERMINAL = new Set(["completed", "failed", "stopped", "cancelled", "interrupted"]);
-  const ACTIVE = new Set(["pending", "queued", "starting", "running", "waiting", "working", "blocked", "stopping"]);
-  const ACTIVE_CHALLENGE_WORK = new Set(["active", "warning", "extended"]);
-  const CONVERSATION_EVENTS = new Set(["assistant_response", "tool_call", "tool_result", "agent_report"]);
-  const ROLE_NAMES = { chief: "首席 Agent", challenge: "挑战 Agent", execution: "执行 Agent" };
+  const TERMINAL = new Set(["completed", "failed", "stopped", "cancelled", "interrupted", "blocked"]);
+  const ACTIVE = new Set(["pending", "queued", "starting", "running", "waiting", "working", "stopping"]);
+  const ACTIVE_CHALLENGE_WORK = new Set(["active"]);
+  const CONVERSATION_EVENTS = new Set(["assistant_response", "tool_call", "tool_result", "worker_reported", "worker_updated"]);
+  const ROLE_NAMES = { chief: "Chief", solver: "Solver", worker: "Worker" };
   const STATUS_NAMES = {
     active: "活跃",
     pending: "待处理",
@@ -26,12 +26,10 @@
     success: "成功",
     verified: "已验证",
     warning: "警告",
-    extended: "已延长",
     paused: "已暂停",
     closed: "已关闭",
     unassigned: "未分配",
   };
-  const PHASE_NAMES = { early: "早期", mid: "中期", late: "后期" };
   const TOOL_LABELS = {
     system_shell: "执行命令",
     system_read_file: "读取文件",
@@ -49,29 +47,23 @@
     benchmark_get_hint: "获取提示",
     benchmark_submit_flag: "提交 Flag",
     benchmark_close_challenge: "关闭挑战",
-    chief_create_challenge_agent: "创建挑战 Agent",
-    chief_get_challenge_reports: "读取挑战报告",
-    chief_get_core_state: "读取核心状态",
-    chief_get_schedule: "读取任务排期",
-    chief_refresh_challenges: "刷新挑战目录",
-    chief_request_hint: "申请挑战提示",
-    chief_wait_for_state: "等待全局状态",
-    challenge_advance_cycle: "推进分析周期",
-    challenge_begin_cycle: "开始分析周期",
-    challenge_close_challenge: "关闭挑战",
-    challenge_commit_cycle: "提交分析周期",
-    challenge_create_execution_agent: "创建执行 Agent",
-    challenge_get_execution_reports: "读取执行报告",
-    challenge_get_state: "读取挑战状态",
-    challenge_get_updates: "读取协作更新",
-    challenge_report_status: "报告挑战状态",
-    challenge_start_cycle: "启动分析周期",
-    challenge_submit_analysis_plan: "提交分析计划",
-    challenge_submit_flag: "提交候选 Flag",
-    challenge_wait_for_state: "等待挑战状态",
-    execution_get_assignment: "读取执行任务",
-    execution_update_progress: "更新执行进度",
-    execution_report: "提交执行报告",
+    chief_observe: "观察整场状态",
+    chief_launch_challenges: "启动或恢复 Solver",
+    chief_wait: "等待全局状态",
+    chief_request_hint: "申请提示",
+    chief_pause_challenges: "暂停题目",
+    chief_close_challenges: "永久关闭题目",
+    solver_observe: "观察题目与报告",
+    solver_wait: "等待题目状态",
+    solver_delegate: "显式委派 Worker",
+    solver_cancel_worker: "取消 Worker",
+    solver_progress: "报告解题进展",
+    solver_submit_flag: "提交候选答案",
+    worker_update: "更新任务进展",
+    worker_report: "提交终态报告",
+    evidence_search: "检索同题证据",
+    evidence_read: "分页读取证据",
+    report_read: "分页读取报告",
     skill_invoke: "调用技能",
     skill_list: "列出技能",
     skill_read: "读取技能说明",
@@ -94,6 +86,11 @@
     events: [],
     afterSequence: 0,
     selectedAgent: null,
+    selectedTask: null,
+    taskDetail: null,
+    taskLoading: false,
+    taskLoadedAt: 0,
+    taskOffset: 0,
     expandedChallengeAgents: new Set(),
     selectedDetail: null,
     detailBefore: 0,
@@ -192,10 +189,6 @@
     return STATUS_NAMES[text.toLowerCase()] || text || "未知";
   }
 
-  function phaseLabel(value) {
-    const text = String(value || "");
-    return PHASE_NAMES[text.toLowerCase()] || text || "—";
-  }
 
   function dateValue(value) {
     const parsed = timestampDate(value);
@@ -272,8 +265,6 @@
   }
 
   function agentIconRole(agent) {
-    if (agent?.kind === "bootstrap") return "bootstrap";
-    if (agent?.kind === "exploration") return "exploration";
     return agent?.role || "chief";
   }
 
@@ -366,7 +357,7 @@
     const released = challenge?.slot_occupied === false || ["stopped", "closed"].includes(containerStatus);
     const agentStatus = String(agent?.status || "").toLowerCase();
     return Boolean(
-      agent?.role === "challenge"
+      agent?.role === "solver"
       && !released
       && !challenge?.is_completed
       && (
@@ -389,18 +380,18 @@
   function agentIconStatus(agent) {
     const status = iconStatus(agent?.status);
     if (challengeMachineActive(agent) && !TERMINAL.has(String(agent?.status || "").toLowerCase())) {
-      // A Challenge Agent can be waiting while its child Execution Agents work.
+      // A Solver can wait while its Workers run.
       // The icon represents the challenge machine, so use the persisted machine
       // state instead of turning the occupied machine gray.
       return "active";
     }
-    if (agent?.role === "challenge" && status === "muted") {
+    if (agent?.role === "solver" && status === "muted") {
       const challenge = challengeForAgent(agent);
       const containerStatus = String(challenge?.container_status || "").toLowerCase();
       const occupied = challenge?.slot_occupied !== false && !["stopped", "closed"].includes(containerStatus);
       if (occupied && !challenge?.is_completed) return "pending";
     }
-    if (agent?.role !== "execution" || status !== "error") return status;
+    if (agent?.role !== "worker" || status !== "error") return status;
     const containerStatus = String(challengeForAgent(agent)?.container_status || "").toLowerCase();
     return ["stopped", "closed", "terminated", "exited"].includes(containerStatus) ? "muted" : status;
   }
@@ -473,28 +464,28 @@
     return String(left.agent_id || "").localeCompare(String(right.agent_id || ""));
   }
 
-  function executionStatusRank(agent) {
+  function workerStatusRank(agent) {
     const status = String(agent?.status || "").toLowerCase();
     if (["running", "working", "active"].includes(status)) return 0;
     if (["queued", "pending", "starting"].includes(status)) return 1;
     return 2;
   }
 
-  function compareExecutionAgents(left, right) {
-    const statusDiff = executionStatusRank(left) - executionStatusRank(right);
+  function compareWorkers(left, right) {
+    const statusDiff = workerStatusRank(left) - workerStatusRank(right);
     if (statusDiff) return statusDiff;
     return compareAgentStart(left, right);
   }
 
-  function challengeStatusRank(agent) {
+  function solverStatusRank(agent) {
     const status = String(agent?.status || "").toLowerCase();
     if (["running", "working", "active", "waiting"].includes(status)) return 0;
     if (["queued", "pending", "starting"].includes(status)) return 1;
     return 2;
   }
 
-  function compareChallengeAgents(left, right) {
-    const statusDiff = challengeStatusRank(left) - challengeStatusRank(right);
+  function compareSolvers(left, right) {
+    const statusDiff = solverStatusRank(left) - solverStatusRank(right);
     if (statusDiff) return statusDiff;
     return compareAgentStart(left, right);
   }
@@ -503,11 +494,11 @@
     return agent?.started_at ? `启用 ${clock(agent.started_at)}` : "待启用";
   }
 
-  function executionAgentName(agent) {
-    if (!agent?.started_at) return "Exec Agent.—.—";
+  function workerName(agent) {
+    if (!agent?.started_at) return "Worker.—.—";
     const started = timestampDate(agent.started_at);
-    if (!started) return "Exec Agent.—.—";
-    return `Exec Agent.${String(started.getHours()).padStart(2, "0")}.${String(started.getMinutes()).padStart(2, "0")}`;
+    if (!started) return "Worker.—.—";
+    return `Worker.${String(started.getHours()).padStart(2, "0")}.${String(started.getMinutes()).padStart(2, "0")}`;
   }
 
   function basename(path) {
@@ -524,10 +515,10 @@
     return state.snapshot?.agents || [];
   }
 
-  function challengeAgents() {
+  function solverAgents() {
     return allAgents()
-      .filter((agent) => agent.role === "challenge")
-      .sort(compareChallengeAgents);
+      .filter((agent) => agent.role === "solver")
+      .sort(compareSolvers);
   }
 
   function chiefAgent() {
@@ -536,10 +527,10 @@
       .sort((left, right) => Number(isActive(right)) - Number(isActive(left)) || dateValue(right.updated_at) - dateValue(left.updated_at))[0] || null;
   }
 
-  function executionChildren(parentId) {
+  function workerChildren(parentId) {
     return allAgents()
-      .filter((agent) => agent.role === "execution" && agent.parent_id === parentId)
-      .sort(compareExecutionAgents);
+      .filter((agent) => agent.role === "worker" && agent.parent_id === parentId)
+      .sort(compareWorkers);
   }
 
   function selectedAgent() {
@@ -548,10 +539,13 @@
 
   function latestAgentActivity(agent) {
     if (!agent) return 0;
-    let latest = Math.max(dateValue(agent.updated_at), dateValue(agent.last_heartbeat_at), dateValue(agent.ended_at));
+    let latest = Math.max(
+      dateValue(agent.last_model_activity_at), dateValue(agent.last_tool_activity_at),
+      dateValue(agent.ended_at),
+    );
     for (let index = state.events.length - 1; index >= 0; index -= 1) {
       const event = state.events[index];
-      if (event.agent_id === agent.agent_id) {
+      if (event.agent_id === agent.agent_id && event.event_type !== "agent_heartbeat") {
         latest = Math.max(latest, dateValue(event.created_at));
         break;
       }
@@ -567,18 +561,15 @@
   }
 
   function agentRoleLabel(agent) {
-    if (agent?.kind === "bootstrap") return "Bootstrap";
-    if (agent?.kind === "exploration") return "探索";
+    if (agent?.role === "worker") return agent.mode === "review" ? "Worker · 复核" : "Worker · 执行";
     return ROLE_NAMES[agent?.role] || agent?.role || "Agent";
   }
 
   function displayName(agent) {
     if (!agent) return "未选择 Agent";
     if (agent.role === "chief") return "首席 Agent";
-    if (agent.role === "challenge") return agent.unique_code || "挑战 Agent";
-    if (agent.kind === "bootstrap") return "Bootstrap";
-    if (agent.kind === "exploration") return "探索";
-    return executionAgentName(agent);
+    if (agent.role === "solver") return agent.unique_code || "Solver";
+    return `${agent.mode === "review" ? "复核" : "执行"} · ${workerName(agent)}`;
   }
 
   function preserveSelection() {
@@ -588,15 +579,16 @@
       return;
     }
     if (state.selectedAgent && agents.some((agent) => agent.agent_id === state.selectedAgent)) return;
-    const challenge = challengeAgents()[0];
+    const challenge = solverAgents()[0];
     const fallback = challenge || chiefAgent() || agents[0];
     state.selectedAgent = fallback?.agent_id || null;
-    if (fallback?.role === "challenge") state.expandedChallengeAgents.add(fallback.agent_id);
+    if (fallback?.role === "solver") state.expandedChallengeAgents.add(fallback.agent_id);
     state.pendingScrollRestore = true;
   }
 
   function mergeSnapshot(data) {
     const initial = !state.snapshot;
+    const tasksChanged = JSON.stringify(state.snapshot?.background_tasks || []) !== JSON.stringify(data.background_tasks || []);
     const oldCursor = state.afterSequence;
     const incoming = Array.isArray(data.events) ? data.events : [];
     state.events = oldCursor === 0 ? incoming : mergeEvents(state.events, incoming).slice(-5000);
@@ -615,7 +607,7 @@
     }
     const update = {
       initial,
-      meaningful: initial || incoming.some((event) => event.event_type !== "agent_heartbeat"),
+      meaningful: initial || tasksChanged || incoming.some((event) => event.event_type !== "agent_heartbeat"),
     };
     if (update.initial || update.meaningful) {
       uiLog("debug", "snapshot_merged", {
@@ -630,15 +622,23 @@
 
   function saveSelectedScroll() {
     const stream = $("#conversation-stream");
-    if (!stream || !state.selectedAgent) return;
+    if (!stream || !state.selectedAgent || state.selectedTask) return;
     const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 30;
     state.scrollByAgent.set(state.selectedAgent, { top: stream.scrollTop, atBottom });
   }
 
   function switchAgent(agentId) {
+    const leavingTask = Boolean(state.selectedTask);
+    state.selectedTask = null;
+    state.taskDetail = null;
+    renderDetails();
     const agent = allAgents().find((item) => item.agent_id === agentId);
+    renderAgentTree();
     if (!agent || state.selectedAgent === agentId) {
-      if (agent) mobilePane("conversation");
+      if (agent) {
+        if (leavingTask) { state.pendingScrollRestore = true; renderConversationHeader(); renderConversation(); }
+        mobilePane("conversation");
+      }
       uiLog("debug", "agent_switch_ignored", {
         agentId,
         reason: !agent ? "agent_not_found" : "already_selected",
@@ -656,7 +656,7 @@
     state.pendingScrollRestore = true;
     state.unreadByAgent.delete(agentId);
     state.follow = state.scrollByAgent.get(agentId)?.atBottom ?? true;
-    if (agent.role === "execution" && agent.parent_id) state.expandedChallengeAgents.add(agent.parent_id);
+    if (agent.role === "worker" && agent.parent_id) state.expandedChallengeAgents.add(agent.parent_id);
     uiLog("info", "agent_selected", {
       agentId,
       role: agent.role,
@@ -740,7 +740,8 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const update = mergeSnapshot(await response.json());
       if (update.meaningful) renderAll();
-      else renderChrome();
+      else { renderChrome(); refreshTaskDetail(); }
+      refreshTaskDurations();
       refreshRuntimeDuration();
       if (state.selectedAgent && !state.selectedDetail) loadAgent(state.selectedAgent, { reset: true });
     } catch (error) {
@@ -773,7 +774,6 @@
     const latestResource = (state.snapshot.resources || []).at(-1) || {};
     setText("#run-id", `RUN ${short(run.run_id, 24)}`);
     setText("#run-status", statusLabel(run.status));
-    setText("#run-phase", phaseLabel(run.phase));
     setText("#event-sequence", run.last_sequence || state.snapshot.latest_sequence || 0);
     setText(
       "#resource-readout",
@@ -798,12 +798,13 @@
   function renderAgentTree() {
     const target = $("#agent-tree");
     const query = $("#agent-search").value.trim().toLowerCase();
-    const challenges = challengeAgents();
+    const challenges = solverAgents();
     const visibleGroups = [];
     for (const agent of challenges) {
-      const children = executionChildren(agent.agent_id);
+      const children = workerChildren(agent.agent_id);
       const matchingChildren = children.filter((child) => agentMatches(child, query));
-      if (query && !agentMatches(agent, query) && matchingChildren.length === 0) continue;
+      const matchingTasks = challengeTasks(agent).filter((task) => taskMatches(task, query));
+      if (query && !agentMatches(agent, query) && matchingChildren.length === 0 && !matchingTasks.length) continue;
       visibleGroups.push(challengeAgentGroup(agent, children, matchingChildren, Boolean(query)));
     }
     target.replaceChildren(...visibleGroups);
@@ -832,13 +833,13 @@
     const challenge = challengeForAgent(agent);
     row.setAttribute(
       "aria-label",
-      `${agent.unique_code || "挑战 Agent"}，${challengeMachineLabel(challenge)}，Agent ${statusLabel(agent.status)}，${children.length} 个执行 Agent`,
+      `${agent.unique_code || "Solver"}，${challengeMachineLabel(challenge)}，Agent ${statusLabel(agent.status)}，${children.length} 个 Worker，${challengeTasks(agent).length} 个执行任务`,
     );
     const caret = make("span", `tree-caret ${searching || expanded ? "open" : ""}`, "›");
     const robot = make("span", "robot-slot");
-    robot.append(makeAgentIcon("challenge", agentIconStatus(agent)));
+    robot.append(makeAgentIcon("solver", agentIconStatus(agent)));
     const copy = make("span", "agent-row-copy");
-    const name = make("strong", "", agent.unique_code || "挑战 Agent");
+    const name = make("strong", "", agent.unique_code || "Solver");
     name.dataset.tooltip = agent.agent_id;
     copy.append(
       name,
@@ -847,7 +848,7 @@
     const count = make("span", "agent-child-count", children.length);
     row.append(caret, robot, copy, count);
     row.addEventListener("click", () => {
-      const wasSelected = state.selectedAgent === agent.agent_id;
+      const wasSelected = state.selectedAgent === agent.agent_id && !state.selectedTask;
       const wasExpanded = state.expandedChallengeAgents.has(agent.agent_id);
       if (wasSelected) {
         const nextExpanded = !wasExpanded;
@@ -877,7 +878,13 @@
     list.setAttribute("role", "group");
     const shownChildren = searching && !agentMatches(agent, $("#agent-search").value.trim().toLowerCase()) ? matchingChildren : children;
     shownChildren.forEach((child) => list.append(executionAgentRow(child)));
-    if (!shownChildren.length && (expanded || searching)) list.append(make("p", "muted-line", "尚未创建执行 Agent"));
+    if (shownChildren.length) list.prepend(make("p", "muted-line", "Worker"));
+    const query = $("#agent-search").value.trim().toLowerCase();
+    const tasks = challengeTasks(agent).filter((task) => !searching || agentMatches(agent, query) || taskMatches(task, query));
+    if (tasks.length) list.append(make("p", "muted-line", "执行任务"));
+    tasks.forEach((task) => list.append(backgroundTaskRow(task)));
+    count.textContent = `${children.length} W · ${challengeTasks(agent).length} 任务`;
+    if (!shownChildren.length && !tasks.length && (expanded || searching)) list.append(make("p", "muted-line", "暂无 Worker 或执行任务"));
     group.append(list);
     return group;
   }
@@ -918,19 +925,30 @@
     if (!agent) return { label: "等待选择", tone: "muted", spinning: false };
     if (agent.status === "queued" || agent.status === "pending") return { label: "排队中", tone: "warn", spinning: true };
     if (agent.status === "starting") return { label: "启动中", tone: "warn", spinning: true };
+    if (["waiting", "paused"].includes(agent.status)) return { label: statusLabel(agent.status), tone: "muted", spinning: false };
     if (TERMINAL.has(agent.status)) return { label: statusLabel(agent.status), tone: stateTone(agent.status), spinning: false };
-    if (agent.kind === "bootstrap") return { label: "后台探索中", tone: "good", spinning: true };
     const latest = [...events].reverse().find((event) => event.event_type !== "agent_heartbeat");
     if (!latest) return { label: "思考中", tone: "good", spinning: true };
     if (latest.event_type === "tool_call") return { label: "调用工具", tone: "good", spinning: true };
     if (latest.event_type === "tool_result") return { label: "分析工具结果", tone: "good", spinning: true };
     if (latest.event_type === "assistant_response") return { label: latest.payload?.tool_names?.length ? "调用工具" : "生成结论", tone: "good", spinning: true };
     if (latest.event_type === "memory_updated" || latest.event_type === "context_compacted") return { label: "整理上下文", tone: "warn", spinning: true };
-    if (latest.event_type === "agent_report") return { label: "生成报告", tone: "good", spinning: true };
+    if (latest.event_type === "worker_reported") return { label: "生成报告", tone: "good", spinning: true };
     return { label: agent.status === "blocked" ? "等待处理" : "思考中", tone: agent.status === "blocked" ? "warn" : "good", spinning: true };
   }
 
   function renderConversationHeader() {
+    if (state.selectedTask) {
+      const task = (state.snapshot?.background_tasks || []).find((item) => item.key === state.selectedTask);
+      $("#selected-avatar").replaceChildren(make("span", "task-type-icon", "▤"));
+      setText("#selected-role", task ? `${task.kind} · 执行任务` : "执行任务");
+      setText("#selected-name", task?.name || "任务不可用");
+      setText("#selected-mission", task?.task_id || "");
+      $("#selected-mission").dataset.tooltip = task?.task_id || "";
+      $("#agent-live-state").className = `agent-live-state ${stateTone(task?.status)}`;
+      setText("#agent-live-label", statusLabel(task?.status));
+      return;
+    }
     const agent = selectedAgent();
     const events = selectedEvents();
     const thinking = thinkingStatus(agent, events);
@@ -1054,7 +1072,7 @@
         }
         return;
       }
-      if (event.event_type === "agent_report") {
+      if (["worker_reported", "worker_updated"].includes(event.event_type)) {
         flushToolGroup();
         timeline.push({ kind: "report", event, sequenceStart: sequence, sequenceEnd: sequence });
       }
@@ -1068,6 +1086,7 @@
   }
 
   function renderConversation() {
+    if (state.selectedTask) { renderTaskConversation(); return; }
     const stream = $("#conversation-stream");
     const previousTop = stream.scrollTop;
     const agent = selectedAgent();
@@ -2058,7 +2077,7 @@
     const turn = setTimelineRange(make("article", "report-turn timeline-node"), event.sequence, event.sequence);
     const card = make("div", "report-message");
     const report = reportForEvent(event);
-    const payload = report?.payload || state.selectedDetail?.agent?.final_report || {};
+    const payload = report?.payload || event.payload || {};
     const summary = payload.summary || payload.message || "Agent 已提交报告。";
     const header = make("div", "report-kicker");
     const meta = make("span", "report-kicker-meta");
@@ -2077,12 +2096,174 @@
   function renderNewMessagesButton() {
     const button = $("#new-messages-button");
     const unread = state.selectedAgent ? state.unreadByAgent.get(state.selectedAgent) || 0 : 0;
-    button.classList.toggle("hidden", state.follow || unread === 0);
+    button.classList.toggle("hidden", Boolean(state.selectedTask) || state.follow || unread === 0);
     button.textContent = unread ? `${unread} 条新消息 · 回到最新` : "回到最新";
+  }
+
+  function taskMatches(task, query) {
+    return !query || [task.name, task.task_id, task.kind, task.status, statusLabel(task.status)].some((value) => String(value || "").toLowerCase().includes(query));
+  }
+
+  function challengeTasks(agent) {
+    const active = (task) => ["queued", "running", "waiting"].includes(task.status) || ["queued", "running"].includes(task.analysis_status);
+    return (state.snapshot?.background_tasks || []).filter((task) => task.unique_code === agent.unique_code && active(task))
+      .sort((a, b) => Number(active(b)) - Number(active(a)) || String(b.started_at).localeCompare(String(a.started_at)));
+  }
+
+  function backgroundTaskRow(task) {
+    const row = make("button", `execution-agent-row background-task-row ${state.selectedTask === task.key ? "selected" : ""}`);
+    row.type = "button";
+    row.dataset.taskKey = task.key;
+    row.setAttribute("aria-label", `${task.name}，${task.kind}，${statusLabel(task.status)}`);
+    const copy = make("span", "agent-row-copy");
+    copy.append(make("strong", "", task.name), make("small", "", `${task.kind}${task.launch_mode === "background" ? " 后台" : ""} · ${statusLabel(task.status)} · ${taskDuration(task)}`));
+    row.append(make("span", "task-type-icon", "▤"), copy);
+    row.addEventListener("click", () => {
+      saveSelectedScroll();
+      state.selectedTask = task.key;
+      state.taskDetail = null;
+      state.taskOffset = 0;
+      state.taskLoadedAt = 0;
+      renderAgentTree();
+      renderConversationHeader();
+      renderConversation();
+      $("#conversation-stream").scrollTop = 0;
+      renderDetails();
+      mobilePane("conversation");
+    });
+    return row;
+  }
+
+  function taskDuration(task) {
+    const end = task.finished_at || state.snapshot?.monitor?.frozen_at || state.snapshot?.monitor?.captured_at;
+    const start = Date.parse(String(task.started_at || "").replace(" ", "T") + (/Z|[+]\d\d:\d\d$/.test(task.started_at || "") ? "" : "Z"));
+    const finish = end ? Date.parse(String(end).replace(" ", "T") + (/Z|[+]\d\d:\d\d$/.test(end) ? "" : "Z")) : Date.now();
+    return Number.isFinite(start) && Number.isFinite(finish) ? `${Math.max(0, Math.round((finish - start) / 1000))}s` : "—";
+  }
+
+  function refreshTaskDurations() {
+    const tasks = new Map((state.snapshot?.background_tasks || []).map((task) => [task.key, task]));
+    document.querySelectorAll("[data-task-key]").forEach((row) => {
+      const task = tasks.get(row.dataset.taskKey);
+      const label = row.querySelector("small");
+      if (task && label) label.textContent = `${task.kind}${task.launch_mode === "background" ? " 后台" : ""} · ${statusLabel(task.status)} · ${taskDuration(task)}`;
+    });
+    const selected = tasks.get(state.selectedTask);
+    const elapsed = document.querySelector("[data-task-elapsed]");
+    if (selected && elapsed) elapsed.textContent = taskDuration(selected);
+  }
+
+  function refreshTaskDetail() {
+    if (!state.selectedTask || state.taskLoading || Date.now() - state.taskLoadedAt <= 2000) return;
+    const task = (state.snapshot?.background_tasks || []).find((item) => item.key === state.selectedTask);
+    if (task) loadTaskDetail(task, state.taskOffset);
+  }
+
+  async function loadTaskDetail(task, offset) {
+    if (state.taskLoading) return;
+    state.taskLoading = true;
+    const key = task.key;
+    const previous = JSON.stringify(state.taskDetail);
+    const scrollTop = $("#details-content").scrollTop;
+    const samePage = offset === state.taskOffset;
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(task.kind)}/${encodeURIComponent(task.task_id)}?offset=${offset}&limit=10000`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const detail = await response.json();
+      if (state.selectedTask === key) {
+        state.taskDetail = detail;
+        state.taskOffset = offset;
+      }
+    } catch (error) {
+      if (state.selectedTask === key) state.taskDetail = {error: String(error)};
+    } finally {
+      state.taskLoading = false;
+      state.taskLoadedAt = state.selectedTask === key ? Date.now() : 0;
+      if (previous !== JSON.stringify(state.taskDetail) || state.selectedTask !== key) {
+        renderConversationHeader();
+        renderConversation();
+        renderDetails();
+        if (state.selectedTask === key) $("#details-content").scrollTop = samePage ? scrollTop : 0;
+      }
+    }
+  }
+
+  function renderTaskDetails(target) {
+    const task = (state.snapshot?.background_tasks || []).find((item) => item.key === state.selectedTask);
+    if (!task) { target.replaceChildren(make("p", "empty-state", "任务不可用")); return; }
+    setText("#details-title", task.name);
+    setText("#details-status", statusLabel(task.status));
+    $("#details-status").className = `status-pill ${stateTone(task.status)}`;
+    target.replaceChildren(detailGrid([["类型", task.kind], ["启动方式", task.launch_mode === "background" ? "主动后台" : "工具执行"], ["所属 Agent", task.agent_id], ["执行状态", statusLabel(task.status)],
+      ["分析状态", task.analysis_status || "—"], ["耗时", taskDuration(task)], ["退出码", task.exit_code == null ? "—" : String(task.exit_code)],
+      ["开始", task.started_at], ["结束", task.finished_at], ["错误", task.error_code || "—"], ["终止原因", task.termination_reason || "—"]]));
+    target.querySelectorAll(".detail-stat").forEach((stat) => {
+      if (stat.querySelector("small")?.textContent === "耗时") stat.querySelector("b").dataset.taskElapsed = "";
+    });
+    if (task.kind === "shell") {
+      const limits = task.resource_limits || {};
+      target.append(detailBlock("资源预算", limits.enforced === false
+        ? {protection: "开发环境：未提供 Linux 硬限制", ...limits}
+        : Object.keys(limits).length ? limits : {protection: "此任务未记录资源预算"}));
+      if (task.resource_usage?.memory_peak_bytes != null) target.append(detailBlock("资源使用", task.resource_usage));
+    }
+    target.append(make("p", "muted-line", "执行完成不代表挑战已解出"));
+    if (state.taskDetail?.cwd != null) target.append(detailBlock("工作目录", state.taskDetail.cwd));
+    if (task.total_count != null) target.append(detailBlock("执行进度", `${task.completed_count ?? 0} / ${task.total_count}`));
+    if (state.taskDetail?.events) target.append(detailBlock("最近任务事件", state.taskDetail.events));
+  }
+
+  function renderTaskConversation() {
+    const stream = $("#conversation-stream");
+    const previousTop = stream.scrollTop;
+    const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 30;
+    const hadOutput = Boolean(stream.querySelector("[data-task-output]"));
+    const task = (state.snapshot?.background_tasks || []).find((item) => item.key === state.selectedTask);
+    const target = make("div", "conversation-column task-execution-content");
+    $("#conversation-empty").classList.add("hidden");
+    $("#history-button").classList.add("hidden");
+    $("#new-messages-button").classList.add("hidden");
+    if (!task) target.append(make("p", "empty-state", "任务不可用"));
+    const detail = state.taskDetail;
+    if (detail?.error) target.append(make("p", "empty-state", `读取失败：${detail.error}`));
+    else if (detail && task) {
+      const invocation = detail.invocation;
+      if (invocation) {
+        const args = invocation.arguments || {};
+        target.append(detailBlock("执行工具", invocation.tool));
+        target.append(detailBlock("执行命令／参数", args.command || args));
+      } else target.append(make("p", "muted-line", "当前记录未包含原始调用命令"));
+      target.append(make("h3", "", "执行回显"));
+      if (task.status === "running") target.append(make("p", "muted-line", "任务运行中，输出自动刷新；脚本未打印时无法推断其内部进度"));
+      if (!detail.output_available) target.append(make("p", "empty-state", "输出不可用：已清理或当前日志包未包含输出文件"));
+      else {
+        if (task.truncated) target.append(make("p", "muted-line", "输出已截断，仅显示保留内容"));
+        const output = make("pre", "detail-pre", detail.output || "暂无输出");
+        output.dataset.taskOutput = "";
+        target.append(output);
+        const controls = make("div", "task-page-controls");
+        if (state.taskOffset > 0) {
+          const previous = make("button", "", "上一页");
+          previous.addEventListener("click", () => loadTaskDetail(task, Math.max(0, state.taskOffset - 10000)));
+          controls.append(previous);
+        }
+        if (detail.next_offset != null) {
+          const next = make("button", "", "下一页");
+          next.addEventListener("click", () => loadTaskDetail(task, detail.next_offset));
+          controls.append(next);
+        }
+        target.append(controls);
+      }
+    } else if (task) target.append(make("p", "empty-state", "正在读取任务…"));
+    stream.replaceChildren(target);
+    stream.scrollTop = hadOutput && atBottom ? stream.scrollHeight : previousTop;
+    if (task && !state.taskLoading && Date.now() - state.taskLoadedAt > 2000) loadTaskDetail(task, state.taskOffset);
   }
 
   function renderDetails() {
     const target = $("#details-content");
+    document.querySelector('[aria-label="Agent 详情分类"]').classList.toggle("hidden", Boolean(state.selectedTask));
+    if (state.selectedTask) { renderTaskDetails(target); return; }
     const agent = selectedAgent();
     const detailAgent = state.selectedDetail?.agent || agent;
     if (!detailAgent && state.detailTab !== "runtime") {
@@ -2135,6 +2316,23 @@
     return block;
   }
 
+  function tokenUsageCard(title, usage) {
+    const section = make("section", "detail-block token-usage");
+    section.append(make("p", "detail-label", title));
+    const format = (value) => Number.isFinite(value) ? value.toLocaleString("zh-CN") : "未知";
+    section.append(detailGrid([
+      ["输入 token", format(usage?.input_tokens)],
+      ["缓存命中", format(usage?.cache_hit_tokens)],
+      ["未缓存输入", format(usage?.uncached_input_tokens)],
+      ["输出 token", format(usage?.output_tokens)],
+    ]));
+    section.append(make("small", "muted-line", `${format(usage?.calls)} 次模型调用 · 含重试和辅助调用`));
+    if (usage?.calls_with_missing_usage > 0) {
+      section.append(make("small", "muted-line", `${format(usage.calls_with_missing_usage)} 次调用计量不完整；完整消耗未知。已知输入 ${format(usage.known_totals?.input_tokens)}，已知输出 ${format(usage.known_totals?.output_tokens)}。`));
+    }
+    return section;
+  }
+
   function renderOverview(target, agent) {
     const challenge = (state.snapshot.challenges || []).find((item) => item.unique_code === agent.unique_code);
     const identity = make("div", "identity-card");
@@ -2156,14 +2354,25 @@
       ["状态", statusLabel(agent.status)],
       ["Challenge", agent.unique_code || "全局"],
       ["父 Agent", agent.parent_id ? short(agent.parent_id, 19) : "根 Agent", agent.parent_id || ""],
-      ["Cycle", agent.cycle_id ? short(agent.cycle_id, 19) : "—", agent.cycle_id || ""],
       ["最近心跳", agent.last_heartbeat_at ? elapsed(agent.last_heartbeat_at) : "无"],
+      ["最近模型活动", agent.last_model_activity_at ? elapsed(agent.last_model_activity_at) : "无"],
+      ["最近工具活动", agent.last_tool_activity_at ? elapsed(agent.last_tool_activity_at) : "无"],
       ["创建时间", clock(agent.created_at)],
     ];
-    if (agent.role === "chief" || agent.role === "challenge") {
+    if (agent.role === "chief" || agent.role === "solver") {
       overviewStats.splice(1, 0, ["已运行时长", runtimeDuration(agent, challenge)]);
     }
     target.append(detailGrid(overviewStats));
+    if (agent.status === "waiting") {
+      const sources = (agent.waiting_sources || []).map((source) =>
+        `${source.kind}:${source.id}（${statusLabel(source.status)}）${source.analysis_status ? ` / 分析 ${statusLabel(source.analysis_status)}` : ""}`,
+      );
+      target.append(detailBlock("等待来源", sources.length ? sources : "无可唤醒来源"));
+    }
+    const usage = state.snapshot.token_usage;
+    target.append(tokenUsageCard("当前 Agent", usage?.agents?.[agent.agent_id]));
+    if (agent.unique_code) target.append(tokenUsageCard("当前题目合计", usage?.challenges?.[agent.unique_code]));
+    if (agent.role === "chief") target.append(tokenUsageCard("整场合计", usage?.run));
     if (agent.mission) target.append(detailBlock("任务", agent.mission));
     if (challenge) {
       target.append(detailGrid([
@@ -2171,7 +2380,7 @@
         ["远端状态", challenge.container_status || "未知"],
         ["工作状态", statusLabel(challenge.work_status)],
         ["槽位", challenge.slot_occupied === true ? "已占用" : "已释放"],
-        ["Hint", challenge.hint_requested ? "已申请提示" : challenge.hint_signal?.eligible ? "可申请提示" : "暂不可申请"],
+        ["Hint", challenge.hint_requested ? "已申请提示" : "可由 Chief 申请"],
       ]));
       const addressBlock = make("section", "detail-block");
       addressBlock.append(make("p", "detail-label", "目标地址"));
@@ -2231,13 +2440,8 @@
       ["报告", String((snapshot.reports || []).length)],
       ["已验证发现", String(verifiedFindings)],
     ]));
+    target.append(tokenUsageCard("整场 token", snapshot.token_usage?.run));
     target.append(resourceMeters(snapshot.resources || []));
-    target.append(runtimeListCard("周期", snapshot.cycles || [], (item) => ({
-      title: `${item.unique_code || "全局"} · Cycle ${item.cycle_number}`,
-      meta: item.cycle_id,
-      state: statusLabel(item.status),
-      tone: stateTone(item.status),
-    })));
     target.append(runtimeListCard("发现", snapshot.findings || [], (item) => ({
       title: item.summary || item.category,
       meta: `${item.unique_code || "全局"} · ${item.category}`,
@@ -2251,7 +2455,7 @@
       tone: stateTone(item.status),
     })));
     target.append(runtimeListCard("准入", snapshot.admissions || [], (item) => ({
-      title: `${item.kind === "bootstrap" ? "Bootstrap" : item.kind === "exploration" ? "探索" : ROLE_NAMES[item.role] || item.role} · P${item.priority ?? "—"}`,
+      title: `${agentRoleLabel(agents.find((agent) => agent.agent_id === item.agent_id) || item)} · P${item.priority ?? "—"}`,
       meta: short(item.agent_id, 30),
       state: statusLabel(item.status),
       tone: stateTone(item.status),
@@ -2456,6 +2660,7 @@
     if (state.selectedAgent && state.detailHasMore) loadAgent(state.selectedAgent, { older: true });
   });
   $("#conversation-stream").addEventListener("scroll", () => {
+    if (state.selectedTask) return;
     const stream = $("#conversation-stream");
     const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight <= 30;
     state.follow = atBottom;

@@ -488,30 +488,23 @@ body.is-resizing * {
   transition: color .16s ease, filter .16s ease;
 }
 
-.agent-icon-challenge {
+.agent-icon-solver {
   -webkit-mask-image: url("/assets/Challenge.svg");
   mask-image: url("/assets/Challenge.svg");
 }
 
-.agent-icon-execution {
+.agent-icon-worker {
   -webkit-mask-image: url("/assets/Execution.svg");
   mask-image: url("/assets/Execution.svg");
 }
+
 
 .agent-icon-chief {
   -webkit-mask-image: url("/assets/Chief.svg");
   mask-image: url("/assets/Chief.svg");
 }
 
-.agent-icon-bootstrap {
-  -webkit-mask-image: url("/assets/gongji.svg");
-  mask-image: url("/assets/gongji.svg");
-}
 
-.agent-icon-exploration {
-  -webkit-mask-image: url("/assets/yewutansuo.svg");
-  mask-image: url("/assets/yewutansuo.svg");
-}
 
 .agent-icon.status-active {
   color: var(--green);
@@ -2141,3 +2134,16 @@ body.is-resizing * {
     transition-duration: .01ms !important;
   }
 }
+
+.token-usage { border-top: 1px solid var(--border, #e5e7eb); padding-top: 14px; }
+.token-usage .detail-grid { font-variant-numeric: tabular-nums; }
+
+/* Resource tasks share challenge navigation without masquerading as Agents. */
+.background-task-row { width: 100%; text-align: left; }
+.background-task-row .agent-row-copy { min-width: 0; }
+.background-task-row strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.background-task-row small { display: block; font-size: 11px; opacity: .7; }
+.task-type-icon { padding: 8px; }
+.task-page-controls { display: flex; gap: 8px; padding: 8px 0; }
+.task-page-controls button { cursor: pointer; padding: 6px 12px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--panel-raised); color: var(--ink-soft); font: inherit; }
+.task-page-controls button:hover { background: var(--panel-hover); }

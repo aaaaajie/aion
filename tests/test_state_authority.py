@@ -1,777 +1,410 @@
-from __future__ import annotations
+"""SQLite authority for explicit work, scopes, immutable outcomes and delivery."""
 
-from pathlib import Path
-
+import asyncio
+import sqlite3
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import select, func
+from agent.state import (
+    CapabilityContext,
+    WorkerTaskInput,
+    WorkerUpdateInput,
+    AgentReportInput,
+)
+from agent.state.database import StateDatabase, SCHEMA_VERSION
+from agent.state.errors import StateConflict, StatePermission
+from agent.state.models import ReportRecord, AgentRecord, FindingRecord
+from tests.solver_state import build_state, worker
 
-from agent.state import CapabilityContext, ChallengeDispatchInput
-from agent.state.database import SCHEMA_VERSION, StateDatabase
-from agent.state.errors import StatePermission
-from agent.state.models import AgentRecord, CycleRecord
-from agent.state.schemas import AgentReportInput, ChallengeImport
-from agent.state.service import StateService
-from agent.subagents.models import ExecutionReport
+
+@pytest.mark.asyncio
+async def test_schema18_rejects_old_database_without_modifying_it(tmp_path):
+    assert SCHEMA_VERSION == 19
+    path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version=18")
+        db.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
+        db.execute("INSERT INTO schema_meta VALUES ('schema_version', '18')")
+        db.execute("CREATE TABLE historical (value TEXT)")
+        db.execute("INSERT INTO historical VALUES ('preserved')")
+    state = StateDatabase(path)
+    with pytest.raises(Exception, match="(?i)(version|schema)"):
+        await state.initialize()
+    await state.close()
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert db.execute("SELECT value FROM historical").fetchone()[0] == "preserved"
+        assert (
+            db.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            == "18"
+        )
 
 
-async def build_state(tmp_path: Path) -> tuple[StateService, CapabilityContext, CapabilityContext]:
-    service = StateService(
-        StateDatabase(tmp_path / "state.sqlite3"),
-        run_root=tmp_path / "runs",
-        workspace_root=tmp_path / "workspace",
-    )
-    await service.initialize()
-    await service.create_run(
-        "run",
-        challenges=[
-            ChallengeImport(
-                unique_code="challenge-a",
-                description="test target",
-                container_status="running",
-                container_addr=["http://127.0.0.1:8000"],
+@pytest.mark.asyncio
+async def test_solver_identity_survives_inactive_status_and_task_key_is_explicit(
+    tmp_path,
+):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        for status in ("paused", "failed", "stopped", "running"):
+            await s.transition_agent("run", "solver", status)
+            result = await s.register_solver_for_challenge(
+                "run",
+                solver_agent_id="other",
+                parent_id="chief",
+                unique_code="a",
+                solver_prompt="resume",
             )
-        ],
-    )
-    await service.register_agent("run", agent_id="chief", role="chief", initial_prompt="chief")
-    await service.register_agent(
-        "run",
-        agent_id="challenge",
-        role="challenge",
-        parent_id="chief",
-        unique_code="challenge-a",
-        initial_prompt="challenge",
-    )
-    chief = CapabilityContext(run_id="run", agent_id="chief", role="chief")
-    challenge = CapabilityContext(
-        run_id="run",
-        agent_id="challenge",
-        role="challenge",
-        unique_code="challenge-a",
-    )
-    await service.start_challenge("run", "challenge-a", chief)
-    return service, chief, challenge
+            assert result["agent_id"] == "solver" and result["idempotent"]
+        task = WorkerTaskInput(task_key="one", objective="read dependency then verify")
+        results = await asyncio.gather(
+            *(s.delegate_workers("run", solver, [task]) for _ in range(5))
+        )
+        ids = {r["admissions"][0]["agent_id"] for r in results}
+        assert len(ids) == 1
+        with pytest.raises(StateConflict):
+            await s.delegate_workers(
+                "run", solver, [task.model_copy(update={"objective": "different"})]
+            )
+        with pytest.raises(StatePermission):
+            w = CapabilityContext(
+                run_id="run", role="worker", agent_id=ids.pop(), unique_code="a"
+            )
+            await s.delegate_workers("run", w, [task])
+    finally:
+        await s.close()
 
 
 @pytest.mark.asyncio
-async def test_schema_15_and_dispatch_is_append_only_and_idempotent(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    assert SCHEMA_VERSION == 15
+async def test_report_dedup_terminal_cancel_and_late_audit(tmp_path):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        w = await worker(s, solver)
+        update = WorkerUpdateInput(summary="step one", tested=["one"], untested=["two"])
+        first = await s.report_worker(
+            "run", w.agent_id, w, update, terminal=False, call_id="update-1"
+        )
+        second = await s.report_worker(
+            "run", w.agent_id, w, update, terminal=False, call_id="retry"
+        )
+        assert second["idempotent"] and first["report_id"] == second["report_id"]
+        with pytest.raises(StateConflict):
+            await s.report_worker(
+                "run",
+                w.agent_id,
+                w,
+                WorkerUpdateInput(summary="changed"),
+                terminal=False,
+                call_id="update-1",
+            )
+        results = await asyncio.gather(
+            s.finalize_worker(
+                "run",
+                w.agent_id,
+                w,
+                AgentReportInput(summary="cancel", status="cancelled"),
+            ),
+            s.finalize_worker(
+                "run",
+                w.agent_id,
+                w,
+                AgentReportInput(summary="done", status="completed"),
+            ),
+        )
+        assert len({r["report_id"] for r in results}) == 1
+        assert any(
+            e["event_type"] == "worker_late_result"
+            for e in await s.list_agent_events("run", w.agent_id)
+        )
+        overview = await s.get_overview("run")
+        assert len(overview["agents"]) == 3
+        assert (
+            next(a for a in overview["agents"] if a["agent_id"] == "solver")["status"]
+            == "pending"
+        )
+    finally:
+        await s.close()
 
-    first = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput.model_validate(
-            {
-                "summary": "baseline",
-                "tasks": [
-                    {
-                        "objective": "collect the HTTP baseline",
-                        "task_key": "baseline",
-                        "hypothesis_key": "http-baseline",
-                    }
+
+@pytest.mark.asyncio
+async def test_delivery_replays_until_matching_persisted_response_and_wait_cannot_lose_report(
+    tmp_path,
+):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        w = await worker(s, solver)
+        wait = await s.record_controller_wait("run", "solver", "pending")
+        assert wait["status"] == "waiting"
+        await s.report_worker(
+            "run",
+            w.agent_id,
+            w,
+            WorkerUpdateInput(summary="new evidence"),
+            terminal=False,
+        )
+        # Writer wins between wait registration and actually suspending.
+        sequence = await s.notifier.wait(
+            s.agent_signal_key("run", "solver"), wait["sequence"], 0.1
+        )
+        assert sequence > wait["sequence"]
+        batch = await s.consume_reports("run", solver)
+        assert (await s.consume_reports("run", solver))["delivery_id"] == batch[
+            "delivery_id"
+        ]
+        with pytest.raises(StateConflict):
+            await s.acknowledge_report_delivery(
+                "run", "solver", batch["delivery_id"], 1
+            )
+        assert (await s.record_controller_wait("run", "solver", "try again"))[
+            "status"
+        ] == "ready"
+        response = await s.append_agent_event(
+            "run",
+            "solver",
+            "assistant_response",
+            {"delivery_ids": [batch["delivery_id"]]},
+        )
+        await s.acknowledge_report_delivery(
+            "run", "solver", batch["delivery_id"], response
+        )
+        assert not (await s.consume_reports("run", solver))["reports"]
+        assert (await s.record_controller_wait("run", "solver", "wait"))[
+            "status"
+        ] == "waiting"
+    finally:
+        await s.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_interrupts_workers_once_preserves_memory_and_unacknowledged_delivery(
+    tmp_path,
+):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        w = await worker(s, solver)
+        await s.update_agent_memory(
+            "run", "solver", "stable memory", summarized_through_sequence=0
+        )
+        await s.report_worker(
+            "run",
+            w.agent_id,
+            w,
+            WorkerUpdateInput(summary="before crash"),
+            terminal=False,
+        )
+        delivery = await s.consume_reports("run", solver)
+        assert await s.interrupt_workers("run") == 1
+        assert await s.interrupt_workers("run") == 0
+        assert (await s.consume_reports("run", solver))["delivery_id"] == delivery[
+            "delivery_id"
+        ]
+        assert (await s.get_agent_runtime("run", "solver"))["agent"][
+            "session_memory"
+        ] == "stable memory"
+        assert (await s.get_agent_runtime("run", w.agent_id))["agent"][
+            "status"
+        ] == "interrupted"
+        retry = (
+            await s.delegate_workers(
+                "run", solver, [WorkerTaskInput(task_key="task", objective="task")]
+            )
+        )["admissions"][0]
+        assert retry["agent_id"] == w.agent_id and retry["status"] == "interrupted"
+        assert (await worker(s, solver, "explicit-retry")).agent_id != w.agent_id
+    finally:
+        await s.close()
+
+
+@pytest.mark.asyncio
+async def test_same_challenge_evidence_pages_cross_scope_denied_and_review_cannot_write(
+    tmp_path,
+):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        w = await worker(s, solver)
+        review = await worker(s, solver, "review", mode="review")
+        evidence = await s.persist_evidence(
+            "run", w, evidence_type="fixture", source="test", content="0123456789"
+        )
+        for context in (solver, w, review):
+            page = await s.read_evidence(
+                "run", context, evidence["evidence_ref"], offset=3, limit_chars=4
+            )
+            assert page["content"] == "3456"
+        await s.register_agent(
+            "run", role="solver", agent_id="other", parent_id="chief", unique_code="b"
+        )
+        other = CapabilityContext(
+            run_id="run", role="solver", agent_id="other", unique_code="b"
+        )
+        for run, context in [("run", other), ("wrong-run", solver)]:
+            with pytest.raises(StatePermission):
+                await s.read_evidence(run, context, evidence["evidence_ref"])
+        with pytest.raises(StatePermission):
+            await s.persist_evidence(
+                "run",
+                review,
+                evidence_type="fixture",
+                source="test",
+                content="forbidden",
+            )
+        with pytest.raises(StatePermission):
+            await s.finalize_worker(
+                "run",
+                review.agent_id,
+                review,
+                AgentReportInput(
+                    status="completed",
+                    summary="review",
+                    findings=[{"summary": "forbidden"}],
+                ),
+            )
+        result = await s.finalize_worker(
+            "run",
+            review.agent_id,
+            review,
+            AgentReportInput(
+                status="completed",
+                summary="read-only review",
+                evidence_refs=[evidence["evidence_ref"]],
+            ),
+        )
+        assert result["status"] == "completed"
+        with pytest.raises(StatePermission):
+            await s.delegate_workers(
+                "run",
+                solver,
+                [
+                    WorkerTaskInput(
+                        task_key="cross",
+                        objective="cross",
+                        context_refs=["evidence:missing"],
+                    )
                 ],
-            }
-        ),
-    )
-    assert first["decision_number"] == 1
-    assert len(first["admissions"]) == 1
+            )
+    finally:
+        await s.close()
 
-    repeated = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput.model_validate(
-            {
-                "summary": "same task is already useful",
-                "tasks": [
+
+@pytest.mark.asyncio
+async def test_worker_findings_share_evidence_without_stage_or_secondary_grant(
+    tmp_path,
+):
+    s, c, solver = await build_state(tmp_path)
+    try:
+        a = await worker(s, solver, "one")
+        b = await worker(s, solver, "two")
+        evidence = await s.persist_evidence(
+            "run",
+            a,
+            evidence_type="fixture",
+            source="read",
+            content="reproducible observation",
+        )
+        first = await s.finalize_worker(
+            "run",
+            a.agent_id,
+            a,
+            AgentReportInput(
+                status="completed",
+                summary="found",
+                findings=[
                     {
-                        "objective": "collect the HTTP baseline",
-                        "task_key": "baseline",
-                    }
-                ],
-            }
-        ),
-    )
-    assert repeated["admissions"] == []
-    assert repeated["idempotent_tasks"][0]["agent_id"] == first["admissions"][0]["agent_id"]
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_repeated_empty_dispatch_is_a_no_action(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    first = await service.dispatch_challenge(
-        "run", "challenge-a", challenge, ChallengeDispatchInput.model_validate({})
-    )
-    second = await service.dispatch_challenge(
-        "run", "challenge-a", challenge, ChallengeDispatchInput.model_validate({})
-    )
-    assert first["no_action"] is True
-    assert second["no_action"] is True
-    async with service.db.sessions() as session:
-        cycles = await session.scalar(select(func.count()).select_from(CycleRecord))
-    assert cycles == 0
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_expensive_tool_fingerprint_is_challenge_scoped_and_retryable(
-    tmp_path: Path,
-) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    first = await service.register_agent(
-        "run",
-        agent_id="execution-one",
-        role="execution",
-        parent_id="challenge",
-        unique_code="challenge-a",
-        mission="first route",
-    )
-    second = await service.register_agent(
-        "run",
-        agent_id="execution-two",
-        role="execution",
-        parent_id="challenge",
-        unique_code="challenge-a",
-        mission="second route",
-    )
-    digest = "a" * 64
-    claimed = await service.claim_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        first["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=digest,
-    )
-    assert claimed == {"claimed": True, "duplicate": False}
-    duplicate = await service.claim_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        second["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=digest,
-    )
-    assert duplicate["duplicate"] is True
-    assert duplicate["reason"] == "already_running"
-
-    await service.complete_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        first["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=digest,
-        success=True,
-    )
-    succeeded = await service.claim_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        second["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=digest,
-    )
-    assert succeeded["duplicate"] is True
-    assert succeeded["reason"] == "already_succeeded"
-
-    retry_digest = "b" * 64
-    await service.claim_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        first["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=retry_digest,
-    )
-    await service.complete_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        first["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=retry_digest,
-        success=False,
-    )
-    retry = await service.claim_challenge_tool_fingerprint(
-        "run",
-        "challenge-a",
-        second["agent_id"],
-        tool_name="pentest_sqlmap",
-        digest=retry_digest,
-    )
-    assert retry == {"claimed": True, "duplicate": False}
-
-    async with service.db.sessions() as session:
-        controller = await session.get(AgentRecord, "challenge")
-        assert controller is not None
-        attempts = controller.report_cursors.get("expensive_tool_attempts", {})
-        assert set(attempts) == {f"pentest_sqlmap:{digest}", f"pentest_sqlmap:{retry_digest}"}
-        assert all("url" not in str(item) for item in attempts.values())
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_dispatch_derives_stable_keys_when_model_omits_them(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    payload = ChallengeDispatchInput.model_validate(
-        {"summary": "stable decision", "tasks": [{"objective": "collect baseline"}]}
-    )
-    first = await service.dispatch_challenge("run", "challenge-a", challenge, payload)
-    second = await service.dispatch_challenge("run", "challenge-a", challenge, payload)
-
-    assert len(first["admissions"]) == 1
-    assert second["admissions"] == []
-    assert second["idempotent_tasks"][0]["task_key"].startswith("task:")
-    overview = await service.get_overview("run")
-    execution_agents = [item for item in overview["agents"] if item["role"] == "execution"]
-    assert len(execution_agents) == 1
-    assert execution_agents[0]["hypothesis_key"].startswith("hypothesis:")
-    assert execution_agents[0]["branch_key"].endswith(":discovery")
-    await service.close()
-
-
-def test_controller_report_projection_is_reference_oriented_and_bounded() -> None:
-    projected = StateService._controller_report_projection(
-        {
-            "report_id": "report-1",
-            "report_ref": "report:report-1",
-            "sequence": 4,
-            "agent_id": "execution-1",
-            "status": "completed",
-            "payload": {
-                "summary": "s" * 5_000,
-                "evidence_refs": [f"evidence:evidence_{index:032d}" for index in range(20)],
-                "findings": [
-                    {
-                        "finding_ref": "finding:finding_" + "a" * 32,
                         "category": "vulnerability",
-                        "summary": "f" * 5_000,
-                        "detail": {"must_not_be_injected": "x" * 5_000},
-                        "confidence": 0.9,
-                        "verification_status": "verified",
-                        "evidence_refs": [f"evidence:evidence_{index:032d}" for index in range(20)],
-                    }
-                ],
-            },
-        }
-    )
-
-    assert len(projected["payload"]["summary"]) == 1_000
-    assert len(projected["payload"]["evidence_refs"]) == 10
-    finding = projected["payload"]["findings"][0]
-    assert len(finding["summary"]) == 1_000
-    assert len(finding["evidence_refs"]) == 10
-    assert "detail" not in finding
-
-
-@pytest.mark.asyncio
-async def test_late_report_keeps_original_cycle_and_is_consumed_once(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    first = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput.model_validate(
-            {"summary": "first", "tasks": [{"objective": "slow task"}]}
-        ),
-    )
-    execution_id = first["admissions"][0]["agent_id"]
-    overview = await service.get_overview("run")
-    original_cycle_id = next(
-        item["cycle_id"]
-        for item in overview["agents"]
-        if item["agent_id"] == execution_id
-    )
-    await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="independent follow-up", tasks=[]),
-    )
-    execution = CapabilityContext(
-        run_id="run",
-        agent_id=execution_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    await service.submit_report(
-        "run",
-        execution_id,
-        execution,
-        AgentReportInput(status="completed", summary="slow result arrived"),
-    )
-    observed = await service.observe_challenge(
-        "run", "challenge-a", challenge, max_reports=20
-    )
-    assert observed["report_count"] == 1
-    assert "cycle_id" not in observed["reports"][0]
-    overview = await service.get_overview("run")
-    assert next(
-        item["cycle_id"]
-        for item in overview["agents"]
-        if item["agent_id"] == execution_id
-    ) == original_cycle_id
-    again = await service.observe_challenge(
-        "run", "challenge-a", challenge, max_reports=20
-    )
-    assert again["report_count"] == 0
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_controller_snapshot_replays_after_model_failure_until_dispatch(
-    tmp_path: Path,
-) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    dispatched = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="first", tasks=[{"objective": "quick task"}]),
-    )
-    execution_id = dispatched["admissions"][0]["agent_id"]
-    await service.submit_report(
-        "run",
-        execution_id,
-        CapabilityContext(
-            run_id="run",
-            agent_id=execution_id,
-            role="execution",
-            unique_code="challenge-a",
-        ),
-        AgentReportInput(status="completed", summary="useful result"),
-    )
-
-    first = await service.observe_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        replay_pending_snapshot=True,
-    )
-    assert first["report_count"] == 1
-    replayed = await service.observe_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        replay_pending_snapshot=True,
-    )
-    assert replayed["report_count"] == 1
-    assert replayed["snapshot_replayed"] is True
-
-    await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="acted on the report", tasks=[]),
-    )
-    acknowledged = await service.observe_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        replay_pending_snapshot=True,
-    )
-    assert acknowledged["report_count"] == 0
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_controller_cannot_wait_on_consumed_but_undecided_snapshot(
-    tmp_path: Path,
-) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    dispatched = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="first", tasks=[{"objective": "quick task"}]),
-    )
-    execution_id = dispatched["admissions"][0]["agent_id"]
-    await service.submit_report(
-        "run",
-        execution_id,
-        CapabilityContext(
-            run_id="run",
-            agent_id=execution_id,
-            role="execution",
-            unique_code="challenge-a",
-        ),
-        AgentReportInput(status="completed", summary="new result"),
-    )
-    snapshot = await service.observe_challenge(
-        "run", "challenge-a", challenge, max_reports=20
-    )
-    assert snapshot["report_count"] == 1
-    events = await service.list_agent_events("run", "challenge")
-    assert sum(
-        event["event_type"] == "challenge_quiescence_ready" for event in events
-    ) == 1
-    assert await service._maybe_signal_challenge_quiescence("run", "challenge-a") is False
-
-    ready = await service.record_controller_wait("run", "challenge", "too early")
-    assert ready["status"] == "ready"
-    assert ready["pending_snapshot"] is True
-
-    await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="no new independent work", tasks=[]),
-    )
-    waiting = await service.record_controller_wait("run", "challenge", "done")
-    assert waiting["status"] == "waiting"
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_optional_report_items_warn_but_terminal_report_commits(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    dispatched = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test"}]),
-    )
-    execution_id = dispatched["admissions"][0]["agent_id"]
-    execution = CapabilityContext(
-        run_id="run",
-        agent_id=execution_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    result = await service.submit_report(
-        "run",
-        execution_id,
-        execution,
-        AgentReportInput.model_validate(
-            {
-                "status": "completed",
-                "summary": "top level is valid",
-                "hypothesis_outcome": "invented",
-                "findings": [{"not_a_finding": True}],
-                "evidence_refs": [123, "evidence:evidence_" + "f" * 32],
-            }
-        ),
-    )
-    assert result["report_id"].startswith("report_")
-    assert {item["code"] for item in result["warnings"]} >= {
-        "invalid_hypothesis_outcome",
-        "invalid_finding_dropped",
-        "invalid_evidence_ref",
-        "evidence_not_accessible",
-    }
-    runtime = await service.get_agent_runtime("run", execution_id)
-    assert runtime["agent"]["status"] == "completed"
-    assert runtime["agent"]["terminal_report_id"] == result["report_id"]
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_cloud_shaped_finding_is_normalized_and_persisted(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    dispatched = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test traversal"}]),
-    )
-    execution_id = dispatched["admissions"][0]["agent_id"]
-    execution = CapabilityContext(
-        run_id="run",
-        agent_id=execution_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    evidence = await service.persist_evidence(
-        "run",
-        execution,
-        evidence_type="http",
-        source="system_http_response",
-        content="root:x:0:0",
-    )
-    result = await service.submit_report(
-        "run",
-        execution_id,
-        execution,
-        AgentReportInput.model_validate(
-            {
-                "status": "completed",
-                "summary": "confirmed traversal",
-                "hypothesis_outcome": "confirmed",
-                "candidate_flag": "task-name-is-still-preserved-as-an-opaque-value",
-                "findings": [
-                    {
-                        "finding_id": "client-traversal-1",
-                        "title": "Traversal reads arbitrary files",
-                        "detail": "download.php accepted ../../../../etc/passwd",
-                        "severity": "high",
-                        "confidence": "high",
-                        "verification_status": "confirmed",
+                        "summary": "candidate",
                         "evidence_refs": [evidence["evidence_ref"]],
                     }
                 ],
-            }
-        ),
-    )
-    assert result["hypothesis_outcome"] == "supported"
-    assert result["warnings"] == []
-    assert result["progress_kinds"] == ["finding_verified"]
-    assert result["findings"][0]["summary"] == "Traversal reads arbitrary files"
-    assert result["findings"][0]["confidence"] == 0.9
-    assert result["findings"][0]["detail"] == {
-        "description": "download.php accepted ../../../../etc/passwd",
-        "client_label": "client-traversal-1",
-        "severity": "high",
-        "evidence_refs": [evidence["evidence_ref"]],
-    }
-
-    events = await service.list_agent_events("run", execution_id)
-    report_event = next(item for item in events if item["event_type"] == "agent_report")
-    assert report_event["payload"] | {
-        "findings_received": 1,
-        "findings_persisted": 1,
-        "findings_dropped": 0,
-        "findings_normalized": 1,
-        "candidate_flag_present": True,
-    } == report_event["payload"]
-
-    observed = await service.observe_challenge(
-        "run", "challenge-a", challenge, max_reports=20
-    )
-    assert observed["candidate_flags"][0]["candidate_flag"].startswith("task-name")
-    await service.close()
+            ),
+        )
+        finding = first["payload"]["findings"][0]
+        await s.finalize_worker(
+            "run",
+            b.agent_id,
+            b,
+            AgentReportInput(
+                status="completed",
+                summary="verified",
+                findings=[
+                    {
+                        "finding_ref": finding["finding_ref"],
+                        "category": "vulnerability",
+                        "summary": "candidate",
+                        "verification_status": "verified",
+                        "evidence_refs": [evidence["evidence_ref"]],
+                    }
+                ],
+            ),
+        )
+        context = await s.observe_solver("run", "a", solver)
+        assert len(context["findings"]) == 1
+        assert context["findings"][0]["verification_status"] == "verified"
+        assert len((await s.get_overview("run"))["agents"]) == 4
+    finally:
+        await s.close()
 
 
 @pytest.mark.asyncio
-async def test_only_assigned_candidate_finding_ref_is_updated(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    first_dispatch = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="discover", tasks=[{"objective": "discover"}]),
-    )
-    first_id = first_dispatch["admissions"][0]["agent_id"]
-    first_context = CapabilityContext(
-        run_id="run",
-        agent_id=first_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    discovered = await service.submit_report(
-        "run",
-        first_id,
-        first_context,
-        AgentReportInput(
-            status="completed",
-            summary="candidate found",
-            findings=[
-                {
-                    "summary": "Candidate traversal",
-                    "verification_status": "candidate",
-                }
-            ],
-        ),
-    )
-    finding_ref = discovered["findings"][0]["finding_ref"]
+async def test_independent_services_share_unique_solver_identity(tmp_path):
+    from agent.state import StateService
 
-    second_dispatch = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(
-            summary="validate",
-            tasks=[
-                {
-                    "objective": "validate traversal",
-                    "context_refs": [finding_ref],
-                }
-            ],
-        ),
+    s, chief, solver = await build_state(tmp_path)
+    other = StateService(
+        StateDatabase(s.db.path), run_root=tmp_path / "runs", workspace_root=tmp_path
     )
-    second_id = second_dispatch["admissions"][0]["agent_id"]
-    second_context = CapabilityContext(
-        run_id="run",
-        agent_id=second_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    evidence = await service.persist_evidence(
-        "run",
-        second_context,
-        evidence_type="http",
-        source="system_http_response",
-        content="root:x:0:0",
-    )
-    verified = await service.submit_report(
-        "run",
-        second_id,
-        second_context,
-        AgentReportInput(
-            status="completed",
-            summary="candidate verified",
-            hypothesis_outcome="supported",
-            findings=[
-                {
-                    "finding_ref": finding_ref,
-                    "summary": "Candidate traversal",
-                    "verification_status": "verified",
-                    "evidence_refs": [evidence["evidence_ref"]],
-                }
-            ],
-        ),
-    )
-    assert verified["warnings"] == []
-    assert verified["findings"][0]["finding_ref"] == finding_ref
-    assert verified["findings"][0]["verification_status"] == "verified"
-    assert verified["progress_kinds"] == ["finding_verified"]
-    await service.close()
+    await other.initialize()
+    try:
+        await s.start_challenge("run", "b", chief)
+        results = await asyncio.gather(
+            *(
+                svc.register_solver_for_challenge(
+                    "run",
+                    solver_agent_id="new-" + str(index),
+                    parent_id="chief",
+                    unique_code="b",
+                    solver_prompt="solve",
+                )
+                for index, svc in enumerate((s, other, s, other))
+            )
+        )
+        assert len({row["agent_id"] for row in results}) == 1
+        assert sum(not row["idempotent"] for row in results) == 1
+    finally:
+        await other.close()
+        await s.close()
 
 
 @pytest.mark.asyncio
-async def test_repeated_finding_evidence_does_not_count_as_progress(
-    tmp_path: Path,
-) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    first_dispatch = await service.dispatch_challenge(
+async def test_pending_candidate_report_replays_exactly_after_service_restart(tmp_path):
+    from agent.state import StateService
+
+    s, chief, solver = await build_state(tmp_path)
+    w = await worker(s, solver, "candidate")
+    await s.report_worker(
         "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="discover", tasks=[{"objective": "discover"}]),
-    )
-    first_id = first_dispatch["admissions"][0]["agent_id"]
-    first_context = CapabilityContext(
-        run_id="run",
-        agent_id=first_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    await service.submit_report(
-        "run",
-        first_id,
-        first_context,
+        w.agent_id,
+        w,
         AgentReportInput(
             status="completed",
-            summary="candidate found",
-            findings=[
-                {
-                    "category": "vulnerability",
-                    "summary": "Candidate traversal",
-                    "verification_status": "candidate",
-                }
-            ],
+            summary="candidate observed",
+            candidate_flag="flag{durable_candidate}",
         ),
+        terminal=True,
     )
-
-    second_dispatch = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(
-            summary="collect evidence",
-            tasks=[{"objective": "collect evidence"}],
-        ),
+    before = await s.consume_reports("run", solver)
+    path = s.db.path
+    await s.close()
+    recovered = StateService(
+        StateDatabase(path), run_root=tmp_path / "runs", workspace_root=tmp_path
     )
-    second_id = second_dispatch["admissions"][0]["agent_id"]
-    second_context = CapabilityContext(
-        run_id="run",
-        agent_id=second_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    evidence = await service.persist_evidence(
-        "run",
-        second_context,
-        evidence_type="http",
-        source="system_http_response",
-        content="same observation recorded again",
-    )
-    repeated = await service.submit_report(
-        "run",
-        second_id,
-        second_context,
-        AgentReportInput(
-            status="completed",
-            summary="same candidate revisited",
-            findings=[
-                {
-                    "category": "vulnerability",
-                    "summary": "Candidate traversal",
-                    "verification_status": "candidate",
-                    "evidence_refs": [evidence["evidence_ref"]],
-                }
-            ],
-        ),
-    )
-
-    assert repeated["progress_kinds"] == []
-    assert repeated["findings"][0]["detail"]["evidence_refs"] == [
-        evidence["evidence_ref"]
-    ]
-    await service.close()
-
-
-def test_execution_report_schema_is_typed_but_optional_items_remain_best_effort() -> None:
-    schema = ExecutionReport.model_json_schema()
-    outcome = schema["properties"]["hypothesis_outcome"]
-    assert outcome["enum"] == ["supported", "rejected", "inconclusive"]
-    finding_ref = schema["properties"]["findings"]["items"]["$ref"]
-    assert finding_ref.endswith("/ReportFindingInput")
-    parsed = ExecutionReport.model_validate(
-        {
-            "status": "completed",
-            "summary": "terminal report survives",
-            "hypothesis_outcome": "provider-specific-value",
-            "findings": [{"title": "cloud-shaped"}, "malformed"],
-        }
-    )
-    assert parsed.hypothesis_outcome == "provider-specific-value"
-    assert parsed.findings[-1] == "malformed"
-
-
-@pytest.mark.asyncio
-async def test_evidence_scope_and_paging(tmp_path: Path) -> None:
-    service, _chief, challenge = await build_state(tmp_path)
-    dispatched = await service.dispatch_challenge(
-        "run",
-        "challenge-a",
-        challenge,
-        ChallengeDispatchInput(summary="run", tasks=[{"objective": "test"}]),
-    )
-    execution_id = dispatched["admissions"][0]["agent_id"]
-    execution = CapabilityContext(
-        run_id="run",
-        agent_id=execution_id,
-        role="execution",
-        unique_code="challenge-a",
-    )
-    saved = await service.persist_evidence(
-        "run",
-        execution,
-        evidence_type="http",
-        source="system_http_response",
-        content="0123456789",
-    )
-    first = await service.read_evidence(
-        "run", execution, saved["evidence_ref"], offset=0, limit_chars=4
-    )
-    second = await service.read_evidence(
-        "run", challenge, saved["evidence_ref"], offset=first["next_offset"], limit_chars=8
-    )
-    assert first["content"] + second["content"] == "0123456789"
-
-    await service.register_agent(
-        "run",
-        agent_id="other-execution",
-        role="execution",
-        parent_id="challenge",
-        unique_code="challenge-a",
-        mission="other",
-        initial_prompt="other",
-    )
-    other = CapabilityContext(
-        run_id="run",
-        agent_id="other-execution",
-        role="execution",
-        unique_code="challenge-a",
-    )
-    with pytest.raises(StatePermission) as error:
-        await service.read_evidence("run", other, saved["evidence_ref"])
-    assert error.value.code == "evidence_not_accessible"
-    await service.close()
+    await recovered.initialize()
+    try:
+        after = await recovered.consume_reports("run", solver)
+        assert after == before
+        assert (
+            after["reports"][0]["payload"]["candidate_flag"]
+            == "flag{durable_candidate}"
+        )
+    finally:
+        await recovered.close()

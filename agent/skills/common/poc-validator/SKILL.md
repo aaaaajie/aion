@@ -25,6 +25,17 @@ Use when:
 3. Execute.
 4. Verify.
 
+## AION indexed POC route
+
+For an indexed Tscan/Yak finding, use the model-facing tools in this order:
+
+1. `system_poc_search` with a product, exact CVE, or observed response feature. Use the exact `poc_ref` returned; a filename or display name is not a reference.
+2. `system_poc_inspect` to read `status`, `blockers`, request preview, matcher, and applicability. `reference_only` is for Yak/Yakit reference text and cannot run.
+3. Call `system_poc_run` once only when `status` is `supported`, with an explicit HTTP(S) target origin. Keep `session_id` only when it belongs to this Agent; set `update_session` only when response cookies should be persisted.
+4. Use `system_poc_output` with the returned `interaction_id` and `wait_seconds` while queued. Repeat output with its cursor; never resubmit a pending or failed run.
+
+The output is `matched`, `not_matched`, `inconclusive`, or `pending`. It describes template conditions and persisted HTTP evidence; it does not by itself prove the business vulnerability. Treat 500, 403, redirects, authentication cookies, missing bodies, and transport failures according to the Web flow skill.
+
 ## Avoid
 
 - Do not act outside the authorized competition scope.

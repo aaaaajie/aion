@@ -8,11 +8,16 @@ import sqlite3
 from pathlib import Path
 
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from .models import Base, SchemaMetaRecord
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 19
 
 
 class StateDatabase:
@@ -24,7 +29,9 @@ class StateDatabase:
             f"sqlite+aiosqlite:///{self.path}",
             connect_args={"timeout": 30},
         )
-        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
+        self.sessions = async_sessionmaker(
+            self.engine, expire_on_commit=False, class_=AsyncSession
+        )
         self._configure_sqlite()
 
     def _configure_sqlite(self) -> None:
@@ -48,7 +55,9 @@ class StateDatabase:
             await asyncio.to_thread(os.chmod, self.path, 0o600)
             async with self.sessions.begin() as session:
                 current = await session.scalar(
-                    select(SchemaMetaRecord).where(SchemaMetaRecord.key == "schema_version")
+                    select(SchemaMetaRecord).where(
+                        SchemaMetaRecord.key == "schema_version"
+                    )
                 )
                 if current is None:
                     session.add(

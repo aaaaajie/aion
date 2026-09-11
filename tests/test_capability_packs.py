@@ -94,10 +94,10 @@ def test_catalog_mounts_only_manifest_skills(tmp_path: Path) -> None:
         "execution/cloud-k8s",
         "execution/offensive-waf-bypass",
     }
-    available = {skill.skill_id for skill in catalog.available("execution")}
+    available = {skill.skill_id for skill in catalog.available("worker")}
     assert execution_mounted <= available
     assert "execution/malware-analysis" not in available
-    challenge_available = {skill.skill_id for skill in catalog.available("challenge")}
+    challenge_available = {skill.skill_id for skill in catalog.available("solver")}
     assert {
         "common/recognize-challenge-direction",
         "challenge/challenge-threat-modeling",
@@ -106,7 +106,7 @@ def test_catalog_mounts_only_manifest_skills(tmp_path: Path) -> None:
 
 def test_execution_listing_stays_within_context_limit(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path)
-    assert len(catalog.listing("execution")) <= MAX_LISTING_CHARS
+    assert len(catalog.listing("worker")) <= MAX_LISTING_CHARS
 
 
 def test_high_signal_query_recommends_one_specialist() -> None:
@@ -130,8 +130,7 @@ def test_discovery_routes_each_dimension_to_its_pack(tmp_path: Path) -> None:
         candidates = catalog.discovery_candidates(text, direction=direction, limit=12)
         ids = [item["skill_id"] for item in candidates]
         expected = {
-            f"execution/{skill}"
-            for skill in PACK_BY_DIRECTION[direction].skills
+            f"execution/{skill}" for skill in PACK_BY_DIRECTION[direction].skills
         }
         assert ids, direction
         assert any(item["skill_id"] in expected for item in candidates), direction
@@ -247,7 +246,9 @@ def test_pentest_tools_are_bounded_and_structured(tmp_path: Path) -> None:
     spec = registry.get("evasion_payload_analyze")
     assert spec is not None
     result = spec.handler(
-        spec.input_model.model_validate({"payload": "%3Cscript%3Ealert(1)%3C/script%3E"})
+        spec.input_model.model_validate(
+            {"payload": "%3Cscript%3Ealert(1)%3C/script%3E"}
+        )
     )
     assert result["data"]["encodings"]["url_encoded"] is True
     assert "_aion_evidence" in result

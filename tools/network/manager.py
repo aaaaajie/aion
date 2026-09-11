@@ -92,9 +92,6 @@ class AgentNetworkClient:
             self.agent_id, str(kwargs.get("task_id") or "")
         )
 
-    async def close(self) -> None:
-        return None
-
 
 class NetworkDiscoveryManager:
     """Own persistent fscan bridge tasks for a single Run."""
@@ -126,7 +123,9 @@ class NetworkDiscoveryManager:
     async def initialize(self, *, resume: bool = False) -> None:
         tasks = await self.service.list_network_tasks(self.run_id)
         for row in tasks:
-            self._repair_jsonl(self._task_dir(row["agent_id"], row["task_id"]) / "results.jsonl")
+            self._repair_jsonl(
+                self._task_dir(row["agent_id"], row["task_id"]) / "results.jsonl"
+            )
         if not resume:
             return
         for row in tasks:
@@ -176,7 +175,9 @@ class NetworkDiscoveryManager:
             "interrupted",
         }:
             raise _error(
-                "conflict", "agent_terminal", "Finished Agent cannot start a network task"
+                "conflict",
+                "agent_terminal",
+                "Finished Agent cannot start a network task",
             )
         task_id = f"network-{uuid4().hex}"
         task_dir = self._task_dir(agent_id, task_id)
@@ -254,16 +255,16 @@ class NetworkDiscoveryManager:
             wait_seconds=wait_seconds,
         )
 
-    async def launch_queued(
-        self, task_id: str, *, work_id: str | None = None
-    ) -> None:
+    async def launch_queued(self, task_id: str, *, work_id: str | None = None) -> None:
         async with self._task_lock(task_id):
             if self._closed:
                 return
             rows = await self.service.list_network_tasks(self.run_id)
             row = next((item for item in rows if item["task_id"] == task_id), None)
             if row is None:
-                raise _error("not_found", "task_not_found", "Network task was not found")
+                raise _error(
+                    "not_found", "task_not_found", "Network task was not found"
+                )
             if row["status"] != "queued" or row["output_cleaned_at"] is not None:
                 return
             task_dir = self._task_dir(row["agent_id"], task_id)
@@ -276,7 +277,9 @@ class NetworkDiscoveryManager:
                     status="failed",
                     error_code="plan_missing",
                 )
-                raise _error("persistence", "plan_missing", "Network scan plan is missing")
+                raise _error(
+                    "persistence", "plan_missing", "Network scan plan is missing"
+                )
             params = json.loads(plan_path.read_text(encoding="utf-8"))
             await self._spawn(
                 row,
@@ -334,6 +337,16 @@ class NetworkDiscoveryManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "read_result": {
+                "tool": "system_network_output",
+                "arguments": {"task_id": task_id, "cursor": cursor, "limit": limit,
+                              **({"filters": filters} if filters else {})},
+            },
+            "result_state": (
+                "partial" if records and row["status"] not in TERMINAL
+                else "available" if records
+                else "pending" if row["status"] not in TERMINAL else "empty"
+            ),
             "recommended_wait_seconds": 20 if row["status"] not in TERMINAL else 0,
         }
 
@@ -404,9 +417,7 @@ class NetworkDiscoveryManager:
 
     async def pause_run(self) -> None:
         self._closed = True
-        for row in await self.service.list_network_tasks(
-            self.run_id, statuses=ACTIVE
-        ):
+        for row in await self.service.list_network_tasks(self.run_id, statuses=ACTIVE):
             live = self._live.get(row["task_id"])
             if live is not None:
                 live.interrupted = True
@@ -572,7 +583,9 @@ class NetworkDiscoveryManager:
             stdout_reader, stderr_reader, return_exceptions=True
         )
         if any(isinstance(item, Exception) for item in reader_results):
-            live.protocol_error = live.protocol_error or "bridge_output_persistence_failed"
+            live.protocol_error = (
+                live.protocol_error or "bridge_output_persistence_failed"
+            )
         live.counters["duration_ms"] = int((time.perf_counter() - started) * 1000)
         live.counters["finished_at"] = _now()
         if live.interrupted:
@@ -661,11 +674,15 @@ class NetworkDiscoveryManager:
                 live.counters["errors"] += 1
             live.changed.set()
 
-    async def _store_result(self, live: LiveNetworkTask, result: dict[str, Any]) -> None:
+    async def _store_result(
+        self, live: LiveNetworkTask, result: dict[str, Any]
+    ) -> None:
         result_type = str(result.get("type") or "").upper()
         if result_type not in {"HOST", "PORT", "SERVICE"}:
             return
-        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        details = (
+            result.get("details") if isinstance(result.get("details"), dict) else {}
+        )
         target = str(result.get("target") or "")
         host = str(details.get("host") or target.split(":", 1)[0])
         record = {
@@ -715,9 +732,7 @@ class NetworkDiscoveryManager:
         self, live: LiveNetworkTask, record: dict[str, Any]
     ) -> None:
         try:
-            runtime = await self.service.get_agent_runtime(
-                self.run_id, live.agent_id
-            )
+            runtime = await self.service.get_agent_runtime(self.run_id, live.agent_id)
         except Exception:
             return
         unique_code = runtime["agent"].get("unique_code")
@@ -752,7 +767,9 @@ class NetworkDiscoveryManager:
 
     async def _resource_monitor(self, live: LiveNetworkTask) -> None:
         assert self.resource_guard is not None
-        while not live.done.is_set() and not live.stop_requested and not live.interrupted:
+        while (
+            not live.done.is_set() and not live.stop_requested and not live.interrupted
+        ):
             try:
                 decision = await self.resource_guard(live.work_id)
                 if live.stop_requested or live.interrupted:
@@ -779,7 +796,9 @@ class NetworkDiscoveryManager:
                 try:
                     await asyncio.wait_for(
                         live.done.wait(),
-                        timeout=max(1.0, float(decision.get("retry_after_seconds", 2.0))),
+                        timeout=max(
+                            1.0, float(decision.get("retry_after_seconds", 2.0))
+                        ),
                     )
                 except asyncio.TimeoutError:
                     pass
@@ -791,7 +810,9 @@ class NetworkDiscoveryManager:
                 except asyncio.TimeoutError:
                     pass
 
-    async def _persist_progress(self, live: LiveNetworkTask, *, force: bool = False) -> None:
+    async def _persist_progress(
+        self, live: LiveNetworkTask, *, force: bool = False
+    ) -> None:
         now = time.monotonic()
         if not force and now - live.last_db_update < 5.0:
             return
@@ -853,7 +874,9 @@ class NetworkDiscoveryManager:
     async def _send_control(self, live: LiveNetworkTask, command: str) -> None:
         await self._write_command(live, {"type": command, "task_id": live.task_id})
 
-    async def _write_command(self, live: LiveNetworkTask, payload: dict[str, Any]) -> None:
+    async def _write_command(
+        self, live: LiveNetworkTask, payload: dict[str, Any]
+    ) -> None:
         if live.process.stdin is None or live.process.returncode is not None:
             return
         encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
@@ -864,9 +887,7 @@ class NetworkDiscoveryManager:
             except (BrokenPipeError, ConnectionResetError):
                 live.protocol_error = "bridge_control_channel_closed"
 
-    async def _finish_work(
-        self, task_id: str, status: str, reason: str | None
-    ) -> None:
+    async def _finish_work(self, task_id: str, status: str, reason: str | None) -> None:
         try:
             await self.service.update_resource_work(
                 self.run_id,
@@ -881,7 +902,9 @@ class NetworkDiscoveryManager:
         try:
             return await self.service.get_network_task(self.run_id, agent_id, task_id)
         except StateNotFound as exc:
-            raise _error("not_found", "task_not_found", "Network task was not found") from exc
+            raise _error(
+                "not_found", "task_not_found", "Network task was not found"
+            ) from exc
 
     async def _terminate_recorded_process(self, row: dict[str, Any]) -> None:
         pid = row.get("pid")
@@ -1101,17 +1124,25 @@ class NetworkDiscoveryManager:
             return True
         if filters.get("status") and record.get("status") != filters["status"]:
             return False
-        if filters.get("port") is not None and record.get("port") != int(filters["port"]):
+        if filters.get("port") is not None and record.get("port") != int(
+            filters["port"]
+        ):
             return False
-        if filters.get("service") and str(record.get("service") or "") != str(filters["service"]):
+        if filters.get("service") and str(record.get("service") or "") != str(
+            filters["service"]
+        ):
             return False
-        if filters.get("host") and str(record.get("host") or "") != str(filters["host"]):
+        if filters.get("host") and str(record.get("host") or "") != str(
+            filters["host"]
+        ):
             return False
         return True
 
     def _require_open(self) -> None:
         if self._closed:
-            raise _error("conflict", "network_manager_closed", "Network manager is closed")
+            raise _error(
+                "conflict", "network_manager_closed", "Network manager is closed"
+            )
 
     def _task_lock(self, task_id: str) -> asyncio.Lock:
         return self._task_locks.setdefault(task_id, asyncio.Lock())

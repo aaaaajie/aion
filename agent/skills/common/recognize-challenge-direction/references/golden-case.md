@@ -11,7 +11,7 @@ Expected path:
 3. Dispatch `execution/binary-reverse-triage` with the artifact path and one
    verification question.
 4. Preserve the dispatch decision and the artifact hash as evidence, then finish
-   with one `execution_report` containing `status=completed` or a precise
+   with one `worker_report` (Worker) or `solver_progress` (Solver) containing `status=completed` or a precise
    `ENTRY_UNREACHABLE`/`INCONCLUSIVE` status.
 
 Acceptance: direction is supported by at least two independent metadata signals,

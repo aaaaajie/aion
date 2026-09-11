@@ -1,10 +1,10 @@
 ---
 name: recognize-challenge-direction
 description: >-
-  Challenge-controller bootstrap only: classify a whole CTF challenge as web,
+  Planning: classify a whole CTF challenge as web,
   pentest, binary, exploit, cloud, evasion, or unknown, then refine it into SRC,
   internal-network, AI, reverse, or exploitation focus from bounded metadata and,
-  only when needed, one exact-target probe. It is not an Execution playbook.
+  only when needed, one exact-target probe. Solver and execute Workers share this planning procedure.
 metadata:
   version: 2
   directions: [web, pentest, binary, exploit, cloud, evasion]
@@ -44,7 +44,7 @@ numbers are weak evidence and never decide the direction alone.
 3. Select a direction only when there is one strong semantic/protocol signal or
    at least two independent medium signals, the confidence is at least `0.80`,
    and the lead over the next candidate is at least `0.20`.
-4. Record the selected direction in the first `challenge_dispatch`. Keep it
+4. Record the selected direction in the task reasoning and evidence. Keep it
    `unknown` when evidence does not meet the rule.
 5. Set `execution_focus` only when at least one independent signal supports it:
    source code or repository evidence implies `src`; reachable internal services
@@ -53,16 +53,12 @@ numbers are weak evidence and never decide the direction alone.
 6. Load exactly one matching reference: `references/web.md`,
    `references/pentest.md`, `references/binary.md`, `references/exploit.md`,
    `references/cloud.md`, or `references/evasion.md`.
-7. When direction is `unknown`, create at most one bounded `recon` task with
-   `hypothesis_key=challenge-direction` and `task_key=direction-probe-1`. Its
-   only question must distinguish the leading candidates. Do not turn it into
-   port scanning, path scanning, vulnerability testing, or flag hunting.
-8. After the report, update the direction in the next `challenge_dispatch` only
-   when the report or an observation supplies new evidence.
+7. When direction is unknown, the same Solver or execute Worker may run one bounded probe that distinguishes the leading candidates. Delegate only an independent task with an explicit task_key when useful. No stage transition requires a new Agent.
+8. Refine the direction only when new evidence supports the change.
 
 ## Execution probe
 
-Only an Execution Agent may run the bundled script. It must read this Skill first,
+A Solver or execute Worker may run the bundled script. It must read this Skill first,
 write a JSON input file, and run:
 
 ```text
@@ -77,7 +73,7 @@ It may perform a homepage request, one EVM identity request, and one chain-id
 request when the target is an EVM candidate, and one bounded raw-TCP banner read.
 It must stop after evidence that
 answers the assigned discrimination question. Return only compact JSON evidence
-and the relevant Evidence references in `execution_report`.
+and the relevant Evidence references in `worker_report` (Worker) or `solver_progress` (Solver).
 
 ## Signal rules
 

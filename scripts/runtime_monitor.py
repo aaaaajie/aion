@@ -122,8 +122,10 @@ class MonitorController:
         runtime_service: str = DEFAULT_RUNTIME_SERVICE,
         sync_seconds: float = SYNC_SECONDS,
         auto_latest: bool = True,
+        workspace_root: Path | None = None,
     ) -> None:
         self.run_root = run_root.expanduser().resolve()
+        self.workspace_root = workspace_root
         self.current_run_file = current_run_file.expanduser().resolve()
         self.port = port
         self.runtime_service = runtime_service
@@ -183,7 +185,7 @@ class MonitorController:
         if self._monitor is not None:
             self._monitor.close()
             self._monitor = None
-        monitor = RuntimeMonitor(database, run_id, port=self.port)
+        monitor = RuntimeMonitor(database, run_id, port=self.port, workspace_root=self.workspace_root)
         monitor.start()
         self._monitor = monitor
         self._run_id = run_id
@@ -203,6 +205,7 @@ class MonitorController:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workspace-root", type=Path)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--current-run-file", type=Path, default=DEFAULT_CURRENT_RUN_FILE)
     parser.add_argument("--monitor-port", type=int, default=DEFAULT_PORT)
@@ -223,6 +226,7 @@ def main() -> None:
         raise SystemExit("--monitor-port must be between 0 and 65535")
     controller = MonitorController(
         run_root=args.run_root,
+        workspace_root=args.workspace_root,
         current_run_file=args.current_run_file,
         port=args.monitor_port,
         runtime_service=args.runtime_service,

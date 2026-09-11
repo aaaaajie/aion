@@ -80,9 +80,12 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "system_glob",
             "system_read_file",
             "system_shell",
+            "system_task_start",
             "system_network_discovery",
             "pentest_dir_fuzz",
             "pentest_sqlmap",
+            "pentest_jwt",
+            "pentest_arjun",
             "execution_report",
         ),
         (
@@ -139,6 +142,8 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "system_http_output",
             "system_http_response",
             "pentest_service_probe",
+            "pentest_jwt",
+            "pentest_arjun",
             "pentest_auth_brute",
             "pentest_dir_fuzz",
             "pentest_credential_lookup",
@@ -206,6 +211,7 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "pwn_session_io",
             "pwn_session_close",
             "system_shell",
+            "system_task_start",
             "execution_report",
         ),
         (
@@ -261,6 +267,7 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "pwn_session_io",
             "pwn_session_close",
             "system_shell",
+            "system_task_start",
             "execution_report",
         ),
         (
@@ -309,6 +316,7 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "evidence_read",
             "system_read_file",
             "system_shell",
+            "system_task_start",
             "execution_report",
         ),
         (
@@ -350,6 +358,7 @@ CAPABILITY_PACKS: tuple[CapabilityPack, ...] = (
             "evasion_payload_analyze",
             "system_read_file",
             "system_shell",
+            "system_task_start",
             "execution_report",
         ),
         (
@@ -401,7 +410,9 @@ def mounted_skill_ids() -> tuple[str, ...]:
             seen.setdefault(f"execution/{skill}", None)
     seen.setdefault("common/recognize-challenge-direction", None)
     seen.setdefault("common/web-ctf-flow", None)
+    seen.setdefault("common/ctf-flag-locator", None)
     seen.setdefault("common/vulnerability-knowledge-base", None)
+    seen.setdefault("common/cyberchef-recipes", None)
     seen.setdefault("challenge/challenge-threat-modeling", None)
     return tuple(sorted(seen))
 

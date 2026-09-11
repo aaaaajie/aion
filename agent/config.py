@@ -27,8 +27,8 @@ class RoleContextProfile:
 
 ROLE_CONTEXT_PROFILES: dict[str, RoleContextProfile] = {
     "chief": RoleContextProfile(128_000, 32_000, 48_000, 32_768),
-    "challenge": RoleContextProfile(96_000, 24_000, 36_000, 32_768),
-    "execution": RoleContextProfile(64_000, 8_000, 24_000, 16_384),
+    "solver": RoleContextProfile(96_000, 24_000, 36_000, 32_768),
+    "worker": RoleContextProfile(64_000, 8_000, 24_000, 16_384),
 }
 
 
@@ -41,33 +41,49 @@ class ContextBudget:
 
     def profile(self, role: str | None) -> RoleContextProfile:
         return ROLE_CONTEXT_PROFILES.get(
-            role or "execution", ROLE_CONTEXT_PROFILES["execution"]
+            role or "worker", ROLE_CONTEXT_PROFILES["worker"]
         )
 
-    def max_output_tokens(self, role: str | None, *, bootstrap: bool = False) -> int:
-        if bootstrap:
-            return 32_768
+    def max_output_tokens(self, role: str | None) -> int:
         return self.profile(role).max_output_tokens
 
-    def absolute_prompt_tokens(
-        self, role: str | None = None, *, bootstrap: bool = False
-    ) -> int:
+    def absolute_prompt_tokens(self, role: str | None = None) -> int:
         return max(
             1,
             self.context_window_tokens
-            - self.max_output_tokens(role, bootstrap=bootstrap)
+            - self.max_output_tokens(role)
             - MODEL_CONTEXT_SAFETY_TOKENS,
         )
 
     @property
     def summary_max_output_tokens(self) -> int:
-        return 8_192
+        return 4_096
+
+
+@dataclass(frozen=True)
+class StagnationPolicy:
+    """Durable intervention thresholds for one active challenge."""
+
+    review_after_seconds: int = 480
+    alternate_after_seconds: int = 840
+    rotate_after_seconds: int = 1320
+    worker_timeout_seconds: int = 480
+    poll_interval_seconds: int = 30
+
+    def __post_init__(self) -> None:
+        if not (
+            0 < self.review_after_seconds
+            < self.alternate_after_seconds
+            < self.rotate_after_seconds
+        ):
+            raise ValueError("stagnation thresholds must be positive and ordered")
+        if self.worker_timeout_seconds <= 0 or self.poll_interval_seconds <= 0:
+            raise ValueError("stagnation timeouts must be positive")
 
 
 def deepseek_agent_request_options(
     *,
     role: str | None,
-    bootstrap: bool = False,
     context_budget: ContextBudget | None = None,
     report_recovery: bool = False,
 ) -> dict[str, object]:
@@ -90,7 +106,7 @@ def deepseek_agent_request_options(
     return {
         "thinking": {"type": "enabled"},
         "reasoning_effort": "max",
-        "max_tokens": budget.max_output_tokens(role, bootstrap=bootstrap),
+        "max_tokens": budget.max_output_tokens(role),
     }
 
 
@@ -101,6 +117,16 @@ def deepseek_auxiliary_request_options() -> dict[str, object]:
         "thinking": {"type": "disabled"},
         "temperature": 0,
     }
+
+
+def normalize_selected_challenge_codes(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError("selected_challenge_codes must be a non-empty list or null")
+    if any(not isinstance(code, str) or not code.strip() or len(code.strip()) > 256 for code in value):
+        raise ValueError("selected_challenge_codes must contain non-empty challenge codes")
+    return list(dict.fromkeys(code.strip() for code in value))
 
 
 class AgentSettings(BaseSettings):
@@ -120,6 +146,13 @@ class AgentSettings(BaseSettings):
             "local/disabled/off, to use the deterministic local catalog without "
             "an extra model request."
         ),
+    )
+    selected_challenge_codes: list[str] | None = Field(
+        default=None, validation_alias="AION_SELECTED_CHALLENGE_CODES"
+    )
+    compact_tools: bool = Field(default=True, validation_alias="AION_COMPACT_TOOLS")
+    solver_observation: bool = Field(
+        default=True, validation_alias="AION_SOLVER_OBSERVATION"
     )
     llm_api_key: SecretStr = Field(
         min_length=1,
@@ -163,10 +196,20 @@ class AgentSettings(BaseSettings):
         le=100,
         validation_alias="AION_DISK_RESERVE_PERCENT",
     )
-    bootstrap_enabled: bool = Field(
-        default=True,
-        validation_alias="AION_BOOTSTRAP_ENABLED",
-        description="Start one autonomous Bootstrap Execution for each new Challenge.",
+    stagnation_review_after_seconds: int = Field(
+        default=480, ge=1, validation_alias="AION_STAGNATION_REVIEW_AFTER_SECONDS"
+    )
+    stagnation_alternate_after_seconds: int = Field(
+        default=840, ge=1, validation_alias="AION_STAGNATION_ALTERNATE_AFTER_SECONDS"
+    )
+    stagnation_rotate_after_seconds: int = Field(
+        default=1320, ge=1, validation_alias="AION_STAGNATION_ROTATE_AFTER_SECONDS"
+    )
+    stagnation_worker_timeout_seconds: int = Field(
+        default=480, ge=1, validation_alias="AION_STAGNATION_WORKER_TIMEOUT_SECONDS"
+    )
+    stagnation_poll_interval_seconds: int = Field(
+        default=30, ge=1, validation_alias="AION_STAGNATION_POLL_INTERVAL_SECONDS"
     )
 
     model_config = SettingsConfigDict(
@@ -175,6 +218,11 @@ class AgentSettings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @field_validator("selected_challenge_codes", mode="before")
+    @classmethod
+    def validate_selected_challenge_codes(cls, value):
+        return normalize_selected_challenge_codes(value)
 
     @field_validator("context_window_tokens")
     @classmethod
@@ -196,6 +244,16 @@ class AgentSettings(BaseSettings):
     @property
     def context_budget(self) -> ContextBudget:
         return ContextBudget(context_window_tokens=self.context_window_tokens)
+
+    @property
+    def stagnation_policy(self) -> StagnationPolicy:
+        return StagnationPolicy(
+            review_after_seconds=self.stagnation_review_after_seconds,
+            alternate_after_seconds=self.stagnation_alternate_after_seconds,
+            rotate_after_seconds=self.stagnation_rotate_after_seconds,
+            worker_timeout_seconds=self.stagnation_worker_timeout_seconds,
+            poll_interval_seconds=self.stagnation_poll_interval_seconds,
+        )
 
     @property
     def run_root(self) -> Path:

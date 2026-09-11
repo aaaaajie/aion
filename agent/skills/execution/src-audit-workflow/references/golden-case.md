@@ -11,7 +11,7 @@ Expected path:
 4. Use `system_http_request` for one control request and one one-variable
    validation request; use `system_http_analyze`/`system_http_output` as needed.
 5. Report file, line, function, request, response difference, and evidence hash
-   in one `execution_report`; label the candidate `verified` or `inconclusive`.
+   in one `worker_report` (Worker) or `solver_progress` (Solver); label the candidate `verified` or `inconclusive`.
 
 Acceptance: a static pattern without a connected source-to-sink path is not a
 finding, and the report includes the exact bounded inventory and request evidence.

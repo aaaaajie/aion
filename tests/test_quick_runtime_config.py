@@ -11,7 +11,9 @@ from agent.tooling import ToolExecutor, ToolRegistry
 import json
 
 
-def test_local_challenge_slot_normalizes_name_and_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_challenge_slot_normalizes_name_and_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         quick,
         "CHALLENGES",
@@ -36,7 +38,9 @@ def test_quick_test_default_wait_is_unbounded() -> None:
     assert quick.DEFAULT_WAIT_SECONDS == 0.0
 
 
-def test_quick_test_does_not_discover_vpn_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quick_test_does_not_discover_vpn_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def fail_discovery(*_args: object, **_kwargs: object) -> Path:
         raise AssertionError("VPN discovery must stay disabled by default")
 
@@ -52,9 +56,18 @@ async def test_local_challenge_benchmark_has_no_external_dependency() -> None:
         "container_addr": ["http://127.0.0.1:8080"],
     }
     benchmark = quick.LocalChallengeBenchmark([challenge])
+
     async def call(name: str, arguments: dict[str, str] | None = None):
         calls = await ToolExecutor(ToolRegistry([benchmark])).execute(
-            [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments or {})}}]
+            [
+                {
+                    "id": name,
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments or {}),
+                    },
+                }
+            ]
         )
         assert calls[0].result is not None
         return calls[0].result
@@ -63,20 +76,18 @@ async def test_local_challenge_benchmark_has_no_external_dependency() -> None:
     assert catalog["ok"] is True
     assert catalog["data"][0]["container_status"] == "stopped"
 
-    started = await call(
-        "benchmark_start_challenge", {"unique_code": "local-web"}
-    )
+    started = await call("benchmark_start_challenge", {"unique_code": "local-web"})
     assert started["ok"] is True
     catalog = await call("benchmark_list_challenges")
     assert catalog["data"][0]["container_status"] == "running"
 
 
-def test_quick_test_waits_for_every_execution_report() -> None:
+def test_quick_test_waits_for_every_worker_report() -> None:
     overview = {
         "agents": [
             {
                 "agent_id": "execution-1",
-                "role": "execution",
+                "role": "worker",
                 "unique_code": "web",
                 "parent_id": "challenge-1",
                 "status": "failed",
@@ -84,7 +95,7 @@ def test_quick_test_waits_for_every_execution_report() -> None:
             },
             {
                 "agent_id": "execution-2",
-                "role": "execution",
+                "role": "worker",
                 "unique_code": "web",
                 "parent_id": "challenge-1",
                 "status": "queued",
@@ -92,19 +103,19 @@ def test_quick_test_waits_for_every_execution_report() -> None:
             },
             {
                 "agent_id": "challenge-1",
-                "role": "challenge",
+                "role": "solver",
                 "unique_code": "web",
                 "status": "running",
-                "report_cursors": {"execution": 0},
+                "report_cursor": 0,
             },
         ]
     }
-    assert quick._execution_phase_complete(overview, {"web"}) is False
+    assert quick._requested_work_complete(overview, {"web"}) is False
 
     overview["agents"][1]["status"] = "completed"
     overview["agents"][1]["last_report_sequence"] = 18
-    overview["agents"][2]["report_cursors"]["execution"] = 18
-    assert quick._execution_phase_complete(overview, {"web"}) is False
+    overview["agents"][2]["report_cursor"] = 18
+    assert quick._requested_work_complete(overview, {"web"}) is False
 
     overview["agents"][2]["status"] = "completed"
-    assert quick._execution_phase_complete(overview, {"web"}) is True
+    assert quick._requested_work_complete(overview, {"web"}) is True

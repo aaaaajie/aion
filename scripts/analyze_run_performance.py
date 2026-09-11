@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from agent.model_usage import aggregate_usage
+from agent.state.database import SCHEMA_VERSION
+from scripts.analyze_hint_delivery import hint_delivery_metrics
 import sqlite3
 from pathlib import Path
 from statistics import median
 from typing import Any
+
+
+# Historical run bundles are immutable analysis inputs.  Runtime state still
+# rejects old schemas; the report reader may inspect the immediately preceding
+# format so downloaded failure snapshots remain auditable.
+ANALYZABLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, 18})
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -72,72 +81,154 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
     skill_discovery_sources: dict[str, int] = {}
     skill_discovery_failures: dict[str, int] = {}
     skill_discovery_cache_hits = 0
-    dispatch_latency: list[float] = []
     model_rounds_to_dispatch: list[float] = []
     first_useful_round_by_agent: dict[str, float] = {}
-    soft_guard_warnings = 0
-    report_items_dropped = 0
     evidence_ref_count = 0
-    low_yield_count = 0
     request_reference_errors = 0
     context_budget_preflights = 0
     empty_response_recoveries = 0
     context_soft_limit_exceeded = 0
     context_capacity_deferred = 0
-    controller_recovery_scheduled = 0
-    controller_recovered = 0
-    controller_recovery_latency: list[float] = []
+    model_recoveries = 0
     runtime_fatal_errors = 0
     agent_roles: dict[str, str] = {}
     summary_by_role: dict[str, dict[str, int]] = {}
     findings_received = 0
     findings_persisted = 0
-    findings_dropped = 0
-    findings_normalized = 0
     candidate_flags = 0
     flag_submissions = 0
-    flag_submissions_accepted = 0
+    flag_submissions_correct = 0
     critical_tool_results: dict[str, dict[str, Any]] = {}
-    first_dispatch_result_by_agent: dict[str, bool] = {}
+    first_delegation_result_by_agent: dict[str, bool] = {}
     cleanup_failure_events = 0
     cleanup_failures_by_manager: dict[str, int] = {}
-    bootstrap_events: dict[str, int] = {
-        "created": 0,
-        "started": 0,
-        "completed": 0,
-        "conclude_started": 0,
-        "conclude_completed": 0,
-        "shared_snapshots": 0,
-        "shared_replays": 0,
-    }
-    bootstrap_shared_reports = 0
-    bootstrap_candidate_flags = 0
     llm_response_rejections: dict[str, int] = {}
     llm_reasoning_missing = 0
     llm_policy: dict[str, Any] | None = None
+    observer_outcomes: dict[str, int] = {}
+    observer_failures: dict[str, int] = {}
+    observer_trimmed = 0
+    observer_skipped = 0
+    observer_received: set[tuple[str, int]] = set()
+    observer_assessments: dict[str, int] = {}
+    observer_tensions = 0
+    observer_corrections: dict[str, int] = {}
+    correction_deliveries: set[str] = set()
+    review_metrics = {"deliveries": 0, "automatic_triggers": 0, "task_snapshot_deliveries": 0,
+                      "successful_records": 0, "rejected_calls": 0, "assessments": {}}
+    stagnation_metrics = {
+        "review_due_count": 0,
+        "strategy_reset_count": 0,
+        "alternate_worker_started_count": 0,
+        "alternate_worker_finished_count": 0,
+        "rotation_requested_count": 0,
+        "worker_results": {},
+        "max_stalled_seconds": 0,
+    }
+    covered_results: set[tuple[str, int]] = set()
+    execution_results: set[tuple[str, int]] = set()
+    parameter_errors: dict[str, int] = {}
+    preflight = {"calls": 0, "successes": 0, "failures": 0}
+    completion_reasons: dict[str, int] = {}
+    # Shell completion is an execution outcome, separate from tool-gateway
+    # errors.  Keep one terminal record per task so repeated cleanup events do
+    # not inflate the report.
+    shell_terminal_by_task: dict[tuple[str, str], dict[str, Any]] = {}
 
     def collect_event(
-        event_type: str, value: dict[str, Any], agent_id: str | None
+        event_type: str, value: dict[str, Any], agent_id: str | None, sequence: int = 0
     ) -> None:
         nonlocal memory_updates, summary_failures, micro_compactions
         nonlocal compaction_skips, unbatched_event_count, persisted_results
-        nonlocal soft_guard_warnings, report_items_dropped
-        nonlocal evidence_ref_count, low_yield_count
+        nonlocal evidence_ref_count
+        nonlocal findings_received, findings_persisted, candidate_flags
         nonlocal request_reference_errors, context_budget_preflights
         nonlocal empty_response_recoveries
         nonlocal context_soft_limit_exceeded, context_capacity_deferred
-        nonlocal controller_recovery_scheduled, controller_recovered
+        nonlocal model_recoveries
         nonlocal runtime_fatal_errors
-        nonlocal findings_received, findings_persisted, findings_dropped
-        nonlocal findings_normalized, candidate_flags
-        nonlocal flag_submissions, flag_submissions_accepted
+        nonlocal flag_submissions, flag_submissions_correct
         nonlocal cleanup_failure_events
         nonlocal skill_discovery_started, skill_discovery_completed
         nonlocal skill_discovery_failed, skill_discovery_fallback
         nonlocal skill_candidate_count
         nonlocal skill_discovery_cache_hits
-        nonlocal bootstrap_shared_reports, bootstrap_candidate_flags
         nonlocal llm_reasoning_missing, llm_policy
+        nonlocal observer_trimmed, observer_skipped, observer_tensions
+
+        if event_type.startswith("observer_correction_"):
+            kind = event_type.removeprefix("observer_correction_")
+            observer_corrections[kind] = observer_corrections.get(kind, 0) + 1
+        if event_type == "run_finished":
+            reason = str(value.get("reason") or "unrecorded")
+            completion_reasons[reason] = completion_reasons.get(reason, 0) + 1
+        if event_type == "shell_task_finished":
+            task_id = value.get("task_id")
+            if isinstance(task_id, str):
+                # Events in this report are filtered to one Run.  Keeping the
+                # run id in the identity makes the de-duplication contract
+                # explicit and safe for callers that reuse this accumulator.
+                key = (run_id, task_id)
+                previous = shell_terminal_by_task.get(key)
+                if previous is None or sequence >= int(previous.get("sequence") or 0):
+                    shell_terminal_by_task[key] = {
+                        **value,
+                        "sequence": sequence,
+                    }
+        if event_type == "solver_review_delivered":
+            review_metrics["deliveries"] += 1
+            review_metrics["automatic_triggers"] += int(value.get("automatic_review_recommended") is True)
+            review_metrics["task_snapshot_deliveries"] += int("task_snapshot_changed" in value.get("trigger_reasons", []))
+        if event_type in {
+            "solver_stagnation_review_due",
+            "solver_strategy_reset",
+            "solver_stagnation_worker_started",
+            "solver_stagnation_worker_finished",
+            "solver_stagnation_rotation_requested",
+        }:
+            stalled = value.get("stalled_seconds")
+            if isinstance(stalled, (int, float)):
+                stagnation_metrics["max_stalled_seconds"] = max(
+                    stagnation_metrics["max_stalled_seconds"], int(stalled)
+                )
+        if event_type == "solver_stagnation_review_due":
+            stagnation_metrics["review_due_count"] += 1
+        elif event_type == "solver_strategy_reset" and value.get("trigger") == "stagnation_review_due":
+            stagnation_metrics["strategy_reset_count"] += 1
+        elif event_type == "solver_stagnation_worker_started":
+            stagnation_metrics["alternate_worker_started_count"] += 1
+        elif event_type == "solver_stagnation_worker_finished":
+            stagnation_metrics["alternate_worker_finished_count"] += 1
+            status = str(value.get("status") or "unknown")
+            results = stagnation_metrics["worker_results"]
+            results[status] = results.get(status, 0) + 1
+        elif event_type == "solver_stagnation_rotation_requested":
+            stagnation_metrics["rotation_requested_count"] += 1
+
+        if event_type == "assistant_response" and value.get("observation_correction_id"):
+            correction_deliveries.add(value['observation_correction_id'])
+        if event_type == "assistant_response" and value.get("observation_revision"):
+            observer_received.add((str(agent_id), value["observation_revision"]))
+        if event_type == "solver_review_record":
+            review_metrics["successful_records"] += 1
+            review = value.get("review") or {}
+            outcome = review.get("assessment", "unrecorded")
+            review_metrics["assessments"][outcome] = review_metrics["assessments"].get(outcome, 0) + 1
+            covered_results.update((str(agent_id), seq) for seq in review.get("covered_sequences", []))
+            covered_results.update((str(agent_id), seq) for seq in (review.get("validation") or {}).get("conclusion_sequences", []))
+            assessment = (value.get("review") or {}).get("observation_assessment")
+            if assessment:
+                observer_assessments[assessment] = observer_assessments.get(assessment, 0) + 1
+        if event_type == "solver_observation_snapshot":
+            observer_tensions += len((value.get("map") or {}).get("TENSION", []))
+            diagnostics = value.get("diagnostics") or {}
+            outcome = diagnostics.get("outcome") or value.get("status", "unknown")
+            observer_outcomes[outcome] = observer_outcomes.get(outcome, 0) + 1
+            stage = diagnostics.get("failure_stage")
+            if stage:
+                observer_failures[stage] = observer_failures.get(stage, 0) + 1
+            observer_trimmed += sum(diagnostics.get("trimmed_entries", {}).values())
+            observer_skipped += ((value.get("coverage") or {}).get("skipped") or {}).get("count", 0)
 
         role = agent_roles.get(str(agent_id or ""), "unknown")
         role_summary = summary_by_role.setdefault(
@@ -156,22 +247,6 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         elif event_type == "memory_update_failed":
             summary_failures += 1
             role_summary["failures"] += 1
-        elif event_type == "bootstrap_created":
-            bootstrap_events["created"] += 1
-        elif event_type == "bootstrap_started":
-            bootstrap_events["started"] += 1
-        elif event_type == "bootstrap_completed":
-            bootstrap_events["completed"] += 1
-            bootstrap_candidate_flags += int(bool(value.get("candidate_flag_present")))
-        elif event_type == "bootstrap_conclude_started":
-            bootstrap_events["conclude_started"] += 1
-        elif event_type == "bootstrap_conclude_completed":
-            bootstrap_events["conclude_completed"] += 1
-        elif event_type == "bootstrap_shared_snapshot":
-            bootstrap_events["shared_snapshots"] += 1
-            bootstrap_shared_reports += int(value.get("report_count") or len(value.get("reports") or []))
-        elif event_type == "bootstrap_shared_snapshot_replayed":
-            bootstrap_events["shared_replays"] += 1
         elif event_type == "context_micro_compacted":
             micro_compactions += 1
             role_summary["micro_compactions"] += 1
@@ -183,14 +258,8 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             context_soft_limit_exceeded += 1
         elif event_type == "context_capacity_deferred":
             context_capacity_deferred += 1
-        elif event_type == "controller_session_recovery_scheduled":
-            controller_recovery_scheduled += 1
-        elif event_type == "controller_session_recovered":
-            controller_recovered += 1
-            if value.get("controller_recovery_latency_ms") is not None:
-                controller_recovery_latency.append(
-                    float(value["controller_recovery_latency_ms"])
-                )
+        elif event_type == "agent_model_recovery":
+            model_recoveries += 1
         elif event_type == "runtime_fatal_error":
             runtime_fatal_errors += 1
         elif event_type == "llm_policy_configured":
@@ -199,18 +268,17 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             llm_reasoning_missing += 1
         elif event_type == "llm_response_rejected":
             reason = str(value.get("reason") or "unknown")
-            llm_response_rejections[reason] = (
-                llm_response_rejections.get(reason, 0) + 1
-            )
+            llm_response_rejections[reason] = llm_response_rejections.get(reason, 0) + 1
         elif event_type == "llm_empty_report_recovery":
             empty_response_recoveries += 1
-        elif event_type == "skill_catalog_ready" and value.get(
-            "initialization_latency_ms"
-        ) is not None:
+        elif (
+            event_type == "skill_catalog_ready"
+            and value.get("initialization_latency_ms") is not None
+        ):
             skill_catalog_init.append(float(value["initialization_latency_ms"]))
-        elif event_type == "skill_top_k_selected" and value.get(
-            "latency_ms"
-        ) is not None:
+        elif (
+            event_type == "skill_top_k_selected" and value.get("latency_ms") is not None
+        ):
             skill_top_k.append(float(value["latency_ms"]))
         elif event_type == "skill_discovery_started":
             skill_discovery_started += 1
@@ -219,9 +287,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             if value.get("latency_ms") is not None:
                 skill_discovery_latency.append(float(value["latency_ms"]))
             source = str(value.get("source") or "unknown")
-            skill_discovery_sources[source] = (
-                skill_discovery_sources.get(source, 0) + 1
-            )
+            skill_discovery_sources[source] = skill_discovery_sources.get(source, 0) + 1
             skill_discovery_cache_hits += int(bool(value.get("cache_hit")))
         elif event_type == "skill_discovery_failed":
             skill_discovery_failed += 1
@@ -234,9 +300,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             if value.get("latency_ms") is not None:
                 skill_discovery_latency.append(float(value["latency_ms"]))
             source = str(value.get("source") or "local_fallback")
-            skill_discovery_sources[source] = (
-                skill_discovery_sources.get(source, 0) + 1
-            )
+            skill_discovery_sources[source] = skill_discovery_sources.get(source, 0) + 1
         elif event_type == "skill_candidate_presented":
             skill_candidate_count += int(value.get("candidate_count") or 0)
             if agent_id:
@@ -247,23 +311,12 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             and agent_id
         ):
             skill_model_activation_agents.add(str(agent_id))
-        elif event_type == "challenge_dispatched":
-            if value.get("dispatch_latency_ms") is not None:
-                dispatch_latency.append(float(value["dispatch_latency_ms"]))
-            soft_guard_warnings += int(
-                value.get("soft_guard_warning_count") or 0
-            )
-        elif event_type == "agent_report":
-            report_items_dropped += int(value.get("report_items_dropped") or 0)
+        elif event_type in {"worker_reported", "worker_updated"}:
             findings_received += int(value.get("findings_received") or 0)
             findings_persisted += int(value.get("findings_persisted") or 0)
-            findings_dropped += int(value.get("findings_dropped") or 0)
-            findings_normalized += int(value.get("findings_normalized") or 0)
             candidate_flags += int(bool(value.get("candidate_flag_present")))
         elif event_type == "evidence_persisted":
             evidence_ref_count += 1
-        elif event_type == "challenge_low_yield":
-            low_yield_count += 1
         elif event_type == "agent_resource_cleanup_failed":
             cleanup_failure_events += 1
             failures = value.get("failures")
@@ -271,7 +324,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                 for failure in failures:
                     if not isinstance(failure, dict):
                         continue
-                    manager = str(failure.get("manager") or "unknown")
+                    manager = str(failure.get("resource") or "unknown")
                     cleanup_failures_by_manager[manager] = (
                         cleanup_failures_by_manager.get(manager, 0) + 1
                     )
@@ -282,14 +335,11 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             and value.get("queue_latency_ms") is not None
         ):
             resource_queue.append(float(value["queue_latency_ms"]))
-        elif event_type == "agent_admission_reserved" and value.get(
-            "queue_latency_ms"
-        ) is not None:
+        elif (
+            event_type == "agent_admission_reserved"
+            and value.get("queue_latency_ms") is not None
+        ):
             agent_queue.append(float(value["queue_latency_ms"]))
-        elif event_type == "cycle_transition_completed" and value.get(
-            "transition_latency_ms"
-        ) is not None:
-            transitions.append(float(value["transition_latency_ms"]))
         elif event_type == "assistant_response":
             if value.get("latency_ms") is not None:
                 model_latency.append(float(value["latency_ms"]))
@@ -309,6 +359,16 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                 prompt_cache_misses.append(float(value["prompt_cache_miss_tokens"]))
         elif event_type == "tool_result":
             tool_name = str(value.get("tool_name") or "")
+            tool_result = value.get("result") or {}
+            tool_error = tool_result.get("error") or {}
+            stage = value.get("error_stage") or tool_error.get("stage")
+            if stage in {"parse", "schema", "semantic"}:
+                parameter_errors[tool_name] = parameter_errors.get(tool_name, 0) + 1
+            if tool_name == "solver_review" and tool_result.get("ok") is False:
+                review_metrics["rejected_calls"] += 1
+            if tool_name == "system_http_plan" and not value.get("replayed"):
+                preflight["calls"] += 1
+                preflight["successes" if tool_result.get("ok") else "failures"] += 1
             if value.get("queue_latency_ms") is not None:
                 tool_queue.append(float(value["queue_latency_ms"]))
             if value.get("execution_latency_ms") is not None:
@@ -325,14 +385,16 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                     "http_response_not_found",
                     "http_request_not_found",
                     "http_interaction_not_found",
+                    "invalid_evidence_ref",
+                    "evidence_not_accessible",
                 }:
                     request_reference_errors += 1
             result = value.get("result")
             successful = isinstance(result, dict) and result.get("ok") is True
             round_number = value.get("round")
             if tool_name in {
-                "challenge_dispatch",
-                "execution_report",
+                "solver_delegate",
+                "worker_report",
                 "system_http_probe",
             }:
                 totals = critical_tool_results.setdefault(
@@ -349,21 +411,23 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                     )
                     failures = totals["failures"]
                     failures[failure_key] = failures.get(failure_key, 0) + 1
-            if (
-                tool_name == "challenge_dispatch"
-            ):
-                if agent_id and agent_id not in first_dispatch_result_by_agent:
-                    first_dispatch_result_by_agent[agent_id] = successful
+            if tool_name == "solver_delegate":
+                if agent_id and agent_id not in first_delegation_result_by_agent:
+                    first_delegation_result_by_agent[agent_id] = successful
                 if successful and isinstance(round_number, int | float):
                     model_rounds_to_dispatch.append(float(round_number))
-            if tool_name == "challenge_submit_flag":
+            if tool_name == "solver_submit_flag":
                 flag_submissions += 1
-                if successful:
-                    flag_submissions_accepted += 1
+                data = result.get("data", {}) if isinstance(result, dict) else {}
+                if successful and (
+                    data.get("correct") is True
+                ):
+                    flag_submissions_correct += 1
             if (
                 successful
                 and agent_id
                 and tool_name.startswith("system_")
+                and tool_name != "system_http_plan"
                 and isinstance(round_number, int | float)
             ):
                 first_useful_round_by_agent.setdefault(agent_id, float(round_number))
@@ -388,13 +452,15 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                             http_connection_pool[key] = max(
                                 metric, http_connection_pool.get(key, 0)
                             )
-            if tool_name == "skill_search" and value.get(
-                "execution_latency_ms"
-            ) is not None:
+            if (
+                tool_name == "skill_search"
+                and value.get("execution_latency_ms") is not None
+            ):
                 skill_search.append(float(value["execution_latency_ms"]))
-            elif tool_name == "skill_invoke" and value.get(
-                "execution_latency_ms"
-            ) is not None:
+            elif (
+                tool_name == "skill_invoke"
+                and value.get("execution_latency_ms") is not None
+            ):
                 result = value.get("result")
                 data = result.get("data") if isinstance(result, dict) else None
                 status = (
@@ -408,6 +474,27 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                 target.append(float(value["execution_latency_ms"]))
 
     with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        version = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        if not version or version[0] not in {str(item) for item in ANALYZABLE_SCHEMA_VERSIONS}:
+            raise ValueError(
+                f"Only schemas {sorted(ANALYZABLE_SCHEMA_VERSIONS)} runs can be analyzed by this implementation"
+            )
+        usage_events = [
+            dict(zip(("event_type", "payload", "agent_id"), item))
+            for item in connection.execute(
+                "SELECT event_type,payload,agent_id FROM state_events WHERE run_id=? AND event_type IN ('model_call_started','model_call_finished') ORDER BY sequence",
+                (run_id,),
+            )
+        ]
+        usage_agents = [
+            dict(zip(("agent_id", "unique_code"), item))
+            for item in connection.execute(
+                "SELECT agent_id,unique_code FROM agents WHERE run_id=?", (run_id,)
+            )
+        ]
+        token_usage = aggregate_usage(usage_events, usage_agents)
         tables = {
             str(item[0])
             for item in connection.execute(
@@ -429,8 +516,8 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                     )
                 }
             )
-        for event_type, payload, agent_id in connection.execute(
-            "SELECT event_type, payload, agent_id FROM state_events "
+        for sequence, event_type, payload, agent_id in connection.execute(
+            "SELECT sequence, event_type, payload, agent_id FROM state_events "
             "WHERE run_id = ? ORDER BY sequence",
             (run_id,),
         ):
@@ -439,7 +526,11 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                collect_event(str(event_type), value, agent_id)
+                if event_type in {"shell_task_finished", "http_interaction_status_changed"} or (
+                    event_type == "tool_result" and value.get("tool_name") != "system_http_plan"
+                ):
+                    execution_results.add((str(agent_id), sequence))
+                collect_event(str(event_type), value, agent_id, int(sequence))
         if "http_interactions" in tables:
             http_interactions = int(
                 connection.execute(
@@ -492,8 +583,79 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                 if table in tables and "agents" in tables
                 else 0
             )
+        if "shell_tasks" in tables:
+            # The task table remains authoritative when a terminal event was
+            # not delivered before shutdown.  Preserve event cleanup details.
+            terminal_statuses = {
+                "completed", "failed", "timeout", "stopped", "interrupted", "cancelled"
+            }
+            for task_id, status, exit_code, timed_out, finished_at, cleanup_reason in connection.execute(
+                "SELECT task_id,status,exit_code,timed_out,finished_at,cleanup_reason "
+                "FROM shell_tasks WHERE run_id=?",
+                (run_id,),
+            ):
+                if status not in terminal_statuses:
+                    continue
+                key = (run_id, str(task_id))
+                event_item = shell_terminal_by_task.get(key, {})
+                shell_terminal_by_task[key] = {
+                    **event_item,
+                    "task_id": str(task_id),
+                    "status": status,
+                    "exit_code": exit_code,
+                    "timed_out": bool(timed_out),
+                    "finished_at": finished_at,
+                    "cleanup": event_item.get("cleanup") or ({"termination_reason": cleanup_reason} if cleanup_reason else {}),
+                    "sequence": event_item.get("sequence", 0),
+                }
+        hint_delivery = hint_delivery_metrics(connection, run_id)
+    shell_execution = {
+        "terminal_task_count": len(shell_terminal_by_task),
+        "completed_count": 0,
+        "failed_count": 0,
+        "timeout_count": 0,
+        "stopped_count": 0,
+        "interrupted_count": 0,
+        "cancelled_count": 0,
+        "nonzero_exit_count": 0,
+        "unknown_exit_code_count": 0,
+        "timed_out_count": 0,
+        "termination_reasons": {},
+    }
+    for item in shell_terminal_by_task.values():
+        status = str(item.get("status") or "unknown")
+        key = f"{status}_count"
+        if key in shell_execution:
+            shell_execution[key] += 1
+        exit_code = item.get("exit_code")
+        if exit_code is None:
+            shell_execution["unknown_exit_code_count"] += 1
+        elif exit_code != 0:
+            shell_execution["nonzero_exit_count"] += 1
+        if item.get("timed_out") is True:
+            shell_execution["timed_out_count"] += 1
+        cleanup = item.get("cleanup") if isinstance(item.get("cleanup"), dict) else {}
+        reason = cleanup.get("termination_reason")
+        if reason:
+            reasons = shell_execution["termination_reasons"]
+            reasons[str(reason)] = reasons.get(str(reason), 0) + 1
     return {
+        "reviews": {**review_metrics, "covered_result_count": len(covered_results & execution_results)},
+        "stagnation": stagnation_metrics,
+        "parameter_errors": parameter_errors,
+        "preflight": preflight,
+        "completion_reasons": completion_reasons,
+        "hint_delivery": hint_delivery,
+        "observer": {"outcomes": observer_outcomes, "failure_stages": observer_failures,
+                     "trimmed_entries": observer_trimmed, "skipped_events": observer_skipped,
+                     "received_revisions": len(observer_received), "tension_entries": observer_tensions,
+                     "solver_reported_assessments": observer_assessments,
+                     "verified_correction_count": observer_corrections.get("resolved", 0),
+                     "corrections": {**observer_corrections,
+                                     "delivered": len(correction_deliveries),
+                                     "feedback": sum(observer_assessments.values())}},
         "run_id": run_id,
+        "token_usage": token_usage,
         "status": row[0],
         "last_sequence": row[1],
         "model_latency_ms": _summary(model_latency),
@@ -531,31 +693,27 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         "tool_total_latency_ms": _summary(tool_total),
         "tool_result_persisted_count": persisted_results,
         "tool_failures": dict(sorted(tool_failures.items())),
+        "shell_execution": shell_execution,
         "critical_tools": dict(sorted(critical_tool_results.items())),
         "competition_flow": {
-            "dispatch_latency_ms": _summary(dispatch_latency),
             "model_rounds_to_dispatch": _summary(model_rounds_to_dispatch),
-            "soft_guard_warning_count": soft_guard_warnings,
-            "report_items_dropped": report_items_dropped,
             "first_useful_tool_round": _summary(
                 list(first_useful_round_by_agent.values())
             ),
             "evidence_ref_count": evidence_ref_count,
-            "low_yield_count": low_yield_count,
             "request_reference_error_count": request_reference_errors,
-            "first_dispatch_success_rate": (
+            "first_delegation_success_rate": (
                 round(
-                    sum(first_dispatch_result_by_agent.values())
-                    / len(first_dispatch_result_by_agent),
+                    sum(first_delegation_result_by_agent.values())
+                    / len(first_delegation_result_by_agent),
                     4,
                 )
-                if first_dispatch_result_by_agent
+                if first_delegation_result_by_agent
                 else None
             ),
             "model_latency_share": (
                 round(
-                    sum(model_latency)
-                    / (sum(model_latency) + sum(tool_execution)),
+                    sum(model_latency) / (sum(model_latency) + sum(tool_execution)),
                     4,
                 )
                 if model_latency or tool_execution
@@ -564,9 +722,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         },
         "findings": {
             "received": findings_received,
-            "normalized": findings_normalized,
             "persisted": findings_persisted,
-            "dropped": findings_dropped,
             "persistence_rate": (
                 round(findings_persisted / findings_received, 4)
                 if findings_received
@@ -576,12 +732,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         "flags": {
             "candidate_count": candidate_flags,
             "submission_count": flag_submissions,
-            "accepted_count": flag_submissions_accepted,
-        },
-        "bootstrap": {
-            **bootstrap_events,
-            "shared_report_count": bootstrap_shared_reports,
-            "candidate_flag_count": bootstrap_candidate_flags,
+            "correct_count": flag_submissions_correct,
         },
         "context_budget": {
             "preflight_count": context_budget_preflights,
@@ -589,10 +740,8 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             "soft_limit_exceeded_count": context_soft_limit_exceeded,
             "capacity_deferred_count": context_capacity_deferred,
         },
-        "controller_recovery": {
-            "scheduled_count": controller_recovery_scheduled,
-            "recovered_count": controller_recovered,
-            "latency_ms": _summary(controller_recovery_latency),
+        "model_recovery": {
+            "attempts": model_recoveries,
             "runtime_fatal_error_count": runtime_fatal_errors,
         },
         "context_compaction": {
@@ -657,17 +806,16 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             "candidate_presentation_rate": (
                 round(
                     len(skill_candidate_agents)
-                    / sum(role == "execution" for role in agent_roles.values()),
+                    / sum(role == "worker" for role in agent_roles.values()),
                     4,
                 )
-                if any(role == "execution" for role in agent_roles.values())
+                if any(role == "worker" for role in agent_roles.values())
                 else None
             ),
             "model_activation_agent_count": len(skill_model_activation_agents),
             "model_activation_rate": (
                 round(
-                    len(skill_model_activation_agents)
-                    / len(skill_candidate_agents),
+                    len(skill_model_activation_agents) / len(skill_candidate_agents),
                     4,
                 )
                 if skill_candidate_agents

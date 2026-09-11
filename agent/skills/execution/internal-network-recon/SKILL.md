@@ -1,36 +1,53 @@
 ---
 name: internal-network-recon
 description: >-
-  Perform bounded authorized internal-network discovery, service identification,
-  and evidence collection. Confirm scope and reachability, poll owned discovery
-  tasks, and select the smallest next validation branch without broad scanning.
+  网络可达性、启动连接失败、客户端差异复验、服务识别、传输协议与应用结果分层。
+  Calibrate authorized host/service reachability when clients disagree or a startup
+  connection fails, then identify only evidenced services. Separate transport,
+  protocol parsing and application results before drawing negative conclusions.
 ---
 
-# Internal network reconnaissance
+# Reachability before service discovery
 
-Start with scope and an explicit hypothesis. Discovery results are inventory, not
-proof of a vulnerability or authorization to access every host.
+Record authorized hosts/ranges, evidence for candidate services and the question to
+answer. Existing reachability or service evidence may suffice; do not start a scan
+when a known endpoint and a small control can resolve the uncertainty.
 
-## Workflow
+## Calibrate comparable conditions
 
-1. Record authorized CIDRs/hosts, ports, rate limits, and the question to answer.
-2. Create one bounded `system_network_discovery` task and retain its task ID.
-3. Poll with `system_network_output`; never replay the scan to check progress.
-4. Normalize live hosts, ports, banners, protocols, confidence, and ownership.
-5. Use `pentest_service_probe` only to clarify a specific service or banner.
-6. Map each service to one next hypothesis: authentication, protocol behavior,
-   SSH access, internal web, or binary service. Do not start all branches at once.
-7. Stop when the hypothesis is answered, the target is outside scope, or the
-   result cannot support a narrower validation task.
+A connection failure describes one attempt at a particular time, from a particular
+client to a particular target. If a later HTTP request succeeds, do not preserve the
+old failure as a permanent Shell network restriction. Recheck the affected client
+against the same known-ready endpoint with comparable method, identity and network
+conditions. HTTP success alone does not establish another port is open.
 
-## Required evidence
+If controls still disagree, record client/proxy/encoding differences and the missing
+premise; do not expand discovery to compensate for an unvalidated client. Recalibrate
+only conclusions affected by readiness, client, identity or environment changes.
 
-Include scope, task ID, timestamps, hosts/ports examined, open-service inventory,
-probe limitations, and evidence references. Distinguish `open`, `reachable`,
-`authenticated`, and `vulnerable`; they are not interchangeable.
+## Choose the smallest next operation
 
-## Tool guidance
+Use system_network_discovery only when existing evidence leaves a bounded inventory
+question. Retain its task ID and read system_network_output; do not relaunch to poll.
+Use pentest_service_probe to clarify a specific service. Read errors and output before
+classifying hosts/ports, recording examined scope and limitations.
 
-Use `system_network_discovery`, `system_network_output`, and
-`pentest_service_probe`. Preserve the returned IDs and finish with exactly one
-`execution_report`.
+Distinguish open/reachable, identified protocol, authenticated and verified application
+behavior. They are not interchangeable. Transport timeout, EOF or reset can coexist
+with received bytes; parse errors can reflect client assumptions. Neither establishes
+application filtering or rejection without a valid protocol/control.
+
+Search existing protocol tools and retrieve their exact schemas before writing a
+client. For an evidenced FastCGI service, read `references/fastcgi-validation.md`.
+Do not assume a service port or server-side path from a historical example.
+
+## Stop and report
+
+Stop when the question is answered, scope ends, controls are unavailable, or no
+narrower test is justified. After repeated no-information tests, reassess the premise;
+changing clients without a distinguishing condition is not new evidence.
+
+Report target scope, timestamp/client conditions, task/read refs, transport versus
+protocol/application results, bounded conclusions and the next uncertainty. Use
+solver_progress or worker_report for your role. Discovery is inventory, not proof
+of a vulnerability or permission to access additional hosts.

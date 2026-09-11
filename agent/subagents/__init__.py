@@ -1,28 +1,6 @@
-"""Role-scoped Agent orchestration primitives."""
+"""Chief, Solver and explicit Worker orchestration."""
 
-from .models import (
-    AgentReport,
-    AgentRole,
-    ExecutionReport,
-)
+from .models import AgentRole
 from .policy import AgentPolicy
 from .supervisor import AgentSupervisor, SubagentError
-from .tools import (
-    AgentControlTools,
-    ChallengeAgentTools,
-    ChiefAgentTools,
-    ExecutionAgentTools,
-)
-
-__all__ = [
-    "AgentControlTools",
-    "AgentPolicy",
-    "AgentReport",
-    "AgentRole",
-    "AgentSupervisor",
-    "ChallengeAgentTools",
-    "ChiefAgentTools",
-    "ExecutionAgentTools",
-    "ExecutionReport",
-    "SubagentError",
-]
+from .tools import AgentControlTools

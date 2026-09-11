@@ -48,7 +48,7 @@ Do not install packages, fetch a fuzzer, or invent coverage numbers.
 Use `system_shell` only for bounded local scripts or supplied harnesses. Use
 `pwn_process_open`/`pwn_session_io` for an assigned Linux process or protocol when
 appropriate, `bin_debug` for focused analysis, and `pwn_session_close` for cleanup.
-Finish with one `execution_report` containing the complete evidence references.
+Finish with one `worker_report` (Worker) or `solver_progress` (Solver) containing the complete evidence references.
 
 ## Stop conditions
 

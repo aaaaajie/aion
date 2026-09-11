@@ -58,3 +58,12 @@ sqli_work/
 *.tsv
 *_probe*.json
 probe-*.json
+!scripts/seal_enhanced_toolchain.py
+!scripts/check_enhanced_toolchain.py
+
+# Chromium runtime assets include .bin and HTML files.
+!tools/binaries/playwright-browsers/**
+
+!tools/binaries/cyberchef/**
+!scripts/build_cyberchef_python.py
+!scripts/check_cyberchef_toolchain.py

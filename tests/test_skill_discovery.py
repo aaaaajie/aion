@@ -128,16 +128,19 @@ async def test_discovery_model_presents_candidates_without_activation(
         task_stage="validation",
         hypothesis="sql-login",
     )
-    assert [item.skill_id for item in result.candidates] == [
-        "execution/sql-injection"
-    ]
+    assert [item.skill_id for item in result.candidates] == ["execution/sql-injection"]
     assert result.source == "model"
     assert calls[0]["model"] == "discovery-model"
     assert calls[0]["thinking"] == {"type": "disabled"}
     assert calls[0]["temperature"] == 0
     assert calls[0]["max_tokens"] == 512
     event_types = [item["event_type"] for item in service.events]
-    assert event_types == ["skill_discovery_started", "skill_discovery_completed"]
+    assert event_types == [
+        "skill_discovery_started",
+        "model_call_started",
+        "model_call_finished",
+        "skill_discovery_completed",
+    ]
     assert "reason" not in service.events[-1]["payload"]
     await discovery.close()
     await client.aclose()
@@ -213,11 +216,14 @@ async def test_discovery_timeout_uses_local_candidates(
     )
     assert result.source == "local_fallback"
     assert result.latency_ms < 500
-    assert next(
-        item
-        for item in service.events
-        if item["event_type"] == "skill_discovery_failed"
-    )["payload"]["failure_code"] == "timeout"
+    assert (
+        next(
+            item
+            for item in service.events
+            if item["event_type"] == "skill_discovery_failed"
+        )["payload"]["failure_code"]
+        == "timeout"
+    )
     await discovery.close()
     await client.aclose()
 

@@ -43,4 +43,4 @@ AI 测试只对存在对应模型输入、检索、工具、记忆或敏感数�
 
 ## 统一交付
 
-每个执行任务必须包含目标、假设、工具调用、验证状态、证据引用、停止原因和清理状态，并最终只提交一个规范的 `execution_report`。缺少工具、超时、平台不匹配或目标不可达时使用明确状态（如 `ENTRY_UNREACHABLE`、`DEPENDENCY_UNAVAILABLE`、`TIMEOUT`、`INCONCLUSIVE`），不静默降级。
+每个执行任务必须包含目标、假设、工具调用、验证状态、证据引用、停止原因和清理状态，并最终只提交一个规范的 `worker_report` (Worker) or `solver_progress` (Solver)。缺少工具、超时、平台不匹配或目标不可达时使用明确状态（如 `ENTRY_UNREACHABLE`、`DEPENDENCY_UNAVAILABLE`、`TIMEOUT`、`INCONCLUSIVE`），不静默降级。

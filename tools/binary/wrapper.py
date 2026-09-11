@@ -7,6 +7,9 @@ from collections.abc import Mapping
 import os
 import re
 import struct
+import shlex
+
+from tools.system.shell import AgentShellClient
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +38,6 @@ from .models import (
 )
 from .session import BinarySessionError, BinarySessionManager
 
-
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _POP_RET_RE = re.compile(rb"^\x5b\xc3$|^\x5e\xc3$|^\x5f\xc3$|^\x58\xc3$")
 _RET_RE = re.compile(rb"^\xc3$")
@@ -50,8 +52,10 @@ class BinaryTools:
         *,
         toolchain_root: str | os.PathLike[str] | None = None,
         session_manager: BinarySessionManager | None = None,
+        shell: AgentShellClient | None = None,
     ) -> None:
         self.root = Path(root).resolve()
+        self._shell = shell
         self._toolchain = toolchain_for(toolchain_root)
         self._sessions = session_manager or BinarySessionManager(self.root)
 
@@ -79,6 +83,7 @@ class BinaryTools:
                     "magic": path.read_bytes()[:16].hex(),
                 }
             return {
+                "ok": True,
                 "data": result,
                 "_aion_evidence": {
                     "evidence_type": "binary",
@@ -103,6 +108,7 @@ class BinaryTools:
                 rf"[ -~]{{{arguments.min_length},}}", decoded, flags=re.DOTALL
             )
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "count": min(len(matches), arguments.limit),
@@ -135,6 +141,7 @@ class BinaryTools:
                     },
                 }
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "nx": result["nx"],
@@ -162,6 +169,7 @@ class BinaryTools:
                 return _file_error(path)
             values = _extract_symbols(path)
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "count": min(len(values), arguments.limit),
@@ -188,6 +196,7 @@ class BinaryTools:
             ]
             instructions = _capstone_disassemble(path, chunk, arguments.offset)
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "offset": arguments.offset,
@@ -220,7 +229,11 @@ class BinaryTools:
                         "stage": "schema",
                         "code": "invalid_hex",
                         "message": "expected_hex and patch_hex must be hexadecimal",
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {},
                     },
                 }
@@ -233,7 +246,11 @@ class BinaryTools:
                         "stage": "schema",
                         "code": "patch_length_mismatch",
                         "message": "expected_hex and patch_hex must have equal length",
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {},
                     },
                 }
@@ -246,7 +263,11 @@ class BinaryTools:
                         "stage": "semantic",
                         "code": "patch_out_of_bounds",
                         "message": "The patch range exceeds the file size",
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {"file_size": len(raw)},
                     },
                 }
@@ -257,12 +278,17 @@ class BinaryTools:
                         "stage": "semantic",
                         "code": "patch_mismatch",
                         "message": "Bytes at the offset do not match expected_hex",
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {"actual_hex": raw[arguments.offset : end].hex()},
                     },
                 }
             path.write_bytes(raw[: arguments.offset] + patch + raw[end:])
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "offset": arguments.offset,
@@ -291,7 +317,11 @@ class BinaryTools:
                         "stage": "schema",
                         "code": "value_overflow",
                         "message": str(exc),
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {},
                     },
                 }
@@ -304,11 +334,16 @@ class BinaryTools:
                         "stage": "schema",
                         "code": "value_overflow",
                         "message": "The value does not fit the requested width",
-                        "retry": {"allowed": True, "action": "rewrite_arguments", "tool": None},
+                        "retry": {
+                            "allowed": True,
+                            "action": "rewrite_arguments",
+                            "tool": None,
+                        },
                         "details": {},
                     },
                 }
             return {
+                "ok": True,
                 "data": {"hex": encoded.hex(), "packed_bytes": len(encoded)},
                 "_aion_evidence": {
                     "evidence_type": "payload",
@@ -332,18 +367,36 @@ class BinaryTools:
                     vaddr = segment["vaddr"] + (index - start)
                     if _RET_RE.match(bytes([byte])):
                         gadgets.append(
-                            {"address": hex(vaddr), "gadget": "ret", "bytes": raw[index : index + 1].hex()}
+                            {
+                                "address": hex(vaddr),
+                                "gadget": "ret",
+                                "bytes": raw[index : index + 1].hex(),
+                            }
                         )
-                    elif byte in {0x58, 0x5B, 0x5E, 0x5F} and index + 1 < end and raw[index + 1] == 0xC3:
-                        name = {0x58: "pop rax", 0x5B: "pop rbx", 0x5E: "pop rsi", 0x5F: "pop rdi"}[byte]
+                    elif (
+                        byte in {0x58, 0x5B, 0x5E, 0x5F}
+                        and index + 1 < end
+                        and raw[index + 1] == 0xC3
+                    ):
+                        name = {
+                            0x58: "pop rax",
+                            0x5B: "pop rbx",
+                            0x5E: "pop rsi",
+                            0x5F: "pop rdi",
+                        }[byte]
                         gadgets.append(
-                            {"address": hex(vaddr), "gadget": name, "bytes": raw[index : index + 2].hex()}
+                            {
+                                "address": hex(vaddr),
+                                "gadget": name,
+                                "bytes": raw[index : index + 2].hex(),
+                            }
                         )
                     if len(gadgets) >= arguments.limit * 4:
                         break
                 if len(gadgets) >= arguments.limit * 4:
                     break
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "count": len(gadgets[: arguments.limit]),
@@ -369,6 +422,7 @@ class BinaryTools:
                 else by_name
             )
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "symbol_count": len(target),
@@ -403,6 +457,7 @@ class BinaryTools:
                     }
                 )
             return {
+                "ok": True,
                 "data": {
                     "file_path": str(path),
                     "instruction_count": len(instructions),
@@ -419,37 +474,41 @@ class BinaryTools:
             assert isinstance(arguments, GdbArguments)
             try:
                 gdb = self._toolchain.command("gdb")
-                output = await asyncio.create_subprocess_exec(
-                    gdb,
-                    "-q",
-                    "-batch",
-                    "-ex",
-                    arguments.script,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                stdout, _ = await asyncio.wait_for(
-                    output.communicate(), timeout=arguments.timeout
+                if self._shell is None:
+                    return _tool_error(
+                        "gdb",
+                        "sandbox_unavailable",
+                        "Debugging requires an owned Agent Shell",
+                    )
+                result = await self._shell.run_shell(
+                    shlex.join([gdb, "-q", "-batch", "-ex", arguments.script]),
+                    cwd=".",
+                    timeout=arguments.timeout,
+                    max_output_chars=arguments.max_output_chars,
+                    run_in_background=False,
                 )
             except ToolchainError as exc:
                 return _tool_error("gdb", "bundled_tool_unavailable", str(exc))
-            except asyncio.TimeoutError:
-                output.kill()
-                await output.communicate()
-                return _tool_error("gdb", "gdb_timeout", "gdb exceeded the bounded timeout")
-            except OSError as exc:
-                return _tool_error("gdb", "gdb_start_failed", str(exc))
-            text = stdout.decode("utf-8", errors="replace")
+            if result.get("timed_out"):
+                return _tool_error(
+                    "gdb", "gdb_timeout", "gdb exceeded the bounded timeout"
+                )
+            text = result.get("output", "")
             if len(text) > arguments.max_output_chars:
                 text = text[: arguments.max_output_chars] + "\n...[truncated]"
             return {
+                "ok": True,
                 "data": {
-                    "returncode": output.returncode,
+                    "returncode": result.get("exit_code"),
                     "output": text,
+                    "cleanup": result.get("cleanup"),
                 },
                 "_aion_evidence": {
                     "evidence_type": "binary",
-                    "content": {"returncode": output.returncode, "output": text[-2_000:]},
+                    "content": {
+                        "returncode": result.get("exit_code"),
+                        "output": text[-2_000:],
+                    },
                     "metadata": {"tool": "gdb"},
                 },
             }
@@ -459,8 +518,11 @@ class BinaryTools:
             try:
                 result = await self._sessions.open_process(arguments)
             except BinarySessionError as exc:
-                return _tool_error("pwn_process_open", exc.code, str(exc), details=exc.details)
+                return _tool_error(
+                    "pwn_process_open", exc.code, str(exc), details=exc.details
+                )
             return {
+                "ok": True,
                 "data": result,
                 "_aion_evidence": {
                     "evidence_type": "binary_session",
@@ -478,12 +540,18 @@ class BinaryTools:
             try:
                 result = await self._sessions.open_tcp(arguments)
             except BinarySessionError as exc:
-                return _tool_error("pwn_tcp_open", exc.code, str(exc), details=exc.details)
+                return _tool_error(
+                    "pwn_tcp_open", exc.code, str(exc), details=exc.details
+                )
             return {
+                "ok": True,
                 "data": result,
                 "_aion_evidence": {
                     "evidence_type": "network_session",
-                    "content": {"session_id": result["session_id"], "kind": result["kind"]},
+                    "content": {
+                        "session_id": result["session_id"],
+                        "kind": result["kind"],
+                    },
                     "metadata": {"host": arguments.host, "port": arguments.port},
                 },
             }
@@ -493,8 +561,11 @@ class BinaryTools:
             try:
                 result = await self._sessions.io(arguments)
             except BinarySessionError as exc:
-                return _tool_error("pwn_session_io", exc.code, str(exc), details=exc.details)
+                return _tool_error(
+                    "pwn_session_io", exc.code, str(exc), details=exc.details
+                )
             return {
+                "ok": True,
                 "data": result,
                 "_aion_evidence": {
                     "evidence_type": "binary_session",
@@ -512,8 +583,10 @@ class BinaryTools:
             try:
                 result = await self._sessions.close(arguments.session_id)
             except BinarySessionError as exc:
-                return _tool_error("pwn_session_close", exc.code, str(exc), details=exc.details)
-            return {"data": result}
+                return _tool_error(
+                    "pwn_session_close", exc.code, str(exc), details=exc.details
+                )
+            return {"ok": True, "data": result}
 
         return [
             ToolSpec(
@@ -605,21 +678,27 @@ class BinaryTools:
                 "Open one bounded TCP/TLS session for an assigned binary protocol target.",
                 PwnTcpOpenArguments,
                 pwn_tcp_open,
-                lambda arguments: (AccessClaim("write", f"network:{arguments.host}:{arguments.port}"),),
+                lambda arguments: (
+                    AccessClaim("write", f"network:{arguments.host}:{arguments.port}"),
+                ),
             ),
             ToolSpec(
                 "pwn_session_io",
                 "Exchange bounded binary-safe bytes with an owned process or TCP session; use base64 for non-text data and optional receive markers for framed protocols.",
                 PwnSessionIoArguments,
                 pwn_session_io,
-                lambda arguments: (AccessClaim("write", f"binary-session:{arguments.session_id}"),),
+                lambda arguments: (
+                    AccessClaim("write", f"binary-session:{arguments.session_id}"),
+                ),
             ),
             ToolSpec(
                 "pwn_session_close",
                 "Close one owned process or TCP binary session.",
                 PwnSessionCloseArguments,
                 pwn_session_close,
-                lambda arguments: (AccessClaim("write", f"binary-session:{arguments.session_id}"),),
+                lambda arguments: (
+                    AccessClaim("write", f"binary-session:{arguments.session_id}"),
+                ),
             ),
         ]
 
@@ -652,7 +731,11 @@ def _has_canary(path: Path) -> bool:
         return False
     return any(
         marker in text
-        for marker in ("__stack_chk_fail", "__stack_chk_guard", "__intel_security_cookie")
+        for marker in (
+            "__stack_chk_fail",
+            "__stack_chk_guard",
+            "__intel_security_cookie",
+        )
     )
 
 
@@ -696,7 +779,9 @@ def _has_fortify(path: Path) -> bool:
     return "_chk" in text
 
 
-def _capstone_disassemble(path: Path, chunk: bytes, offset: int) -> list[dict[str, Any]]:
+def _capstone_disassemble(
+    path: Path, chunk: bytes, offset: int
+) -> list[dict[str, Any]]:
     """Decode a bounded ELF chunk when the pinned Capstone wheel is available."""
 
     try:
@@ -727,7 +812,16 @@ def _extract_symbols(path: Path) -> list[dict[str, Any]]:
 
     raw = path.read_bytes()
     names: dict[str, dict[str, Any]] = {}
-    for marker in (b"__stack_chk_fail", b"__libc_start_main", b"system", b"puts", b"printf", b"open", b"read", b"write"):
+    for marker in (
+        b"__stack_chk_fail",
+        b"__libc_start_main",
+        b"system",
+        b"puts",
+        b"printf",
+        b"open",
+        b"read",
+        b"write",
+    ):
         index = raw.find(marker)
         if index >= 0:
             names[marker.decode()] = {"name": marker.decode(), "address": hex(index)}

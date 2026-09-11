@@ -38,7 +38,7 @@ an exploit, or treat missing measurements as zero.
 
 Use `evidence_read`, `system_read_file`, and `system_shell` only for owned local
 aggregation files. Do not use HTTP, network discovery, SSH, binary sessions, or
-credential tools from this Skill. Finish with one `execution_report`.
+credential tools from this Skill. Finish with one `worker_report` (Worker) or `solver_progress` (Solver).
 
 ## Required report
 

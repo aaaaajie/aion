@@ -1,51 +1,53 @@
 ---
 name: sqli-sql-injection
-description: Bounded SQL injection playbook for login and authentication forms, request parameters, search, filtering, sorting, reports, exports, and SQLite/MySQL/PostgreSQL operations; covers manual differential checks, sqlmap, boolean, time, error, and blind injection.
-when_to_use: Use when the assigned branch names SQLi, SQL injection, sqlmap, blind or time-based SQL, a database error, or a login/authentication form returns a stable 500/5xx that needs SQLi triage. Not for generic Web reconnaissance, default-credential testing, or unrelated command injection.
+description: >-
+  SQL 注入假设验证、稳定页面错误、请求有效性、阴性结论边界、换工具仍属同一假设。
+  Evaluate a concrete SQL-input hypothesis in authorized login, search, filter or
+  report requests; distinguish database behavior from stable page errors and
+  bound negative results to valid controls and tested inputs.
+when_to_use: Use for a concrete SQL hypothesis, database error or reproducible input/timing differential; a stable login 5xx calls for request/layer validation before SQL-specific detection. Not generic reconnaissance.
 ---
 
-# Sqli Sql Injection Skill
+# Bounded SQL-input validation
 
-## Purpose
+## Verify the request before the mechanism
 
-Determine whether an authorized target input reaches SQL queries, especially when a login form is unusable. A stable 500/5xx is evidence of an application failure, not proof of SQL injection or proof that SQL injection is absent; first test whether the response is input-controlled.
+Record endpoint, method, parameter, body encoding, headers, identity/CSRF and a
+normal control with status, response structure and latency. Verify that the input
+reaches the intended handler. Missing prerequisites, an expired session, unread
+output or an unvalidated client make the experiment inconclusive.
 
-## When to use
+Separate initial response, redirect, Cookie changes and the later authenticated
+business control from page rendering. A stable 500 proves neither SQL execution
+nor its absence. A Cookie or redirect alone is not proof of a valid identity.
 
-Use when the task or current evidence includes one of these high-signal conditions:
+## Select a distinguishing check
 
-- an explicit `sqli`, `SQL injection`, `login-sqli`, `sqlmap`, blind-SQL, or time-based-SQL hypothesis;
-- a login or authentication form with a stable 500/5xx, database error, or reproducible response/timing differential;
-- a request parameter, cookie, header, search, filter, sort, report, or export field suspected to reach a database query.
+State the specific input-to-query hypothesis and expected observable difference.
+Use a bounded controlled pair supported by current evidence; keep other conditions
+fixed. A single expression with no delay/difference constrains only that expression
+under those conditions, not all SQL mechanisms or every request reaching a database.
+Timing interpretation requires a stable normal control, not an isolated duration.
 
-Do not auto-activate for a generic Web task, ordinary login/default-credential testing, or shell/command injection.
+Use manual checks or `pentest_sqlmap` when they can answer this question. sqlmap
+is optional, requires the exact reproducible request and bounded scope/budget,
+and is not automatically warranted by a form or a constant error. Search its schema
+before use. Read output and verify any claimed result with an independent control.
+Do not perform full-database extraction as part of detection.
 
-## Fixed workflow
+Keep the same hypothesis_id when switching between manual checks and sqlmap for
+the same mechanism. Tool choice is not a new hypothesis. After two valid tests add
+no information, reassess request validity and the premise; further tests require
+new evidence or a condition that can distinguish the remaining possibilities.
 
-1. Capture the exact request: URL, method, parameter names, form body, content type, relevant headers, cookies, CSRF value, and the baseline status/body hash/latency.
-2. Triage the login failure. Compare a baseline with a small number of controlled true/false/error inputs. A constant 500 with no input or timing difference is an application/template/DB failure hypothesis, not a confirmed SQLi result.
-3. If there is a concrete parameter and the request is reproducible, call `pentest_sqlmap` once with the exact URL/body and bounded level, risk, status-code handling, and timeout. Do not dump the database or use an unbounded scan.
-4. If sqlmap is unavailable, the request format is unsupported, or the result is ambiguous, perform a bounded manual boolean/error/time-differential check. Change the hypothesis or input between attempts; never repeat the same original arguments.
-5. Validate the result independently with a clean request and preserve the request metadata, status/body hashes, latency comparison, sqlmap output, and evidence reference. Stop with an explicit `confirmed`, `rejected`, `entry_unreachable`, or `inconclusive` status.
+## Report and stop
 
-For a login branch, separate the work into `login-sqli-differential` and `login-sqli-sqlmap` hypotheses so the controller can see whether the failure was caused by an unreachable form, a stable server error, or an input-controlled SQL behavior.
+Preserve input, endpoint, client, identity, environment, control/result evidence and
+what remains untested. Report confirmed, rejected for the specific tested condition,
+or inconclusive with missing prerequisites. Stop when the question is answered or
+no distinguishing test is supported; do not turn tool failure into target rejection.
 
-## Avoid
-
-- Do not act outside the authorized competition scope.
-- Do not call sqlmap without a concrete parameter or exact reproducible request.
-- Do not repeat a failed action with the same original arguments.
-- Do not perform unbounded brute force, full-database extraction, or unnecessary data collection.
-- Do not treat a stable 500, tool output, or model claim as proof without independent validation.
-
-## Success Criteria
-
-A successful result requires:
-- reproducible behavior
-- recorded evidence
-- independently verified impact
-- a clear stop condition and final status
-
-## Detailed Workflow
-
-Read `references/detailed-workflow.md` only after the Skill is selected and the current evidence matches this vulnerability family. For sqlmap-specific flags read `references/SQLMAP_ADVANCED.md`; for login/database-error cases read the relevant section of `references/SCENARIOS.md`. Read only the relevant section and keep the current atomic task, tool budget, evidence target, and stop condition unchanged.
+Read `references/detailed-workflow.md` for a matching mechanism, and
+`references/SQLMAP_ADVANCED.md` only when sqlmap-specific options are needed.
+Use the relevant section of `references/SCENARIOS.md` for request context;
+these references do not override the validity and stop conditions above.

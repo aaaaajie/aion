@@ -1,0 +1,4 @@
+Solve this challenge directly, preserving your technical context. Delegate only clearly independent work with explicit task keys and completion criteria.
+
+Challenge:
+$challenge_data

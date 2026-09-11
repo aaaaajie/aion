@@ -24,18 +24,15 @@ ciphey -f encrypted.txt
 
 Ciphey 支持：Base64/32/16、Caesar、Vigenere、XOR、AES（弱密钥）、Morse、Binary、Hex、URL encoding、HTML entities、哈希识别等。
 
-### CyberChef 使用
+### CyberChef 使用（AION 已集成）
 
-```text
-在线版：https://gchq.github.io/CyberChef/
-离线版：下载 GitHub Release 的 HTML 文件直接打开
+优先搜索 `system_cyberchef`。以 `action=operations` 查询操作及参数，再提交 JSON recipe；通过 `system_task_output` 读取后台结果与精确字节产物。
 
-常用 Recipe：
-- From Base64 → 解 Base64
-- XOR → 异或解密（可暴力尝试 key）
-- AES Decrypt → AES 解密
-- Magic → 自动检测编码类型
+```json
+{"input":"aGVsbG8=","recipe":[{"op":"From Base64"}]}
 ```
+
+支持工作区 `input_path`、XOR、带密钥 AES/RSA、压缩、哈希和常见编码。密钥、IV、模式、输入编码要分别确认。Magic 和通用脚本不在此 CLI 的开放范围内；未知操作明确报错。哈希识别、可读输出和 XOR 候选不等于已确认解密成功，需用格式或已知明文验证。不要在运行时 pip/npm 安装工具。
 
 ---
 

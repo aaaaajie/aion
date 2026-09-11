@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+# The executable is deliberately only a launcher.  Python 3.11 is supplied by
+# the AION image and the engine itself lives in the application tree.
+binary_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+tool_root=$(CDPATH= cd -- "$binary_dir/../../.." && pwd)
+export PYTHONPATH="$tool_root${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m tools.cyberchef.cli "$@"

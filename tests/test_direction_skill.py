@@ -12,7 +12,9 @@ class SkillState:
     def __init__(self) -> None:
         self.values: list[str] = []
 
-    async def activate_agent_skill(self, run_id: str, agent_id: str, **value: Any) -> dict[str, Any]:
+    async def activate_agent_skill(
+        self, run_id: str, agent_id: str, **value: Any
+    ) -> dict[str, Any]:
         self.values.append(value["skill_id"])
         active = {
             "skill_id": value["skill_id"],
@@ -43,88 +45,36 @@ def catalog(tmp_path: Path) -> SkillCatalog:
 
 
 @pytest.mark.asyncio
-async def test_execution_candidate_requires_model_confirmation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", ["solver", "worker"])
+async def test_skill_search_is_on_demand_and_explicit_activation_survives_resume(
+    tmp_path: Path, role: str
+) -> None:
     state = SkillState()
+    compiled = catalog(tmp_path)
     context = SkillSessionContext(
-        catalog(tmp_path),
-        role="execution",
-        service=state,  # type: ignore[arg-type]
+        compiled,
+        role=role,
+        service=state,
         run_id="run",
         agent_id="agent",
-        selection_text="Validate SQL injection on the id parameter",
-        presented_candidates=[
-            {
-                "skill_id": "execution/sql-injection",
-                "relevance_reason": "The assignment explicitly names SQL injection.",
-            }
-        ],
     )
-    assert state.values == []
-    assert "<skill_candidates>" in context.render_system_context()
-    assert "The assignment explicitly names SQL injection" in (
-        context.render_system_context()
-    )
-    activated = await context.invoke("execution/sql-injection")
-    assert activated["activation_status"] == "activated"
-    assert state.values == ["execution/sql-injection"]
-
-
-@pytest.mark.asyncio
-async def test_generic_http_baseline_does_not_activate_unrelated_skill(tmp_path: Path) -> None:
-    state = SkillState()
-    context = SkillSessionContext(
-        catalog(tmp_path),
-        role="execution",
-        service=state,  # type: ignore[arg-type]
-        run_id="run",
-        agent_id="agent",
-        selection_text="Collect a normal HTTP service baseline and headers",
-    )
-    assert state.values == []
-    assert "<skill_candidates>" not in context.render_system_context()
-
-
-@pytest.mark.asyncio
-async def test_strong_candidate_stays_model_activated(tmp_path: Path) -> None:
-    state = SkillState()
-    context = SkillSessionContext(
-        catalog(tmp_path),
-        role="execution",
-        service=state,  # type: ignore[arg-type]
-        run_id="run",
-        agent_id="agent",
-        selection_text="login form stable 500 SQL injection sqlmap",
-        presented_candidates=[
-            {
-                "skill_id": "execution/sql-injection",
-                "match_strength": "strong",
-                "recommended": True,
-                "relevance_reason": "The task explicitly tests SQL injection.",
-            }
-        ],
-    )
-
-    assert state.values == []
-    rendered = context.render_system_context()
-    assert "match_strength" in rendered
-    assert "ranking signals, not activation commands" in rendered
-    assert "only tool call in your first" not in rendered
+    assert state.values == [] and context.render_system_context() == ""
+    candidates = context.search("sql injection", limit=5)
+    assert any(item["skill_id"] == "execution/sql-injection" for item in candidates)
+    assert state.values == [] and context.render_system_context() == ""
     activated = await context.invoke("execution/sql-injection")
     assert activated["activation_status"] == "activated"
     assert state.values == ["execution/sql-injection"]
     assert context.active_skills[0]["activation_mode"] == "model"
-
-
-@pytest.mark.asyncio
-async def test_generic_web_branch_does_not_auto_activate_sqli(tmp_path: Path) -> None:
-    state = SkillState()
-    context = SkillSessionContext(
-        catalog(tmp_path),
-        role="execution",
-        service=state,  # type: ignore[arg-type]
+    rendered = context.render_system_context()
+    assert "<active_skills>" in rendered and "Bounded work." in rendered
+    restored = SkillSessionContext(
+        compiled,
+        role=role,
+        service=state,
         run_id="run",
         agent_id="agent",
-        selection_text="enumerate ordinary web routes and headers",
+        active_skills=context.active_skills,
     )
-
-    assert state.values == []
+    assert restored.render_system_context() == rendered
+    assert state.values == ["execution/sql-injection"]

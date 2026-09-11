@@ -114,8 +114,20 @@ def _check_bundled_binary(layout: Any, name: str, entry: dict[str, Any]) -> dict
     args = entry.get("version_args", ["--version"])
     if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
         return {"ok": False, "code": "invalid_version_args", "path": str(path)}
+    # Some bundled adapters are small Python entrypoints.  Put the Python
+    # interpreter that is running this validator first so their `python3`
+    # lookup uses the prepared offline venv rather than the host interpreter.
+    runtime_bin = Path(sys.executable).parent
     probe_env = {
-        "PATH": os.pathsep.join((str(layout.bin_dir), "/usr/local/bin", "/usr/bin", "/bin")),
+        "PATH": os.pathsep.join(
+            (
+                str(runtime_bin),
+                str(layout.bin_dir),
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            )
+        ),
         "LC_ALL": "C",
         "LANG": "C",
     }
@@ -193,6 +205,8 @@ def _check_python_bundle(layout: Any, manifest: dict[str, Any]) -> dict[str, Any
 
 
 _PYTHON_PACKAGE_DISTRIBUTIONS = {
+    "playwright": "playwright",
+    "semgrep": "semgrep",
     "pwntools": "pwntools",
     "angr": "angr",
     "capstone": "capstone",
@@ -211,7 +225,27 @@ _TOOL_TO_BINARY = {
     "pentest_auth_brute": "hydra",
     "pentest_sqlmap": "sqlmap",
     "pentest_dir_fuzz": "ffuf",
+    "pentest_jwt": "jwt_tool",
+    "pentest_arjun": "arjun",
 }
+
+
+def _check_enhanced_assets(layout, manifest):
+    if "chromium" not in manifest.get("system_binaries", {}):
+        return {"ok": True, "checked": 0}
+    path = layout.root / "enhanced-assets.sha256.json"
+    try:
+        assets = json.loads(path.read_text())
+        if not assets:
+            raise ValueError("empty asset manifest")
+        for name, expected in assets.items():
+            asset = (layout.root.parent / name).resolve(strict=True)
+            asset.relative_to(layout.root.parent.resolve())
+            if _sha256(asset) != expected:
+                raise ValueError(f"asset checksum mismatch: {name}")
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "checked": len(assets)}
 
 
 def check_tool_chain(root: Path | None = None) -> dict[str, Any]:
@@ -220,9 +254,12 @@ def check_tool_chain(root: Path | None = None) -> dict[str, Any]:
     manifest = load_tool_manifest(root)
     layout = toolchain_for(root)
     python_bundle = _check_python_bundle(layout, manifest)
+    asset_report = _check_enhanced_assets(layout, manifest)
     present: dict[str, dict[str, Any]] = {}
     missing: dict[str, dict[str, Any]] = {}
-    missing_required = False
+    missing_required = not asset_report["ok"]
+    if not asset_report["ok"]:
+        missing["enhanced_assets"] = asset_report
     if not python_bundle["ok"]:
         missing["python_runtime"] = python_bundle
         missing_required = True
@@ -271,6 +308,7 @@ def check_tool_chain(root: Path | None = None) -> dict[str, Any]:
     return {
         "ok": not missing_required,
         "target": target,
+        "enhanced_assets": asset_report,
         "present": present,
         "missing": missing,
         "python_packages": python_packages,

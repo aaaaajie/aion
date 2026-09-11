@@ -14,7 +14,7 @@ Expected path:
    SRC, binary, internal-network, and AI fields.
 4. Compare baseline, AI-only, and AI+Skills rows only where denominators match;
    leave unavailable values explicitly missing.
-5. Finish with one `execution_report` containing summary/detail JSON and source
+5. Finish with one `worker_report` (Worker) or `solver_progress` (Solver) containing summary/detail JSON and source
    report IDs. Do not create network traffic or rerun a validation.
 
 Acceptance: a missing label or denominator yields `inconclusive`, not a fabricated

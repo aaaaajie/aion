@@ -55,6 +55,18 @@
       "package": "pyelftools",
       "purpose": "Structured ELF metadata for Linux binary workflows",
       "required": true
+    },
+    "playwright": {
+      "version": "1.55.0",
+      "package": "playwright",
+      "required": true,
+      "purpose": "Offline browser and source review"
+    },
+    "semgrep": {
+      "version": "1.136.0",
+      "package": "semgrep",
+      "required": true,
+      "purpose": "Offline browser and source review"
     }
   },
   "system_binaries": {
@@ -62,7 +74,9 @@
       "version": "2.6.0",
       "path": "bin/checksec",
       "sha256": "220359d4fc02fc910fc5e373bc42a3285a3a06a85dcd1a925343abd0125c23de",
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "ELF hardening report",
       "required": true
     },
@@ -70,14 +84,18 @@
       "version": "0.18.0",
       "path": "bin/patchelf",
       "sha256": "c93d3159f9154762bd9999a3288237090b087836acae25bbc490fce54c2d0fa2",
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "ELF patching"
     },
     "seccomp-tools": {
       "version": "1.6.3",
       "path": "bin/seccomp-tools",
       "sha256": null,
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "Seccomp BPF disassembly",
       "required": false
     },
@@ -85,7 +103,9 @@
       "version": "6.0.4",
       "path": "bin/radare2",
       "sha256": "d19b8d0c3b9258e79d4b0ae650d27dc40a8ee37307f2bbea90ac2263fe5992bf",
-      "version_args": ["-v"],
+      "version_args": [
+        "-v"
+      ],
       "purpose": "Binary analysis and disassembly",
       "required": true
     },
@@ -93,7 +113,9 @@
       "version": "13.2",
       "path": "bin/gdb",
       "sha256": "122975f0e808793e9caf483dcce41fd92dda309296d897db87b87c45b6e44bf9",
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "Debugger batch scripts",
       "required": true
     },
@@ -101,7 +123,9 @@
       "version": "7.93",
       "path": "bin/nmap",
       "sha256": "2dc380700e92209f39a0c79cf5bb7de4306a47d44be287eed3a6f92b1b864bca",
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "Network service discovery",
       "required": true
     },
@@ -109,7 +133,9 @@
       "version": "9.5",
       "path": "bin/hydra",
       "sha256": null,
-      "version_args": ["-h"],
+      "version_args": [
+        "-h"
+      ],
       "purpose": "Bounded credential testing",
       "required": false
     },
@@ -117,7 +143,9 @@
       "version": "1.8.6",
       "path": "bin/sqlmap",
       "sha256": "13f1c027b2db8e5e97d5f388bdd755aee8d50e936869c7fbad4bda88a31c4607",
-      "version_args": ["--version"],
+      "version_args": [
+        "--version"
+      ],
       "purpose": "SQL injection verification",
       "required": true
     },
@@ -125,9 +153,63 @@
       "version": "2.1.0",
       "path": "bin/ffuf",
       "sha256": "b0183aeed13d3ccea5db79809ca4135b7561257406a0f5d6f982e0551abea4e7",
-      "version_args": ["-V"],
+      "version_args": [
+        "-V"
+      ],
       "purpose": "Directory fuzzing",
       "required": true
+    },
+    "jwt_tool": {
+      "version": "2.3.0-aion1",
+      "path": "bin/jwt_tool",
+      "sha256": "9560a0acac41f4ddaa7109d5618011086f149f172ede93d57bf4fda8f34c7cc0",
+      "version_args": [
+        "--help"
+      ],
+      "version_pattern": "usage: jwt_tool",
+      "source": "https://github.com/ticarpi/jwt_tool",
+      "upstream_version": "2.3.0",
+      "upstream_commit": "3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b",
+      "upstream_license": "GPL-3.0",
+      "purpose": "Offline JWT parsing, signing, verification and bounded auditing",
+      "required": true
+    },
+    "arjun": {
+      "version": "2.2.7-aion1",
+      "path": "bin/arjun",
+      "sha256": "094b65b2dfba47bb1c4da9df56ac1846d8e05ee59e79a13917f900d94f27d48d",
+      "version_args": [
+        "--help"
+      ],
+      "version_pattern": "usage: arjun",
+      "source": "https://github.com/s0md3v/Arjun",
+      "upstream_version": "2.2.7",
+      "upstream_commit": "d1fb995cb1e064d4e171d83f19f6af79b0a3c5ce",
+      "upstream_license": "AGPL-3.0",
+      "purpose": "Bounded HTTP parameter discovery",
+      "required": true
+    },
+    "chromium": {
+      "version": "140.0.7339.16",
+      "path": "playwright-browsers/chromium-1187/chrome-linux/chrome",
+      "sha256": "2fa605e3639b8cfbe8037d0b8e0324dbf7f9e6ad7beb345374ecd26764e2d92b",
+      "version_args": [
+        "--version"
+      ],
+      "required": true,
+      "purpose": "Headless business request capture",
+      "asset_directory": "playwright-browsers"
+    },
+    "cyberchef": {
+      "version": "11.2.0-aion-python",
+      "path": "bin/cyberchef",
+      "sha256": "5d8fc7239b136611331662b57a0a38aa6762e417d24483bda5e740ffade22cd8",
+      "version_args": [
+        "--version"
+      ],
+      "required": true,
+      "version_pattern": "11.2.0-aion-python",
+      "purpose": "Offline Python-native CyberChef crypto and encoding recipes"
     }
   }
 }

@@ -123,7 +123,9 @@ async def test_runtime_loop_diagnostics_are_visible_and_rate_limited(
 ) -> None:
     service = StateService(tmp_path / "state.sqlite3")
     await service.create_run("diagnostic")
-    runtime = AgentRuntime(_settings(), project_root=tmp_path, run_root=tmp_path / "runs")
+    runtime = AgentRuntime(
+        _settings(), project_root=tmp_path, run_root=tmp_path / "runs"
+    )
     runtime.state_service = service
     runtime.run_id = "diagnostic"
 
@@ -143,7 +145,9 @@ async def test_runtime_loop_diagnostics_are_visible_and_rate_limited(
 
 
 @pytest.mark.asyncio
-async def test_runtime_waits_for_network_before_benchmark_and_chief(tmp_path: Path) -> None:
+async def test_runtime_waits_for_network_before_benchmark_and_chief(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
     _BlockingRunner.events = events
     network = _Network(events)
@@ -159,8 +163,12 @@ async def test_runtime_waits_for_network_before_benchmark_and_chief(tmp_path: Pa
     )
 
     await runtime.start("test", run_id="network-order")
-    assert events.index("vpn-ready") < events.index("benchmark:benchmark_list_challenges")
-    assert events.index("benchmark:benchmark_list_challenges") < events.index("runner:chief")
+    assert events.index("vpn-ready") < events.index(
+        "benchmark:benchmark_list_challenges"
+    )
+    assert events.index("benchmark:benchmark_list_challenges") < events.index(
+        "runner:chief"
+    )
 
     await runtime.close()
     assert events.index("benchmark-close") < events.index("vpn-close")
@@ -195,10 +203,7 @@ async def test_recoverable_chief_session_does_not_close_runtime_or_children(
     events_rows = await runtime.state_service.list_agent_events(
         "controller-recovers", chief["agent_id"]
     )
-    assert any(
-        item["event_type"] == "controller_session_recovery_scheduled"
-        for item in events_rows
-    )
+    assert any(item["event_type"] == "agent_model_recovery" for item in events_rows)
     await runtime.close()
 
 
@@ -230,12 +235,15 @@ async def test_runtime_pause_preserves_chief_for_resume(tmp_path: Path) -> None:
         outbox_count = connection.execute(
             "SELECT COUNT(*) FROM audit_outbox"
         ).fetchone()[0]
-    assert chief_status == ("running",)
+    assert chief_status == ("paused",)
     assert run_status == ("paused", "runtime_pause")
     assert outbox_count == 0
-    assert json.loads(
-        (run_root / "pause-resume" / "checkpoint.json").read_text(encoding="utf-8")
-    )["status"] == "paused"
+    assert (
+        json.loads(
+            (run_root / "pause-resume" / "checkpoint.json").read_text(encoding="utf-8")
+        )["status"]
+        == "paused"
+    )
 
     resumed_events: list[str] = []
     _BlockingRunner.events = resumed_events
@@ -251,12 +259,16 @@ async def test_runtime_pause_preserves_chief_for_resume(tmp_path: Path) -> None:
     await resumed.start("", run_id="pause-resume", resume=True)
     assert "runner:chief" in resumed_events
     assert resumed.state_service is not None
-    assert (await resumed.state_service.get_overview("pause-resume"))["run"]["status"] == "active"
+    assert (await resumed.state_service.get_overview("pause-resume"))["run"][
+        "status"
+    ] == "active"
     await resumed.close()
 
 
 @pytest.mark.asyncio
-async def test_network_start_failure_prevents_benchmark_and_chief(tmp_path: Path) -> None:
+async def test_network_start_failure_prevents_benchmark_and_chief(
+    tmp_path: Path,
+) -> None:
     events: list[str] = []
     _BlockingRunner.events = events
     network = _Network(events, start_error=RuntimeError("vpn unavailable"))

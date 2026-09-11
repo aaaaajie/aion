@@ -1,1 +1,1 @@
-"""Skills shared by Challenge and Execution Agents."""
+"""Skills shared by Solver and execute Workers."""

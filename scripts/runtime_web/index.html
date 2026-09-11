@@ -28,23 +28,23 @@
 
         <label class="agent-search">
           <span aria-hidden="true">⌕</span>
-          <input id="agent-search" type="search" placeholder="搜索 Agent" autocomplete="off" aria-label="搜索 Agent">
+          <input id="agent-search" type="search" placeholder="搜索 Agent 或任务" autocomplete="off" aria-label="搜索 Agent 或任务">
           <kbd>⌘F</kbd>
         </label>
 
         <div class="agent-section-label">
-          <span>挑战 AGENT</span>
+          <span>WORKER / 执行任务</span>
           <small>按活跃度排序</small>
         </div>
-        <div class="agent-tree" id="agent-tree" role="tree" aria-label="挑战与执行 Agent"></div>
-        <div class="empty-state" id="agent-empty">等待挑战 Agent 创建…</div>
+        <div class="agent-tree" id="agent-tree" role="tree" aria-label="挑战、Worker 与执行任务"></div>
+        <div class="empty-state" id="agent-empty">等待 Solver 创建…</div>
 
         <div class="chief-dock">
           <div class="agent-section-label"><span>全局视角</span></div>
           <button class="chief-agent-button" id="chief-agent-button" type="button" aria-label="切换到首席 Agent 视角">
             <span class="robot-slot chief-avatar" aria-hidden="true"></span>
             <span class="chief-copy">
-              <strong>首席 Agent</strong>
+              <strong>Chief</strong>
               <small id="chief-agent-meta">等待创建</small>
             </span>
           </button>
@@ -122,7 +122,6 @@
     <footer class="statusbar" aria-label="Runtime 状态">
       <span><i class="statusbar-branch">⌁</i><b id="run-id">RUN —</b></span>
       <span><i id="run-status-dot"></i><b id="run-status">—</b></span>
-      <span>阶段 <b id="run-phase">—</b></span>
       <span>事件 <b id="event-sequence">0</b></span>
       <span class="statusbar-spacer"></span>
       <span>CPU / MEM <b id="resource-readout">—</b></span>

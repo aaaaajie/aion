@@ -1,275 +1,184 @@
-"""Validated payloads exchanged between role-scoped Agents."""
+"""Current model-facing Agent control contracts."""
 
-from __future__ import annotations
-
-import re
-from typing import Any, Literal
-
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator
-
+from typing import Literal
+from pydantic import Field, model_validator
 from agent.state.schemas import (
-    ChallengeDirection,
-    ExecutionTaskInput,
-    HypothesisOutcome,
-    ReportFindingInput,
+    StrictModel,
+    WorkerTaskInput,
+    WorkerUpdateInput,
+    AgentReportInput,
 )
 
-AgentRole = Literal["chief", "challenge", "execution"]
-AgentStatus = Literal[
-    "pending",
-    "running",
-    "waiting",
-    "completed",
-    "failed",
-    "stopped",
-    "interrupted",
-    "indeterminate",
-]
+AgentRole = Literal["chief", "solver", "worker"]
 
 
-class _Arguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
-class EmptyArguments(_Arguments):
+class EmptyArguments(StrictModel):
     pass
 
 
-class UniqueCodeArguments(_Arguments):
-    unique_code: str = Field(min_length=1, max_length=256)
-
-    @field_validator("unique_code")
-    @classmethod
-    def non_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("unique_code must not be blank")
-        return value
+class ReportQueryArguments(StrictModel):
+    max_reports: int = Field(default=20, ge=1, le=100)
 
 
-class ReportQueryArguments(_Arguments):
-    max_reports: int = Field(
-        default=20,
-        ge=1,
-        le=50,
-        description="Maximum new reports to consume in this snapshot (1-50).",
-    )
+class LaunchChallengesArguments(StrictModel):
+    unique_codes: list[str] = Field(min_length=1, max_length=50)
 
 
-class LaunchChallengesArguments(_Arguments):
-    unique_codes: list[str] = Field(min_length=1, max_length=16)
-
-    @field_validator("unique_codes")
-    @classmethod
-    def unique_non_blank_codes(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("challenge codes must not be blank")
-        if len(set(values)) != len(values):
-            raise ValueError("challenge codes must be unique")
-        return values
+class ControllerWaitArguments(StrictModel):
+    reason: str | None = Field(default=None, max_length=1000)
 
 
-class ControllerWaitArguments(_Arguments):
-    reason: str | None = Field(default=None, max_length=1_000)
-
-    @field_validator("reason")
-    @classmethod
-    def normalize_reason(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+class SimpleHintArguments(StrictModel):
+    unique_code: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)
 
 
-class SimpleHintArguments(UniqueCodeArguments):
-    reason: str = Field(min_length=1, max_length=1_000)
+class PauseChallengesArguments(LaunchChallengesArguments):
+    reason: str = Field(min_length=1, max_length=2000)
+    release_container: bool = True
 
 
-class SecondaryBootstrapArguments(_Arguments):
-    route_a: str = Field(min_length=1, max_length=800)
-    route_b: str = Field(min_length=1, max_length=800)
-    reason: str = Field(min_length=1, max_length=1_000)
-
-    @field_validator("route_a", "route_b", "reason")
-    @classmethod
-    def non_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value must not be blank")
-        return normalized
+class CloseChallengesArguments(LaunchChallengesArguments):
+    reason: str = Field(min_length=1, max_length=2000)
 
 
-class ChallengeDispatchArguments(_Arguments):
-    summary: str = Field(
-        default="runtime state update",
+class DelegateArguments(StrictModel):
+    tasks: list[WorkerTaskInput] = Field(
         min_length=1,
-        max_length=8_000,
-        description=(
-            "Optional decision summary at the top level; use an empty JSON object "
-            "when Runtime should derive a deterministic checkpoint follow-up."
-        ),
+        max_length=50,
+        description="Independent tasks. For artifact-specific review, include exact evidence/report refs in each task's context_refs.",
     )
-    outcome: Literal["continue", "blocked", "completed", "failed"] = "continue"
-    direction: ChallengeDirection | None = None
-    tasks: SkipValidation[Any] = Field(
-        default_factory=list,
-        description=(
-            "Independent tasks. Each task requires only objective; optional malformed "
-            "metadata is dropped or defaulted with warnings."
-        ),
-    )
-    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
-    next_steps: list[str] = Field(default_factory=list, max_length=50)
-
-    @field_validator("evidence_refs")
-    @classmethod
-    def non_blank_evidence_refs(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("evidence references must not be blank")
-        return values
 
 
-class SubmitFlagArguments(_Arguments):
-    flag: str = Field(min_length=1, max_length=4_096)
+class CancelWorkerArguments(StrictModel):
+    worker_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)
 
 
-class EvidenceReadArguments(_Arguments):
-    evidence_ref: str = Field(
-        pattern=r"^evidence:evidence_[0-9a-f]{32}$",
-        description="Complete evidence:evidence_<32 hex> reference.",
-    )
-    offset: int = Field(default=0, ge=0)
-    limit_chars: int = Field(default=8_000, ge=1, le=8_000)
+class ReviewValidation(StrictModel):
+    conclusion_sequences: list[int] = Field(min_length=1, max_length=20)
+    control_evidence_refs: list[str] = Field(min_length=1, max_length=20)
+    calibration_basis: str | None = Field(default=None, min_length=1, max_length=1000)
+    calibration_sequences: list[int] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def evidence_contract(self):
+        if not (self.calibration_basis or "").strip() and not self.calibration_sequences:
+            raise ValueError("Validation requires an implementation calibration basis or calibration sequences")
+        if any(not ref.startswith("evidence:") for ref in self.control_evidence_refs):
+            raise ValueError("Controls must use evidence references")
+        if any(seq <= 0 for seq in self.conclusion_sequences + self.calibration_sequences):
+            raise ValueError("Source sequences must be positive")
+        return self
 
 
-class BootstrapCheckpointArguments(_Arguments):
-    route_key: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$",
-        description="Stable lowercase route identifier used for Challenge deduplication.",
-    )
-    summary: str = Field(min_length=1, max_length=2_000)
-    next_step: str = Field(min_length=1, max_length=2_000)
-    task_stage: Literal["validation", "exploitation"]
-    evidence_refs: list[str] = Field(min_length=1, max_length=10)
+class AcquiredCapability(StrictModel):
+    """A Solver's evidence-backed statement about a target-side capability."""
 
-    @field_validator("summary", "next_step")
-    @classmethod
-    def non_blank_text(cls, value: str) -> str:
-        normalized = " ".join(value.split())
-        if not normalized:
-            raise ValueError("checkpoint text must not be blank")
-        return normalized
-
-    @field_validator("evidence_refs")
-    @classmethod
-    def complete_evidence_refs(cls, values: list[str]) -> list[str]:
-        pattern = r"^evidence:evidence_[0-9a-f]{32}$"
-        if any(
-            not isinstance(value, str) or not re.fullmatch(pattern, value)
-            for value in values
-        ):
-            raise ValueError(
-                "checkpoint evidence_refs must be complete Evidence references"
-            )
-        if len(set(values)) != len(values):
-            raise ValueError("checkpoint evidence_refs must be unique")
-        return values
-
-
-class BootstrapCycleYieldArguments(_Arguments):
-    """A non-terminal boundary used to resume the persistent Bootstrap lane."""
-
-    summary: str = Field(min_length=1, max_length=2_000)
-
-    @field_validator("summary")
-    @classmethod
-    def non_blank_summary(cls, value: str) -> str:
-        normalized = " ".join(value.split())
-        if not normalized:
-            raise ValueError("cycle yield summary must not be blank")
-        return normalized
-
-
-class ExecutionCheckpointArguments(_Arguments):
-    """A bounded, non-terminal handoff from a parallel Execution Agent."""
-
-    summary: str = Field(min_length=1, max_length=2_000)
-    next_step: str = Field(min_length=1, max_length=2_000)
-    task_stage: Literal[
-        "discovery", "validation", "exploitation", "post_exploitation"
+    kind: Literal[
+        "file_read",
+        "command_execution",
+        "database_read",
+        "admin_session",
+        "ssrf",
     ]
-    urgency: Literal["interrupt", "inform"] = "inform"
-    evidence_refs: list[str] = Field(min_length=1, max_length=10)
+    target_environment: str = Field(min_length=1, max_length=1_000)
+    scope: str = Field(
+        min_length=1,
+        max_length=2_000,
+        description="What was actually demonstrated in the target environment.",
+    )
+    limitations: str = Field(
+        min_length=1,
+        max_length=2_000,
+        description="What remains unverified or unavailable.",
+    )
 
-    @field_validator("summary", "next_step")
-    @classmethod
-    def non_blank_text(cls, value: str) -> str:
-        normalized = " ".join(value.split())
-        if not normalized:
-            raise ValueError("checkpoint text must not be blank")
-        return normalized
-
-    @field_validator("evidence_refs")
-    @classmethod
-    def complete_evidence_refs(cls, values: list[str]) -> list[str]:
-        pattern = r"^evidence:evidence_[0-9a-f]{32}$"
+    @model_validator(mode="after")
+    def non_blank_details(self):
         if any(
-            not isinstance(value, str) or not re.fullmatch(pattern, value)
-            for value in values
+            not value.strip()
+            for value in (self.target_environment, self.scope, self.limitations)
+        ):
+            raise ValueError("Capability environment, scope and limitations must not be blank")
+        return self
+
+
+class SolverReviewArguments(StrictModel):
+    hypothesis_id: str = Field(min_length=1, max_length=128)
+    strategy_revision: int = Field(default=1, ge=1)
+    covered_sequences: list[int] = Field(max_length=100)
+    assessment: Literal["inconclusive", "no_new_information", "new_information"]
+    direction_status: Literal["open", "weakly_rejected", "dead"] = "open"
+    summary: str = Field(min_length=1, max_length=2000)
+    next_test: str = Field(min_length=1, max_length=1000)
+    validation: ReviewValidation | None = Field(default=None, description="Evidence for a verified conclusion or ruled-out hypothesis. Ordinary progress observations may omit it.")
+    acquired_capabilities: list[AcquiredCapability] = Field(
+        default_factory=list,
+        max_length=5,
+        description="Only evidence-validated target-side capabilities. Local command success or a keyword is not sufficient.",
+    )
+    revoked_sequences: list[int] = Field(default_factory=list, max_length=50)
+    environment_dependent: bool = True
+    observation_revision: int | None = Field(default=None, gt=0,
+        description="Optional existing observer snapshot event sequence. Omit both observation fields when no observer snapshot was delivered.")
+    observation_assessment: Literal["corrected", "dismissed", "uncertain"] | None = Field(default=None,
+        description="Feedback about the observer snapshot named by observation_revision, NOT the uncertainty of this review. Omit unless observation_revision is supplied.")
+
+    @model_validator(mode="after")
+    def evidence_contract(self):
+        if any(not value.strip() for value in (self.hypothesis_id, self.summary, self.next_test)):
+            raise ValueError("Hypothesis, summary and next test must not be blank")
+        if (self.observation_revision is None) != (self.observation_assessment is None):
+            raise ValueError("Observation assessment and revision must be supplied together")
+        if any(seq <= 0 for seq in self.covered_sequences + self.revoked_sequences):
+            raise ValueError("Source sequences must be positive")
+        if self.acquired_capabilities and (
+            self.assessment != "new_information" or self.validation is None
         ):
             raise ValueError(
-                "checkpoint evidence_refs must be complete Evidence references"
+                "Acquired capabilities require a new-information review with validation"
             )
-        if len(set(values)) != len(values):
-            raise ValueError("checkpoint evidence_refs must be unique")
-        return values
+        if self.direction_status == "dead" and (
+            self.assessment != "new_information" or self.validation is None
+        ):
+            raise ValueError("dead directions require validated new information")
+        return self
 
 
-ExecutionReportStatus = Literal["completed", "blocked", "failed", "cancelled"]
+class SolverProgressArguments(WorkerUpdateInput):
+    status: Literal["working", "blocked"] = "working"
 
 
-class ExecutionReport(_Arguments):
-    status: ExecutionReportStatus
-    summary: str = Field(min_length=1, max_length=4_000)
-    hypothesis_outcome: SkipValidation[HypothesisOutcome] = Field(
-        default="inconclusive",
-        description="Use exactly supported, rejected, or inconclusive.",
-    )
-    findings: SkipValidation[list[ReportFindingInput]] = Field(
-        default_factory=list,
-        description=(
-            "Optional best-effort findings. Each item uses summary, optional object detail, "
-            "category, confidence, verification_status, finding_ref, and evidence_refs. "
-            "Malformed items are warnings and never invalidate the terminal report."
-        ),
-    )
-    evidence_refs: SkipValidation[list[str]] = Field(
-        default_factory=list,
-        description="Optional Evidence refs; malformed refs are dropped with warnings.",
-    )
-    next_steps: list[str] = Field(default_factory=list, max_length=20)
-    candidate_flag: str | None = Field(
-        default=None,
+class SubmitFlagArguments(StrictModel):
+    flag: str = Field(min_length=1, max_length=4096)
+
+
+class EvidenceReadArguments(StrictModel):
+    evidence_ref: str = Field(
         min_length=1,
-        max_length=4_096,
         description=(
-            "An exact flag token ready for challenge_submit_flag. Omit it for task names, "
-            "credentials, URLs, vulnerability descriptions, or unverified guesses."
+            "Copy the exact returned evidence_ref: "
+            "evidence:evidence_<32 lowercase hex characters>. "
+            "Do not pass a bare evidence ID."
         ),
     )
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    offset: int = Field(default=0, ge=0, description="Character offset returned by the prior page.")
+    limit_chars: int = Field(default=8000, ge=1, le=30000, description="Maximum characters to return per page.")
 
 
-class AgentReport(_Arguments):
-    agent_id: str = Field(min_length=1)
-    role: AgentRole
-    unique_code: str | None = None
-    status: str = Field(min_length=1, max_length=64)
-    summary: str = Field(min_length=1, max_length=4_000)
-    findings: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
-    evidence_refs: list[Any] = Field(default_factory=list, max_length=50)
-    next_steps: list[str] = Field(default_factory=list, max_length=20)
-    candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    sequence: int = Field(default=0, ge=0)
+class ReportReadArguments(StrictModel):
+    report_ref: str = Field(min_length=1, description="Exact report_ref returned by a control or Worker report; never synthesize a reference.")
+    offset: int = Field(default=0, ge=0, description="Character offset returned by the prior read.")
+    limit_chars: int = Field(default=8000, ge=1, le=30000, description="Maximum characters to return per page.")
+
+
+class EvidenceSearchArguments(StrictModel):
+    query: str = Field(default="", max_length=1000, description="Search source, evidence type, or an exact/partial system task_id.")
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class SolverObserveArguments(ReportQueryArguments):
+    task_offset: int = Field(default=0, ge=0)
+    task_limit: int = Field(default=20, ge=1, le=100)

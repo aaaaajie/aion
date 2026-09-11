@@ -16,9 +16,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
+from pydantic import ValidationError
+
+from agent.tooling import tool_error, validation_details
 
 from agent.state import StateService
 from agent.state.errors import StateNotFound
@@ -33,15 +37,18 @@ from .fingerprint import (
     FingerprintScanResult,
     FingerprintScanner,
 )
+from .urls import effective_url
 from .models import (
     FingerprintArguments,
     HttpAnalyzeArguments,
     HttpCleanupArguments,
     HttpOutputArguments,
     HttpOutputFilters,
+    HttpPlanArguments,
     HttpProbeArguments,
     HttpProbeCase,
     HttpRequestArguments,
+    HttpRequestInput,
     HttpRequestSpec,
     HttpResponseArguments,
     HttpStopArguments,
@@ -105,6 +112,9 @@ class AgentHttpClient:
             result_limit=20,
         )
 
+    async def plan(self, arguments: HttpPlanArguments) -> dict[str, Any]:
+        return await self.manager.plan(self.agent_id, arguments)
+
     async def path_probe(self, arguments: PathProbeArguments) -> dict[str, Any]:
         return await self.manager.start_path_probe(
             self.agent_id,
@@ -113,6 +123,8 @@ class AgentHttpClient:
             session_id=arguments.session_id,
             extensions=arguments.extensions,
             wordlist_paths=arguments.wordlist_paths,
+            packaged_wordlists=arguments.packaged_wordlists,
+            max_candidates=arguments.max_candidates,
             exclude_paths=arguments.exclude_paths,
             force_extensions=arguments.force_extensions,
             include_status_codes=arguments.include_status_codes,
@@ -197,9 +209,6 @@ class AgentHttpClient:
             self.agent_id, interaction_id=arguments.interaction_id
         )
 
-    async def close(self) -> None:
-        """The Supervisor owns the manager; session close is a no-op."""
-
 
 class HttpProbeManager:
     """Persist and coordinate all HTTP interactions for one Runtime Run."""
@@ -220,6 +229,7 @@ class HttpProbeManager:
         self.service = service
         self.run_id = run_id
         self.engine = engine or HttpInteractionEngine(policy)
+        self._agent_engines: dict[str, HttpInteractionEngine] = {}
         self.path_transport = path_transport
         self.resource_guard = resource_guard
         self.disk_reserve_bytes = max(0, disk_reserve_bytes)
@@ -232,9 +242,7 @@ class HttpProbeManager:
         self._response_cache: dict[
             tuple[str, str], tuple[int, list[dict[str, Any]]]
         ] = {}
-        self._group_cache: dict[
-            tuple[str, str], tuple[int, list[dict[str, Any]]]
-        ] = {}
+        self._group_cache: dict[tuple[str, str], tuple[int, list[dict[str, Any]]]] = {}
         self._similarity_cache: dict[
             tuple[str, str], tuple[int, list[dict[str, Any]]]
         ] = {}
@@ -244,8 +252,17 @@ class HttpProbeManager:
         self._reclaim_lock = asyncio.Lock()
         self._closed = False
 
-    def bind(self, agent_id: str) -> AgentHttpClient:
+    def bind(
+        self, agent_id: str, *, workspace_root: Path | None = None
+    ) -> AgentHttpClient:
+        if workspace_root is not None and agent_id not in self._agent_engines:
+            self._agent_engines[agent_id] = HttpInteractionEngine(
+                WorkspacePolicy(workspace_root), transport=self.engine.transport
+            )
         return AgentHttpClient(self, agent_id)
+
+    def _engine(self, agent_id: str) -> HttpInteractionEngine:
+        return self._agent_engines.get(agent_id, self.engine)
 
     async def initialize(self, *, resume: bool = False) -> None:
         await self._remove_orphan_interaction_directories()
@@ -269,8 +286,7 @@ class HttpProbeManager:
             was_active = row["status"] in {"queued", "running", "analyzing"}
             can_resume_analysis = (
                 row["status"] in {"queued", "running", "analyzing", "interrupted"}
-                and
-                row["execution_status"] == "completed"
+                and row["execution_status"] == "completed"
                 and row["analysis_status"] in {"queued", "running"}
                 and row["output_cleaned_at"] is None
             )
@@ -295,14 +311,10 @@ class HttpProbeManager:
                 execution_status=(
                     "completed"
                     if row["execution_status"] == "completed"
-                    else (
-                        "interrupted" if was_active else row["execution_status"]
-                    )
+                    else ("interrupted" if was_active else row["execution_status"])
                 ),
                 analysis_status=(
-                    "queued"
-                    if can_resume_analysis
-                    else row["analysis_status"]
+                    "queued" if can_resume_analysis else row["analysis_status"]
                 ),
                 resource_status="interrupted",
             )
@@ -344,6 +356,183 @@ class HttpProbeManager:
             kind="request",
         )
 
+    async def _build_plan(
+        self, agent_id: str, cases: list[HttpProbeCase], interaction_id: str
+    ) -> list[ExpandedRequest]:
+        """Expand and check ownership without creating work or changing runtime state."""
+        self._require_open()
+        requests = self._engine(agent_id).expand_cases(
+            cases,
+            id_factory=lambda: uuid4().hex,
+            default_group_id=interaction_id,
+        )
+        if not requests:
+            error = self._error(
+                "validation",
+                "empty_http_interaction",
+                "HTTP interaction must expand to at least one request",
+            )
+            error.detail["fields"] = [
+                {"path": f"cases.{index}.variables", "code": error.code, "message": error.message}
+                for index in range(len(cases))
+            ]
+            raise error
+        expanded: list[ExpandedRequest] = []
+        for item in requests:
+            if (
+                item.spec.parent_request_id is not None
+                and not await self._request_owned(agent_id, item.spec.parent_request_id)
+            ):
+                raise self._error(
+                    "not_found",
+                    "parent_request_not_found",
+                    "Parent request was not found",
+                )
+            if not await self._request_group_allowed(agent_id, item.request_group_id):
+                raise self._error(
+                    "not_found",
+                    "request_group_not_found",
+                    "Request group was not found",
+                )
+            context_id = item.spec.connection_context_id
+            if context_id:
+                sequence = item.spec.sequence_id
+                if sequence is None:
+                    sequence = await self._next_context_sequence(agent_id, context_id)
+                item = replace(
+                    item,
+                    spec=item.spec.model_copy(
+                        update={
+                            "connection_context_id": context_id,
+                            "sequence_id": sequence,
+                        }
+                    ),
+                )
+            expanded.append(item)
+        return expanded
+
+    async def plan(
+        self, agent_id: str, arguments: HttpPlanArguments
+    ) -> dict[str, Any]:
+        from agent.tool_examples import examples_for
+
+        try:
+            if arguments.tool_name == "system_http_request":
+                validated = HttpRequestArguments.model_validate(arguments.arguments)
+                cases = [HttpProbeCase(request=validated.to_request_spec())]
+            else:
+                probe = HttpProbeArguments.model_validate(arguments.arguments)
+                cases = [case.to_case() for case in probe.cases]
+            group_id = f"plan-{uuid4().hex}"
+            requests = await self._build_plan(agent_id, cases, group_id)
+        except ValidationError as exc:
+            fields = validation_details(exc)
+            for item in fields:
+                item["path"] = "arguments." + item["path"]
+            return tool_error(
+                "schema", "invalid_arguments", "Tool arguments failed schema validation",
+                retry_allowed=True, retry_action="rewrite_arguments",
+                retry_tool="system_http_plan",
+                details={"fields": fields, "examples": examples_for(arguments.tool_name)},
+            )
+        except SystemToolError as exc:
+            fields = exc.detail.get("fields") or [
+                {"path": "", "code": exc.code, "message": exc.message}
+            ]
+            located = []
+            for field in fields:
+                path = field["path"]
+                if arguments.tool_name == "system_http_request":
+                    path = path.removeprefix("cases.0.")
+                located.append({**field, "path": "arguments" + (f".{path}" if path else "")})
+            exc.detail = {
+                **exc.detail, "fields": located, "examples": examples_for(arguments.tool_name)
+            }
+            raise
+
+        indices = {f"{group_id}-case-{index}": index for index in range(len(cases))}
+        counts = [0] * len(cases)
+        for item in requests:
+            counts[indices[item.request_group_id]] += 1
+        return {
+            "tool_name": arguments.tool_name,
+            "case_count": len(cases),
+            "request_count": len(requests),
+            "cases": [
+                {"case_index": index, "request_count": count}
+                for index, count in enumerate(counts)
+            ],
+            "previews": [
+                {
+                    "case_index": indices[item.request_group_id],
+                    "request_index": item.ordinal,
+                    "request": self._preview_request(item.spec),
+                }
+                for item in requests[:5]
+            ],
+            "preview_limit": 5,
+            "previews_truncated": len(requests) > 5,
+        }
+
+    @staticmethod
+    def _preview_request(spec: HttpRequestSpec) -> dict[str, Any]:
+        """Mask credentials in a detached preview; opaque bodies are metadata only."""
+        def sensitive(key: str) -> bool:
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+            return (
+                normalized in {
+                    "authorization", "proxyauthorization", "cookie", "setcookie",
+                    "password", "passwd", "pwd", "secret", "clientsecret",
+                    "apikey", "xapikey", "credential", "credentials",
+                }
+                or normalized.endswith(("token", "password", "secret", "apikey"))
+            )
+
+        def mask(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: "[REDACTED]" if sensitive(str(key)) else mask(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [mask(item) for item in value]
+            return value
+
+        preview = mask({
+            name: getattr(spec, name)
+            for name in HttpRequestInput.model_fields
+            if name not in {"auth", "body", "cookies"}
+        })
+        parts = urlsplit(str(effective_url(spec.url, spec.query)))
+        netloc = parts.netloc
+        if "@" in netloc:
+            netloc = "%5BREDACTED%5D@" + netloc.rsplit("@", 1)[1]
+        query = parts.query
+        if any(sensitive(key) for key, _ in parse_qsl(query, keep_blank_values=True)):
+            query = urlencode([
+                (key, "[REDACTED]" if sensitive(key) else value)
+                for key, value in parse_qsl(query, keep_blank_values=True)
+            ])
+        preview["url"] = urlunsplit(parts._replace(netloc=netloc, query=query))
+        preview["cookies"] = {key: "[REDACTED]" for key in spec.cookies}
+        preview["auth"] = (
+            {key: value if key == "type" else "[REDACTED]"
+             for key, value in spec.auth.model_dump(exclude_none=True).items()}
+            if spec.auth else None
+        )
+        if spec.body is None:
+            preview["body"] = None
+        elif spec.body.type in {"raw", "base64"}:
+            raw = (base64.b64decode(spec.body.value, validate=True)
+                   if spec.body.type == "base64" else spec.body.value.encode("utf-8"))
+            preview["body"] = {"type": spec.body.type, "byte_length": len(raw)}
+        else:
+            preview["body"] = mask(spec.body.model_dump(mode="json"))
+        if spec.session_id is not None:
+            preview["session_id"] = spec.session_id
+            preview["update_session"] = spec.update_session
+        return preview
+
     async def start_probe(
         self,
         agent_id: str,
@@ -357,56 +546,12 @@ class HttpProbeManager:
     ) -> dict[str, Any]:
         self._require_open()
         interaction_id = f"interaction-{uuid4().hex}"
-        requests = self.engine.expand_cases(
-            cases,
-            id_factory=lambda: uuid4().hex,
-            default_group_id=interaction_id,
-        )
-        if not requests:
-            raise self._error(
-                "validation",
-                "empty_http_interaction",
-                "HTTP interaction must expand to at least one request",
-            )
-        expanded: list[ExpandedRequest] = []
-        for item in requests:
-            if item.spec.parent_request_id is not None and not await self._request_owned(
-                agent_id, item.spec.parent_request_id
-            ):
-                raise self._error(
-                    "not_found",
-                    "parent_request_not_found",
-                    "Parent request was not found",
-                )
-            if not await self._request_group_allowed(
-                agent_id, item.request_group_id
-            ):
-                raise self._error(
-                    "not_found",
-                    "request_group_not_found",
-                    "Request group was not found",
-                )
-            context_id = item.spec.connection_context_id
-            if context_id:
-                sequence = item.spec.sequence_id
-                if sequence is None:
-                    sequence = await self._next_context_sequence(
-                        agent_id, context_id
-                    )
-                item = replace(
-                    item,
-                    spec=item.spec.model_copy(
-                        update={
-                            "connection_context_id": context_id,
-                            "sequence_id": sequence,
-                        }
-                    ),
-                )
-            expanded.append(item)
-        requests = expanded
+        requests = await self._build_plan(agent_id, cases, interaction_id)
         template_summary = {
             "case_count": len(cases),
-            "variable_names": sorted({name for case in cases for name in case.variables}),
+            "variable_names": sorted(
+                {name for case in cases for name in case.variables}
+            ),
             "combinations": [case.combine for case in cases],
             "expanded_requests": len(requests),
             "url_samples": [item.spec.url for item in requests[:3]],
@@ -467,6 +612,8 @@ class HttpProbeManager:
         session_id: str | None = None,
         extensions: list[str] | None = None,
         wordlist_paths: list[str] | None = None,
+        packaged_wordlists: list[str] | None = None,
+        max_candidates: int = 256,
         exclude_paths: list[str] | None = None,
         force_extensions: bool = False,
         include_status_codes: list[int] | None = None,
@@ -499,7 +646,15 @@ class HttpProbeManager:
             )
         if not url.lower().startswith(("http://", "https://")):
             raise self._error(
-                "validation", "invalid_path_probe_url", "Path probe URL must use http or https"
+                "validation",
+                "invalid_path_probe_url",
+                "Path probe URL must use http or https",
+            )
+        if max_candidates < 1 or max_candidates > 1000:
+            raise self._error(
+                "validation",
+                "invalid_path_probe_candidate_limit",
+                "max_candidates must be between 1 and 1000",
             )
         preset = PROFILE_PRESETS[profile]
         interaction_id = f"interaction-{uuid4().hex}"
@@ -530,19 +685,21 @@ class HttpProbeManager:
             extensions=tuple(extensions) if extensions is not None else (),
             force_extensions=bool(force_extensions),
             wordlist_paths=tuple(wordlist_paths or ()),
+            packaged_wordlists=tuple(packaged_wordlists or ()),
+            max_candidates=int(max_candidates),
             exclude_paths=tuple(exclude_paths or ()),
             include_status_codes=frozenset(include_status_codes or ()),
             exclude_status_codes=frozenset(exclude_status_codes or {404}),
             recursion_depth=int(recursion_depth or 0),
-            recursion_status_codes=frozenset(
-                recursion_status_codes or {200, 301, 302}
-            ),
+            recursion_status_codes=frozenset(recursion_status_codes or {200, 301, 302}),
             max_body_bytes=max_body_bytes or preset["max_body_bytes"],
             request_intent=request_intent or "path_discovery",
             parent_request_id=parent_request_id,
             request_group_id=group_id,
         )
-        engine = PathProbeEngine(self.policy, options, transport=self.path_transport)
+        engine = PathProbeEngine(
+            self._engine(agent_id).policy, options, transport=self.path_transport
+        )
         interaction_dir, response_dir = await self._create_interaction_directories(
             agent_id, interaction_id
         )
@@ -807,19 +964,16 @@ class HttpProbeManager:
     ) -> dict[str, Any]:
         row = await self._owned(agent_id, interaction_id)
         live = self._live.get(interaction_id)
-        if (
-            row["output_cleaned_at"] is None
-            and live is not None
-            and wait_seconds != 0
-        ):
+        if row["output_cleaned_at"] is None and live is not None and wait_seconds != 0:
             live.changed.clear()
             # Close the clear/read/wait lost-wakeup window: after clearing the
             # signal, reread both the journal cursor and authoritative state.
             row = await self._owned(agent_id, interaction_id)
             before = self._journal_path(agent_id, interaction_id).stat().st_size
-            active = row["status"] not in TERMINAL or row[
-                "analysis_status"
-            ] in {"queued", "running"}
+            active = row["status"] not in TERMINAL or row["analysis_status"] in {
+                "queued",
+                "running",
+            }
             if before <= cursor and active:
                 await self._wait(live.changed, wait_seconds)
         return await self._result_page(
@@ -898,6 +1052,7 @@ class HttpProbeManager:
             "encoding": encoding,
             "content": content,
             "body_sha256": record.get("body_sha256"),
+            "body_bytes": path.stat().st_size,
         }
         if offset_bytes == 0:
             result["headers"] = record.get("headers", {})
@@ -1006,9 +1161,7 @@ class HttpProbeManager:
                             "recommended_action": "repeat_request_if_still_required",
                         },
                     )
-                revision = await self._next_analysis_revision(
-                    agent_id, interaction_id
-                )
+                revision = await self._next_analysis_revision(agent_id, interaction_id)
                 self._analysis_scopes[(interaction_id, revision)] = (
                     set(request_ids or []),
                     request_group_id,
@@ -1146,7 +1299,11 @@ class HttpProbeManager:
                 },
             )
         if row["output_cleaned_at"] is not None:
-            return {"interaction_id": interaction_id, "cleaned": False, "already_cleaned": True}
+            return {
+                "interaction_id": interaction_id,
+                "cleaned": False,
+                "already_cleaned": True,
+            }
         path = self._interaction_dir(agent_id, interaction_id)
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
@@ -1154,50 +1311,75 @@ class HttpProbeManager:
         await self.service.mark_http_interaction_cleaned(
             self.run_id, agent_id, interaction_id, reason="explicit"
         )
-        return {"interaction_id": interaction_id, "cleaned": True, "already_cleaned": False}
+        return {
+            "interaction_id": interaction_id,
+            "cleaned": True,
+            "already_cleaned": False,
+        }
 
     async def finish_agent(self, agent_id: str) -> None:
         rows = await self.service.list_http_interactions(self.run_id, agent_id=agent_id)
-        for row in rows:
-            interaction_id = str(row["interaction_id"])
-            lock = self._interaction_locks.setdefault(
-                (agent_id, interaction_id), asyncio.Lock()
-            )
-            async with lock:
-                current = await self._owned(agent_id, interaction_id)
-                try:
-                    if current["status"] not in TERMINAL:
-                        await self._stop_interaction(agent_id, interaction_id)
-                except (FileNotFoundError, NotADirectoryError):
-                    # A request worker may have removed its private directory
-                    # just before terminal cleanup acquired the interaction
-                    # lock. The durable row is still authoritative, so this
-                    # interaction is already stopped for cleanup purposes.
-                    pass
-                path = self._interaction_dir(agent_id, interaction_id)
-                try:
-                    if path.exists():
-                        shutil.rmtree(path, ignore_errors=True)
-                except (FileNotFoundError, NotADirectoryError):
-                    pass
-                self._drop_interaction_caches(agent_id, interaction_id)
-                current = await self._owned(agent_id, interaction_id)
-                if current["output_cleaned_at"] is None:
-                    await self.service.mark_http_interaction_cleaned(
-                        self.run_id,
-                        agent_id,
-                        interaction_id,
-                        reason="agent_terminal",
-                    )
+        results = await asyncio.gather(
+            *(
+                self._finish_agent_interaction(agent_id, str(row["interaction_id"]))
+                for row in rows
+            ),
+            self._engine(agent_id).close_agent(agent_id),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
         session_dir = self._agent_root(agent_id) / "http-sessions"
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
+        try:
+            if session_dir.exists():
+                shutil.rmtree(session_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            failures.append(exc)
+        if failures:
+            raise ExceptionGroup("HTTP Agent cleanup failed", failures)
+
+    async def _finish_agent_interaction(
+        self, agent_id: str, interaction_id: str
+    ) -> None:
+        lock = self._interaction_locks.setdefault(
+            (agent_id, interaction_id), asyncio.Lock()
+        )
+        async with lock:
+            current = await self._owned(agent_id, interaction_id)
+            try:
+                if current["status"] not in TERMINAL:
+                    await self._stop_interaction(agent_id, interaction_id)
+            except (FileNotFoundError, NotADirectoryError):
+                # A request worker may have removed its private directory
+                # just before terminal cleanup acquired the interaction
+                # lock. The durable row is still authoritative, so this
+                # interaction is already stopped for cleanup purposes.
+                pass
+            path = self._interaction_dir(agent_id, interaction_id)
+            try:
+                if path.exists():
+                    shutil.rmtree(path)
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            self._drop_interaction_caches(agent_id, interaction_id)
+            current = await self._owned(agent_id, interaction_id)
+            if current["output_cleaned_at"] is None:
+                await self.service.mark_http_interaction_cleaned(
+                    self.run_id,
+                    agent_id,
+                    interaction_id,
+                    reason="agent_terminal",
+                )
 
     async def finish_run(self) -> None:
         rows = await self.service.list_http_interactions(self.run_id)
         for agent_id in sorted({str(row["agent_id"]) for row in rows}):
             await self.finish_agent(agent_id)
-        await self.engine.aclose()
+        await asyncio.gather(
+            self.engine.aclose(),
+            *(engine.aclose() for engine in self._agent_engines.values()),
+        )
         self._closed = True
 
     async def pause_run(self) -> None:
@@ -1211,12 +1393,14 @@ class HttpProbeManager:
                     if task is not None and not task.done():
                         task.cancel()
                 await asyncio.gather(
-                    *(task for task in (live.execution_task, live.analysis_task) if task),
+                    *(
+                        task
+                        for task in (live.execution_task, live.analysis_task)
+                        if task
+                    ),
                     return_exceptions=True,
                 )
-                await self._record_unfinished_requests(
-                    live, outcome="interrupted"
-                )
+                await self._record_unfinished_requests(live, outcome="interrupted")
             if row["kind"] in {"path_probe", "fingerprint"}:
                 self._write_stopped_summary_if_missing(
                     row["agent_id"], row["interaction_id"], reason="interrupted"
@@ -1249,7 +1433,10 @@ class HttpProbeManager:
                 resource_status="interrupted",
             )
         self._live.clear()
-        await self.engine.aclose()
+        await asyncio.gather(
+            self.engine.aclose(),
+            *(engine.aclose() for engine in self._agent_engines.values()),
+        )
         self._closed = True
 
     async def _run_execution(self, live: LiveInteraction, work_id: str) -> None:
@@ -1288,7 +1475,9 @@ class HttpProbeManager:
                         if delay:
                             await asyncio.sleep(delay)
                         next_start = loop.time() + 1.0 / float(rate)
-                await self._append(live, {"type": "request_started", **self._request_json(item)})
+                await self._append(
+                    live, {"type": "request_started", **self._request_json(item)}
+                )
                 started += 1
                 if started == 1 or started % 25 == 0:
                     await self.service.update_http_interaction(
@@ -1297,9 +1486,10 @@ class HttpProbeManager:
                         live.interaction_id,
                         started_requests=started,
                     )
-                body_path = self._response_dir(
-                    live.agent_id, live.interaction_id
-                ) / f"{item.request_id}.body"
+                body_path = (
+                    self._response_dir(live.agent_id, live.interaction_id)
+                    / f"{item.request_id}.body"
+                )
                 if item.spec.session_id:
                     lock = self._session_locks.setdefault(
                         (live.agent_id, item.spec.session_id), asyncio.Lock()
@@ -1308,9 +1498,12 @@ class HttpProbeManager:
                         session = self._load_session(
                             live.agent_id, item.spec.session_id
                         )
-                        result, response_cookies = await self.engine.execute(
+                        result, response_cookies = await self._engine(
+                            live.agent_id
+                        ).execute(
                             item,
                             body_path=body_path,
+                            agent_id=live.agent_id,
                             session_cookies=list(session.get("cookies", [])),
                         )
                         if item.spec.update_session:
@@ -1322,12 +1515,11 @@ class HttpProbeManager:
                                 request_id=item.request_id,
                             )
                 else:
-                    session = self._load_session(
-                        live.agent_id, item.spec.session_id
-                    )
-                    result, _ = await self.engine.execute(
+                    session = self._load_session(live.agent_id, item.spec.session_id)
+                    result, _ = await self._engine(live.agent_id).execute(
                         item,
                         body_path=body_path,
+                        agent_id=live.agent_id,
                         session_cookies=list(session.get("cookies", [])),
                     )
                 await self._append(live, result)
@@ -1381,9 +1573,11 @@ class HttpProbeManager:
                 *(
                     ordered_sequence(
                         items,
-                        key=lambda value: value.spec.sequence_id
-                        if value.spec.sequence_id is not None
-                        else value.ordinal,
+                        key=lambda value: (
+                            value.spec.sequence_id
+                            if value.spec.sequence_id is not None
+                            else value.ordinal
+                        ),
                     )
                     for items in context_requests.values()
                 ),
@@ -1445,7 +1639,7 @@ class HttpProbeManager:
         plan = self._plan(live.agent_id, live.interaction_id)
         options = PathProbeOptions.from_plan(plan["options"])
         engine = PathProbeEngine(
-            self.policy,
+            self._engine(live.agent_id).policy,
             options,
             transport=self.path_transport,
         )
@@ -1694,11 +1888,15 @@ class HttpProbeManager:
             "duration_ms": result.duration_ms,
         }
 
-    def _write_summary(self, agent_id: str, interaction_id: str, summary: dict[str, Any]) -> None:
+    def _write_summary(
+        self, agent_id: str, interaction_id: str, summary: dict[str, Any]
+    ) -> None:
         path = self._interaction_dir(agent_id, interaction_id) / "summary.json"
         self._write_private_json_atomic(path, summary)
 
-    def _load_summary(self, agent_id: str, interaction_id: str) -> dict[str, Any] | None:
+    def _load_summary(
+        self, agent_id: str, interaction_id: str
+    ) -> dict[str, Any] | None:
         path = self._interaction_dir(agent_id, interaction_id) / "summary.json"
         if not path.exists():
             return None
@@ -1733,9 +1931,7 @@ class HttpProbeManager:
             started_at=_now_iso(),
             finished_at=_now_iso(),
         )
-        summary = self._path_probe_summary(
-            options, result, estimated_requests=0
-        )
+        summary = self._path_probe_summary(options, result, estimated_requests=0)
         summary["stopped_reason"] = reason
         self._write_summary(agent_id, interaction_id, summary)
 
@@ -1887,9 +2083,7 @@ class HttpProbeManager:
 
     async def _queue_analysis(self, live: LiveInteraction, *, revision: int) -> None:
         row = await self._owned(live.agent_id, live.interaction_id)
-        response_records = self._response_records(
-            live.agent_id, live.interaction_id
-        )
+        response_records = self._response_records(live.agent_id, live.interaction_id)
         largest_response = max(
             (int(item.get("body_bytes") or 0) for item in response_records),
             default=0,
@@ -1949,7 +2143,8 @@ class HttpProbeManager:
                     break
                 body_file = response.get("body_file")
                 body_path = (
-                    self._response_dir(live.agent_id, live.interaction_id) / str(body_file)
+                    self._response_dir(live.agent_id, live.interaction_id)
+                    / str(body_file)
                     if body_file
                     else Path("/nonexistent")
                 )
@@ -2035,7 +2230,7 @@ class HttpProbeManager:
             default_types = {"fingerprint"}
         elif row["kind"] == "path_probe":
             default_types = {"response", "fingerprint"}
-        records, next_cursor = self._read_records(
+        records, next_cursor, page_end_cursor = self._read_records(
             agent_id,
             interaction_id,
             cursor=cursor,
@@ -2078,15 +2273,13 @@ class HttpProbeManager:
                 else 0
             ),
             "running_requests": (
-                max(0, started_requests - completed_requests)
-                if execution_active
-                else 0
+                max(0, started_requests - completed_requests) if execution_active else 0
             ),
             "started_requests": started_requests,
             "completed_requests": completed_requests,
             "analyzed_responses": row["analyzed_responses"],
             "response_bytes": row["response_bytes"],
-            "connection_pool": self.engine.connection_stats,
+            "connection_pool": self._engine(agent_id).connection_stats,
             "resource_admission": (
                 None
                 if latest_work is None
@@ -2105,26 +2298,33 @@ class HttpProbeManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "page_end_cursor": page_end_cursor,
+            "has_more": next_cursor < page_end_cursor,
+            "read_scope": {
+                "filters": filters.model_dump(mode="json", exclude_defaults=True) if filters else {},
+                "record_types": sorted(record_types or default_types),
+                "default": not (filters and filters.model_dump(exclude_defaults=True))
+                and (record_types is None or record_types == default_types),
+            },
+            "read_result": {
+                "tool": "system_http_output",
+                "arguments": {
+                    "interaction_id": interaction_id, "cursor": cursor, "limit": limit,
+                    **({"filters": filters.model_dump(mode="json", exclude_none=True)} if filters else {}),
+                },
+            },
+            "result_state": (
+                "partial" if records and (execution_active or analysis_active)
+                else "available" if records
+                else "pending" if execution_active or analysis_active
+                else "empty"
+            ),
             "recommended_wait_seconds": (
-                20
-                if row["status"] not in TERMINAL
-                or analysis_active
-                else 0
+                20 if row["status"] not in TERMINAL or analysis_active else 0
             ),
-            "is_terminal": row["status"] in TERMINAL
-            and not analysis_active,
-            "can_cleanup": row["status"] in TERMINAL
-            and not analysis_active,
-            "recommended_action": (
-                "analyze_or_cleanup"
-                if row["execution_status"] == "completed"
-                and row["analysis_status"] == "not_requested"
-                else "analyze"
-                if analysis_active
-                else "cleanup"
-                if row["status"] in TERMINAL
-                else "output"
-            ),
+            "is_terminal": row["status"] in TERMINAL and not analysis_active,
+            "can_cleanup": row["status"] in TERMINAL and not analysis_active,
+            "recommended_action": "read_results_before_cleanup",
             "template_summary": plan.get("template_summary"),
             "request_catalog": self._request_catalog(agent_id, interaction_id),
         }
@@ -2132,9 +2332,7 @@ class HttpProbeManager:
             summary = self._load_summary(agent_id, interaction_id)
             page["summary"] = summary
             page["matched_requests"] = (
-                int(summary.get("matched_requests") or 0)
-                if summary is not None
-                else 0
+                int(summary.get("matched_requests") or 0) if summary is not None else 0
             )
         return page
 
@@ -2171,6 +2369,11 @@ class HttpProbeManager:
                         else record.get("outcome") or "pending"
                     ),
                     "response_available": response_available,
+                    "read_response": (
+                        {"tool": "system_http_response", "arguments": {
+                            "interaction_id": interaction_id, "request_id": request_id,
+                        }} if response_available else None
+                    ),
                 }
             )
             seen.add(request_id)
@@ -2189,6 +2392,11 @@ class HttpProbeManager:
                     "method": record.get("method"),
                     "status": record.get("outcome") or "completed",
                     "response_available": response_available,
+                    "read_response": (
+                        {"tool": "system_http_response", "arguments": {
+                            "interaction_id": interaction_id, "request_id": request_id,
+                        }} if response_available else None
+                    ),
                 }
             )
         return catalog[:256]
@@ -2202,14 +2410,19 @@ class HttpProbeManager:
         limit: int,
         filters: HttpOutputFilters | None,
         record_types: set[str],
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, int]:
         path = self._journal_path(agent_id, interaction_id)
         records: list[dict[str, Any]] = []
         with path.open("rb") as source:
-            source.seek(min(cursor, path.stat().st_size))
-            while len(records) < limit:
-                line = source.readline()
+            page_end_cursor = os.fstat(source.fileno()).st_size
+            source.seek(min(cursor, page_end_cursor))
+            while source.tell() < page_end_cursor:
+                start = source.tell()
+                line = source.readline(page_end_cursor - start)
                 if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    source.seek(start)
                     break
                 try:
                     record = json.loads(line)
@@ -2223,9 +2436,12 @@ class HttpProbeManager:
                     agent_id, interaction_id, record, filters
                 ):
                     continue
+                if len(records) == limit:
+                    source.seek(start)
+                    break
                 records.append(self._compact_record(record))
             next_cursor = source.tell()
-        return records, next_cursor
+        return records, next_cursor, page_end_cursor
 
     @staticmethod
     def _compact_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -2233,7 +2449,8 @@ class HttpProbeManager:
             return record
         compact = dict(record)
         headers = {
-            str(name).lower(): value for name, value in record.get("headers", {}).items()
+            str(name).lower(): value
+            for name, value in record.get("headers", {}).items()
         }
         selected = {
             name: headers[name]
@@ -2255,16 +2472,26 @@ class HttpProbeManager:
     def _matches_filter(record: dict[str, Any], filters: HttpOutputFilters) -> bool:
         if filters.request_ids and record.get("request_id") not in filters.request_ids:
             return False
-        if filters.status_codes and record.get("status_code") not in filters.status_codes:
+        if (
+            filters.status_codes
+            and record.get("status_code") not in filters.status_codes
+        ):
             return False
         if filters.outcomes and record.get("outcome") not in filters.outcomes:
             return False
-        if filters.request_group_id and record.get("request_group_id") != filters.request_group_id:
+        if (
+            filters.request_group_id
+            and record.get("request_group_id") != filters.request_group_id
+        ):
             return False
         size = record.get("body_bytes")
-        if filters.min_body_bytes is not None and (size is None or size < filters.min_body_bytes):
+        if filters.min_body_bytes is not None and (
+            size is None or size < filters.min_body_bytes
+        ):
             return False
-        if filters.max_body_bytes is not None and (size is None or size > filters.max_body_bytes):
+        if filters.max_body_bytes is not None and (
+            size is None or size > filters.max_body_bytes
+        ):
             return False
         return True
 
@@ -2308,7 +2535,10 @@ class HttpProbeManager:
         if not path.exists():
             return False
         data = path.read_bytes()
-        if filters.body_contains is not None and filters.body_contains.encode() not in data:
+        if (
+            filters.body_contains is not None
+            and filters.body_contains.encode() not in data
+        ):
             return False
         if filters.body_regex is not None:
             try:
@@ -2390,7 +2620,9 @@ class HttpProbeManager:
                     "location": None,
                     "title": None,
                     "headers": {},
-                    "error": "RuntimeInterrupted" if outcome == "interrupted" else "Stopped",
+                    "error": (
+                        "RuntimeInterrupted" if outcome == "interrupted" else "Stopped"
+                    ),
                     "body_file": body_path.name if body_path.exists() else None,
                 },
             )
@@ -2668,25 +2900,33 @@ class HttpProbeManager:
             )
         except StateNotFound as exc:
             raise self._error(
-                "not_found", "http_interaction_not_found", "HTTP interaction was not found"
+                "not_found",
+                "http_interaction_not_found",
+                "HTTP interaction was not found",
             ) from exc
 
     async def _interaction_any_owner(self, interaction_id: str) -> dict[str, Any]:
         rows = await self.service.list_http_interactions(self.run_id)
-        row = next((item for item in rows if item["interaction_id"] == interaction_id), None)
+        row = next(
+            (item for item in rows if item["interaction_id"] == interaction_id), None
+        )
         if row is None:
             raise self._error(
-                "not_found", "http_interaction_not_found", "HTTP interaction was not found"
+                "not_found",
+                "http_interaction_not_found",
+                "HTTP interaction was not found",
             )
         return row
 
     async def _request_owned(self, agent_id: str, request_id: str) -> bool:
-        for row in await self.service.list_http_interactions(self.run_id, agent_id=agent_id):
+        for row in await self.service.list_http_interactions(
+            self.run_id, agent_id=agent_id
+        ):
             try:
                 plan = self._plan(agent_id, row["interaction_id"])
                 if any(
                     item.request_id == request_id
-                    for item in self._load_plan(agent_id, row["interaction_id"])
+                    for item in [self._request_from_json(raw) for raw in plan.get("requests", [])]
                 ):
                     return True
                 if plan.get("kind") == "path_probe":
@@ -2716,7 +2956,7 @@ class HttpProbeManager:
         for row in await self.service.list_http_interactions(self.run_id):
             try:
                 plan = self._plan(row["agent_id"], row["interaction_id"])
-                requests = self._load_plan(row["agent_id"], row["interaction_id"])
+                requests = [self._request_from_json(raw) for raw in plan.get("requests", [])]
             except (OSError, KeyError, ValueError):
                 continue
             option_group = None
@@ -2918,7 +3158,9 @@ class HttpProbeManager:
             buckets.setdefault((segment, segment_value), []).append(index)
         return name
 
-    def _response_records(self, agent_id: str, interaction_id: str) -> list[dict[str, Any]]:
+    def _response_records(
+        self, agent_id: str, interaction_id: str
+    ) -> list[dict[str, Any]]:
         path = self._journal_path(agent_id, interaction_id)
         if not path.exists():
             return []
@@ -2963,9 +3205,7 @@ class HttpProbeManager:
         path = self._response_dir(agent_id, interaction_id) / str(body_file)
         return not path.is_symlink() and path.is_file()
 
-    async def _next_analysis_revision(
-        self, agent_id: str, interaction_id: str
-    ) -> int:
+    async def _next_analysis_revision(self, agent_id: str, interaction_id: str) -> int:
         revisions = [
             int(item.get("revision", 0))
             for item in self._all_records(agent_id, interaction_id)
@@ -3131,7 +3371,14 @@ class HttpProbeManager:
         )
 
     def _agent_root(self, agent_id: str) -> Path:
-        return self.policy.root / ".system-tools" / "runs" / self.run_id / "agents" / agent_id
+        return (
+            self.policy.root
+            / ".system-tools"
+            / "runs"
+            / self.run_id
+            / "agents"
+            / agent_id
+        )
 
     async def _remove_orphan_interaction_directories(self) -> None:
         """Remove only Run-scoped directories that have no authoritative row."""
@@ -3177,7 +3424,9 @@ class HttpProbeManager:
 
     def _require_open(self) -> None:
         if self._closed:
-            raise self._error("conflict", "http_manager_closed", "HTTP manager is closed")
+            raise self._error(
+                "conflict", "http_manager_closed", "HTTP manager is closed"
+            )
 
     @staticmethod
     def _error(

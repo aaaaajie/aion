@@ -1,6 +1,7 @@
 """Tests for persistent bridge-backed network discovery tools."""
 
 from __future__ import annotations
+from tests.resource_runtime import another_resource_agent
 
 import asyncio
 from pathlib import Path
@@ -15,7 +16,7 @@ from tools.system.policy import SystemToolError, WorkspacePolicy
 from tests.resource_runtime import install_resource_runtime
 
 
-_FAKE_BRIDGE = r'''#!/usr/bin/env python3
+_FAKE_BRIDGE = r"""#!/usr/bin/env python3
 import json
 import sys
 
@@ -44,7 +45,7 @@ for line in sys.stdin:
     elif command["type"] == "stop":
         print(json.dumps({"type":"finished","status":"stopped","stats":{"tasks_total":3,"tasks_completed":1}}), flush=True)
         raise SystemExit(0)
-'''
+"""
 
 
 def _fake_bridge(
@@ -118,6 +119,10 @@ async def test_discovery_uses_network_tasks_and_paginates(tmp_path: Path) -> Non
     )
     assert first["results"] == repeated["results"]
     assert first["next_cursor"] == repeated["next_cursor"]
+    assert first["read_result"]["tool"] == "system_network_output"
+    assert first["result_state"] == "available"
+    reread = await manager.output(agent_id, **first["read_result"]["arguments"])
+    assert reread["results"] == first["results"]
     filtered = await manager.output(
         agent_id,
         task_id=result["task_id"],
@@ -138,13 +143,16 @@ async def test_discovery_uses_network_tasks_and_paginates(tmp_path: Path) -> Non
     )
     await repaired.initialize()
     assert results_path.read_bytes().endswith(b"\n")
-    assert len(
-        (
-            await repaired.output(
-                agent_id, task_id=result["task_id"], wait_seconds=0
-            )
-        )["results"]
-    ) == 3
+    assert (
+        len(
+            (
+                await repaired.output(
+                    agent_id, task_id=result["task_id"], wait_seconds=0
+                )
+            )["results"]
+        )
+        == 3
+    )
     await manager.finish_run()
     await service.close()
 
@@ -192,7 +200,7 @@ async def test_running_stop_cleanup_and_ownership_without_sleep(tmp_path: Path) 
         await manager.cleanup(agent_id, result["task_id"])
     assert running_cleanup.value.code == "task_still_running"
 
-    second = await service.register_agent("run-1", role="chief", initial_prompt="second")
+    second = await another_resource_agent(service, "run-1")
     with pytest.raises(SystemToolError) as denied:
         await manager.output(
             second["agent_id"], task_id=result["task_id"], wait_seconds=0
@@ -222,18 +230,20 @@ async def test_running_stop_cleanup_and_ownership_without_sleep(tmp_path: Path) 
         "running",
         "stopped",
     }
-    page = await manager.output(
-        agent_id, task_id=result["task_id"], wait_seconds=0
-    )
+    page = await manager.output(agent_id, task_id=result["task_id"], wait_seconds=0)
     assert len(page["results"]) == 3
     assert (await manager.cleanup(agent_id, result["task_id"]))["cleaned"] is True
-    assert (await manager.cleanup(agent_id, result["task_id"]))["already_cleaned"] is True
+    assert (await manager.cleanup(agent_id, result["task_id"]))[
+        "already_cleaned"
+    ] is True
     await manager.finish_run()
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_queued_output_stop_cleanup_and_recovery_are_persistent(tmp_path: Path) -> None:
+async def test_queued_output_stop_cleanup_and_recovery_are_persistent(
+    tmp_path: Path,
+) -> None:
     service, manager, agent_id = await _harness(
         tmp_path, _fake_bridge(tmp_path), start_runtime=False
     )
@@ -241,9 +251,9 @@ async def test_queued_output_stop_cleanup_and_recovery_are_persistent(tmp_path: 
         agent_id, targets="127.0.0.1", ports="80", wait_seconds=0
     )
     assert first["status"] == "queued"
-    assert (await manager.output(
-        agent_id, task_id=first["task_id"], wait_seconds=0
-    ))["status"] == "queued"
+    assert (await manager.output(agent_id, task_id=first["task_id"], wait_seconds=0))[
+        "status"
+    ] == "queued"
     assert (await manager.stop(agent_id, first["task_id"]))["status"] == "stopped"
     assert (await manager.cleanup(agent_id, first["task_id"]))["cleaned"] is True
 
@@ -257,9 +267,7 @@ async def test_queued_output_stop_cleanup_and_recovery_are_persistent(tmp_path: 
         binary_path=_fake_bridge(tmp_path),
     )
     await resumed.initialize(resume=True)
-    page = await resumed.output(
-        agent_id, task_id=second["task_id"], wait_seconds=0
-    )
+    page = await resumed.output(agent_id, task_id=second["task_id"], wait_seconds=0)
     assert page["status"] == "interrupted"
     assert page["error_code"] == "runtime_recovered"
     await resumed.finish_run()
@@ -267,7 +275,9 @@ async def test_queued_output_stop_cleanup_and_recovery_are_persistent(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_runtime_resource_pause_resume_and_stop_do_not_deadlock(tmp_path: Path) -> None:
+async def test_runtime_resource_pause_resume_and_stop_do_not_deadlock(
+    tmp_path: Path,
+) -> None:
     allowed = False
 
     async def guard(_work_id: str) -> dict:
@@ -286,18 +296,14 @@ async def test_runtime_resource_pause_resume_and_stop_do_not_deadlock(tmp_path: 
         agent_id, targets="127.0.0.1", ports="80", wait_seconds=0
     )
     for _ in range(100):
-        page = await manager.output(
-            agent_id, task_id=result["task_id"], wait_seconds=0
-        )
+        page = await manager.output(agent_id, task_id=result["task_id"], wait_seconds=0)
         if page["resource_status"] == "waiting":
             break
         await asyncio.sleep(0.01)
     assert page["resource_status"] == "waiting"
     allowed = True
     for _ in range(150):
-        page = await manager.output(
-            agent_id, task_id=result["task_id"], wait_seconds=0
-        )
+        page = await manager.output(agent_id, task_id=result["task_id"], wait_seconds=0)
         if page["resource_status"] == "running":
             break
         await asyncio.sleep(0.01)
@@ -355,7 +361,10 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
     if not binary.is_file():
         pytest.skip("aion-fscan bridge is not built")
     service, manager, agent_id = await _harness(tmp_path, binary)
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             await asyncio.wait_for(reader.read(4096), timeout=1)
             writer.write(
@@ -385,9 +394,7 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
             )
         assert result["status"] == "completed"
         assert result["open_ports"] == 1
-        assert not any(
-            item.get("plugin") == "webtitle" for item in result["results"]
-        )
+        assert not any(item.get("plugin") == "webtitle" for item in result["results"])
         assert result["scanner_version"]
         marked = await manager.start_discovery(
             agent_id,
@@ -403,9 +410,9 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
             )
         assert marked["status"] == "completed"
         assert marked["web_ports"] >= 1
-        assert any(item.get("plugin") == "webtitle" for item in marked["results"]), marked[
-            "results"
-        ]
+        assert any(item.get("plugin") == "webtitle" for item in marked["results"]), (
+            marked["results"]
+        )
     finally:
         server.close()
         await server.wait_closed()
@@ -413,31 +420,31 @@ async def test_real_bridge_loopback_smoke(tmp_path: Path, unused_tcp_port: int) 
     await service.close()
 
 
-def test_tool_definitions_are_execution_only_and_prompted(tmp_path: Path) -> None:
+def test_tool_definitions_are_shared_by_solver_and_worker_and_prompted(
+    tmp_path: Path,
+) -> None:
     service = StateService(tmp_path / "state.sqlite3")
     manager = NetworkDiscoveryManager(
         WorkspacePolicy(tmp_path), service, "run-1", binary_path=_fake_bridge(tmp_path)
     )
     from agent.tooling import ToolRegistry
 
-    definitions = ToolRegistry([NetworkTools(manager.bind("execution-test"))]).definitions()
+    definitions = ToolRegistry(
+        [NetworkTools(manager.bind("execution-test"))]
+    ).definitions()
     names = {item["function"]["name"] for item in definitions}
-    assert names <= AgentPolicy("execution").allowed_tools
+    assert names <= AgentPolicy("worker").allowed_tools
     assert names.isdisjoint(AgentPolicy("chief").allowed_tools)
-    assert names.isdisjoint(AgentPolicy("challenge").allowed_tools)
-    prompt = (
-        Path(__file__).resolve().parents[1] / "agent" / "prompts" / "execution_system.txt"
-    ).read_text(encoding="utf-8")
-    assert "system_network_discovery" in prompt
-    assert "system_network_output" in prompt
+    assert names <= AgentPolicy("solver").allowed_tools
     discovery_schema = next(
         item["function"]["parameters"]
         for item in definitions
         if item["function"]["name"] == "system_network_discovery"
     )
-    assert "maximum" not in discovery_schema["properties"]["concurrency"].get(
-        "anyOf", [{}]
-    )[0]
+    assert (
+        "maximum"
+        not in discovery_schema["properties"]["concurrency"].get("anyOf", [{}])[0]
+    )
     output_schema = next(
         item["function"]["parameters"]
         for item in definitions

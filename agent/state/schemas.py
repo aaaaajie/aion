@@ -29,41 +29,15 @@ ChallengeDirection = Literal[
 CHALLENGE_DIRECTION_VALUES = frozenset(
     {"unknown", "web", "pentest", "binary", "exploit", "cloud", "evasion"}
 )
-ExecutionKind = Literal[
-    "general",
-    "recon",
-    "web",
-    "pentest",
-    "exploit",
-    "cloud",
-    "evasion",
-    "credential",
-    "privilege",
-    "verification",
-    "exploration",
-]
-TaskStage = Literal["discovery", "validation", "exploitation", "post_exploitation"]
-HypothesisOutcome = Literal["supported", "rejected", "inconclusive"]
 ChallengeWorkStatus = Literal[
     "unassigned",
     "active",
-    "warning",
-    "extended",
     "paused",
     "completed",
     "closed",
 ]
 CHALLENGE_WORK_STATUS_VALUES = frozenset(
-    {"unassigned", "active", "warning", "extended", "paused", "completed", "closed"}
-)
-ChallengeControlState = Literal[
-    "ok",
-    "blocked",
-    "degraded",
-    "waiting_external_change",
-]
-CHALLENGE_CONTROL_STATE_VALUES = frozenset(
-    {"ok", "blocked", "degraded", "waiting_external_change"}
+    {"unassigned", "active", "paused", "completed", "closed"}
 )
 
 
@@ -106,70 +80,46 @@ class ReportFindingInput(StrictModel):
         return values
 
 
-
-class ExecutionTaskInput(StrictModel):
+class WorkerTaskInput(StrictModel):
     objective: str = Field(min_length=1, max_length=4_000)
-    task_key: str | None = Field(default=None, min_length=1, max_length=128)
-    hypothesis_key: str | None = Field(default=None, min_length=1, max_length=128)
-    branch_key: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=256,
-        description="Stable capability branch key; defaults to hypothesis:kind when omitted.",
-    )
-    kind: ExecutionKind = "general"
-    task_stage: TaskStage = "discovery"
-    priority: int = Field(default=50, ge=0, le=100)
+    task_key: str = Field(min_length=1, max_length=128)
+    mode: Literal["execute", "review"] = "execute"
     success_criteria: list[str] = Field(default_factory=list, max_length=20)
-    context_refs: list[str] = Field(default_factory=list, max_length=50)
-    timeout_seconds: int = Field(default=1_800, ge=1, le=3_600)
+    context_refs: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Exact evidence_ref/report_ref values supplied by the parent. Required when a review targets a specific artifact; never invent references.",
+    )
+    timeout_seconds: int | None = Field(default=None, ge=1)
 
-
-class HypothesisInput(StrictModel):
-    key: str = Field(min_length=1, max_length=128)
-    statement: str = Field(min_length=1, max_length=4_000)
-    confidence: float = Field(default=0.5, ge=0, le=1)
-    based_on_observations: list[str] = Field(default_factory=list, max_length=50)
-
-
-
-class ChallengeDispatchInput(StrictModel):
-    summary: str = Field(default="runtime state update", min_length=1, max_length=8_000)
-    outcome: Literal["continue", "blocked", "completed", "failed"] = "continue"
-    direction: ChallengeDirection | None = None
-    tasks: list[ExecutionTaskInput] = Field(default_factory=list, max_length=50)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
-    next_steps: list[str] = Field(default_factory=list, max_length=50)
-
-    @field_validator("evidence_refs")
+    @field_validator("objective", "task_key")
     @classmethod
-    def non_blank_evidence_refs(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("evidence references must not be blank")
-        return values
+    def non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value.strip()
 
 
-
-class AgentReportInput(StrictModel):
-    status: Literal["completed", "blocked", "failed", "cancelled"]
+class WorkerUpdateInput(StrictModel):
     summary: str = Field(min_length=1, max_length=4_000)
-    hypothesis_outcome: SkipValidation[HypothesisOutcome] = "inconclusive"
-    findings: SkipValidation[list[ReportFindingInput]] = Field(
-        default_factory=list,
-        description=(
-            "Optional best-effort findings. Use summary (not title), an object detail, "
-            "and complete finding:/evidence: references. Malformed items produce warnings "
-            "without losing the terminal report."
-        ),
-    )
-    evidence_refs: SkipValidation[list[str]] = Field(
-        default_factory=list,
-        description="Optional Evidence refs; malformed refs are dropped with warnings.",
-    )
+    evidence_refs: list[str] = Field(default_factory=list, max_length=50)
+    tested: list[str] = Field(default_factory=list, max_length=50)
+    untested: list[str] = Field(default_factory=list, max_length=50)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
+
+
+class AgentReportInput(WorkerUpdateInput):
+    status: Literal["completed", "blocked", "failed", "cancelled", "interrupted"]
+    findings: list[ReportFindingInput] = Field(default_factory=list, max_length=50)
     confidence: float | None = Field(default=None, ge=0, le=1)
 
+
+class ReviewAgentReportInput(WorkerUpdateInput):
+    """Terminal report contract for read-only review Workers."""
+
+    status: Literal["completed", "blocked", "failed", "cancelled", "interrupted"]
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class ChallengeStateUpdate(StrictModel):
@@ -179,11 +129,10 @@ class ChallengeStateUpdate(StrictModel):
     container_addr: list[str] | None = None
 
 
-
 class CapabilityContext(StrictModel):
     run_id: str = Field(min_length=1)
     agent_id: str = Field(min_length=1)
-    role: Literal["chief", "challenge", "execution"]
+    role: Literal["chief", "solver", "worker"]
     unique_code: str | None = None
 
 

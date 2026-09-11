@@ -24,6 +24,14 @@ scripts/recheck_liuyan.py
 scripts/build_platform.py
 deploy/README.md
 agent/skills/execution/* copy/
+output/
+tools/binaries/playwright-browsers/
+docs/web-challenge-playbook.md
+docs/run-*-review.md
+docs/analysis/*-comparison.md
+docs/poc-entry-acceptance.md
+docs/poc-runtime-acceptance.md
+docs/skill-awareness-acceptance.md
 
 # VPS-specific operator credentials and host fingerprints
 deploy/vps_known_hosts

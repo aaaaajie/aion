@@ -7,8 +7,6 @@ import stat
 from pathlib import Path
 from typing import Any
 
-DEFAULT_WORKSPACE_ROOT = Path("/Users/mr.li/aion")
-
 
 class SystemToolError(Exception):
     """Safe, serializable error raised by a system tool operation."""
@@ -60,7 +58,7 @@ class WorkspacePolicy:
         "/dev/fd/2",
     }
 
-    def __init__(self, root: str | os.PathLike[str] = DEFAULT_WORKSPACE_ROOT) -> None:
+    def __init__(self, root: str | os.PathLike[str]) -> None:
         root_path = Path(root).expanduser()
         try:
             root_path = root_path.resolve(strict=True)

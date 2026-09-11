@@ -25,7 +25,13 @@ class ResourceRuntimePump:
         self.http_manager = http_manager
         self.network_manager = network_manager
         self.controller = controller or ResourceController(
-            service, run_id, storage_root=root
+            service,
+            run_id,
+            storage_root=root,
+            # Test fixtures must not depend on the host volume's free space;
+            # production Runtime supplies the real disk-reservation policy.
+            disk_reserve_bytes=0,
+            disk_reserve_percent=0.0,
         )
         self._closed = False
         self._task = asyncio.create_task(self._run())
@@ -102,3 +108,18 @@ def install_resource_runtime(
     manager.finish_run = finish_run
     manager.pause_run = pause_run
     return pump
+
+
+async def another_resource_agent(service, run_id):
+    from uuid import uuid4
+
+    code = "owner-" + uuid4().hex
+    await service.import_challenges(run_id, [{"unique_code": code}])
+    chief = next(
+        a
+        for a in (await service.get_overview(run_id))["agents"]
+        if a["role"] == "chief"
+    )
+    return await service.register_agent(
+        run_id, role="solver", parent_id=chief["agent_id"], unique_code=code
+    )

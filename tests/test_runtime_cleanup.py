@@ -22,11 +22,7 @@ def test_fresh_cleanup_removes_only_runtime_owned_paths(tmp_path: Path) -> None:
     cache.mkdir(parents=True)
     (cache / "old-task.json").write_text("stale", encoding="utf-8")
     run_dir = run_root / "fresh-run"
-    run_dir.mkdir(parents=True)
-    (run_dir / "state.sqlite3").write_text("stale", encoding="utf-8")
     evidence_dir = workspace / ".aion" / "runs" / "fresh-run"
-    evidence_dir.mkdir(parents=True)
-    (evidence_dir / "stale.json").write_text("stale", encoding="utf-8")
 
     evidence = workspace / "evidence" / "keep.txt"
     evidence.parent.mkdir(parents=True)
@@ -46,6 +42,12 @@ def test_fresh_cleanup_removes_only_runtime_owned_paths(tmp_path: Path) -> None:
     assert not evidence_dir.exists()
     assert evidence.read_text(encoding="utf-8") == "archive"
     assert old_run.read_text(encoding="utf-8") == "archive"
+
+    with pytest.raises(FreshRunCleanupError, match="already exists"):
+        cleanup_fresh_run_artifacts(
+            workspace_root=workspace, run_root=run_root, run_id="old-run"
+        )
+    assert old_run.read_text() == "archive"
 
 
 def test_fresh_cleanup_accepts_missing_artifacts(tmp_path: Path) -> None:

@@ -34,18 +34,15 @@ def _skill(
     *,
     description: str | None = None,
     when_to_use: str | None = None,
-    auto_activate_for: tuple[str, ...] = (),
     body: str = "Use the available evidence.\n",
 ) -> Path:
     directory = root / category / name
     directory.mkdir(parents=True)
-    auto = "[" + ", ".join(auto_activate_for) + "]"
     (directory / "SKILL.md").write_text(
         "---\n"
         f"name: {name}\n"
         f"description: {description or f'Use {name} for a bounded task.'}\n"
         f"when_to_use: {when_to_use or f'When the bounded task needs {name}.'}\n"
-        f"auto_activate_for: {auto}\n"
         "---\n\n"
         f"{body}",
         encoding="utf-8",
@@ -100,7 +97,7 @@ def _context(
     )
 
 
-def test_catalog_compiles_role_listings_auto_skills_and_invocation_payload(
+def test_catalog_compiles_role_listings_and_invocation_payload(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
@@ -109,7 +106,6 @@ def test_catalog_compiles_role_listings_auto_skills_and_invocation_payload(
         "common",
         "collect-evidence",
         description="Collect durable evidence.",
-        auto_activate_for=("challenge",),
         body="# Evidence\n\nKeep exact paths.\n",
     )
     (common / "references").mkdir()
@@ -126,19 +122,17 @@ def test_catalog_compiles_role_listings_auto_skills_and_invocation_payload(
 
     catalog = SkillCatalog(root)
 
-    assert [item.skill_id for item in catalog.available("challenge")] == [
+    assert set(item.skill_id for item in catalog.available("solver")) == {
         "challenge/plan-web",
         "common/collect-evidence",
-    ]
-    assert [item.skill_id for item in catalog.auto_skills("challenge")] == [
-        "common/collect-evidence"
-    ]
-    assert "common/collect-evidence" not in catalog.listing("challenge")
-    assert "challenge/plan-web" in catalog.listing("challenge")
-    assert len(catalog.listing("execution")) <= catalog_module.MAX_LISTING_CHARS
+        "execution/auth-bypass",
+    }
+    assert "common/collect-evidence" in catalog.listing("solver")
+    assert "challenge/plan-web" in catalog.listing("solver")
+    assert len(catalog.listing("worker")) <= catalog_module.MAX_LISTING_CHARS
 
     payload = catalog.invocation_payload(
-        "execution", "execution/auth-bypass", activation_status="activated"
+        "worker", "execution/auth-bypass", activation_status="activated"
     )
     assert payload["instructions"].startswith("Use the available evidence")
     assert "---" not in payload["instructions"]
@@ -146,7 +140,10 @@ def test_catalog_compiles_role_listings_auto_skills_and_invocation_payload(
     assert script["shell_path"] == (
         "$AION_SKILLS_ROOT/execution/auth-bypass/scripts/detect.py"
     )
-    assert len(json.dumps(payload, ensure_ascii=False)) < catalog_module.MAX_INVOKE_RESULT_CHARS
+    assert (
+        len(json.dumps(payload, ensure_ascii=False))
+        < catalog_module.MAX_INVOKE_RESULT_CHARS
+    )
 
 
 def test_catalog_ignores_only_finder_copy_of_a_canonical_skill(
@@ -162,7 +159,7 @@ def test_catalog_ignores_only_finder_copy_of_a_canonical_skill(
     )
 
     catalog = SkillCatalog(root)
-    assert [item.skill_id for item in catalog.available("execution")] == [
+    assert [item.skill_id for item in catalog.available("worker")] == [
         "execution/probe-service"
     ]
 
@@ -177,7 +174,7 @@ def test_catalog_reads_only_supporting_resources_by_lines(tmp_path: Path) -> Non
     catalog = SkillCatalog(root)
 
     first = catalog.read_resource(
-        "execution",
+        "worker",
         "execution/probe-service",
         resource="references/notes.md",
         limit=2,
@@ -185,7 +182,7 @@ def test_catalog_reads_only_supporting_resources_by_lines(tmp_path: Path) -> Non
     assert first["content"] == "alpha\nbeta"
     assert first["next_offset"] == 2
     final = catalog.read_resource(
-        "execution",
+        "worker",
         "execution/probe-service",
         resource="references/notes.md",
         offset=first["next_offset"],
@@ -195,21 +192,21 @@ def test_catalog_reads_only_supporting_resources_by_lines(tmp_path: Path) -> Non
     assert final["has_more"] is False
 
     with pytest.raises(SkillCatalogError) as core:
-        catalog.read_resource(
-            "execution", "execution/probe-service", resource="SKILL.md"
-        )
+        catalog.read_resource("worker", "execution/probe-service", resource="SKILL.md")
     assert core.value.code == "skill_core_read_not_allowed"
     assert core.value.retry_tool == "skill_invoke"
 
 
-def test_catalog_bounds_large_resource_and_pages_large_instructions(tmp_path: Path) -> None:
+def test_catalog_bounds_large_resource_and_pages_large_instructions(
+    tmp_path: Path,
+) -> None:
     root = _root(tmp_path)
     skill = _skill(root, "common", "large-reference")
     (skill / "references").mkdir()
     body = "\n".join(f"{index:03d}-" + "x" * 196 for index in range(100))
     (skill / "references" / "large.md").write_text(body, encoding="utf-8")
     result = SkillCatalog(root).read_resource(
-        "execution", "common/large-reference", resource="references/large.md"
+        "worker", "common/large-reference", resource="references/large.md"
     )
     assert len(result["content"]) <= catalog_module.MAX_READ_CHARS
     assert result["has_more"] is True
@@ -222,11 +219,11 @@ def test_catalog_bounds_large_resource_and_pages_large_instructions(tmp_path: Pa
         body="# Guide\n\n" + "\n".join("x" * 1_000 for _ in range(9)),
     )
     large_catalog = SkillCatalog(large_root)
-    record = large_catalog.get("execution", "common/large-core")
+    record = large_catalog.get("worker", "common/large-core")
     assert len(record.activation_view) <= catalog_module.MAX_ACTIVATION_VIEW_CHARS
     assert len(record.activation_view) < len(record.instructions)
     page = large_catalog.read_resource(
-        "execution", "common/large-core", resource="instructions", limit=10
+        "worker", "common/large-core", resource="instructions", limit=10
     )
     assert page["resource"]["kind"] == "instructions"
     assert page["content"].startswith("# Guide")
@@ -263,21 +260,24 @@ def test_catalog_derives_optional_when_to_use_from_body_then_description(
         encoding="utf-8",
     )
     catalog = SkillCatalog(root)
-    assert catalog.get("execution", "execution/body-routing").when_to_use == (
+    assert catalog.get("worker", "execution/body-routing").when_to_use == (
         "Use when SQL login behavior needs validation."
     )
-    assert catalog.get(
-        "execution", "execution/description-routing"
-    ).when_to_use == "Use for fallback routing."
+    assert (
+        catalog.get("worker", "execution/description-routing").when_to_use
+        == "Use for fallback routing."
+    )
 
 
-@pytest.mark.parametrize("resource", ["../outside.txt", "/etc/passwd", "references/../x"])
+@pytest.mark.parametrize(
+    "resource", ["../outside.txt", "/etc/passwd", "references/../x"]
+)
 def test_catalog_rejects_resource_traversal(tmp_path: Path, resource: str) -> None:
     root = _root(tmp_path)
     _skill(root, "challenge", "plan-safe")
     with pytest.raises(SkillCatalogError) as error:
         SkillCatalog(root).read_resource(
-            "challenge", "challenge/plan-safe", resource=resource
+            "solver", "challenge/plan-safe", resource=resource
         )
     assert error.value.code == "skill_resource_outside_root"
 
@@ -296,23 +296,17 @@ def test_catalog_rejects_symlink_binary_invalid_role_and_invalid_frontmatter(
     catalog = SkillCatalog(root)
     with pytest.raises(SkillCatalogError) as escaped:
         catalog.read_resource(
-            "execution", "execution/inspect-input", resource="references/escape.txt"
+            "worker", "execution/inspect-input", resource="references/escape.txt"
         )
     assert escaped.value.code == "skill_resource_outside_root"
     with pytest.raises(SkillCatalogError) as binary:
         catalog.read_resource(
-            "execution", "execution/inspect-input", resource="references/binary.dat"
+            "worker", "execution/inspect-input", resource="references/binary.dat"
         )
     assert binary.value.code == "skill_resource_not_utf8"
     with pytest.raises(SkillCatalogError) as inaccessible:
-        catalog.get("challenge", "execution/inspect-input")
+        catalog.get("worker", "challenge/plan-safe")
     assert inaccessible.value.code == "skill_not_found"
-
-    invalid = _root(tmp_path / "invalid")
-    _skill(invalid, "common", "bad-role", auto_activate_for=("chief",))
-    with pytest.raises(SkillCatalogError) as bad_role:
-        SkillCatalog(invalid)
-    assert bad_role.value.code == "skill_auto_activate_for_invalid"
 
 
 def test_catalog_rejects_name_mismatch_and_duplicate_ids(
@@ -323,7 +317,7 @@ def test_catalog_rejects_name_mismatch_and_duplicate_ids(
     directory.mkdir()
     (directory / "SKILL.md").write_text(
         "---\nname: different-name\ndescription: mismatch\n"
-        "when_to_use: during a mismatch test\nauto_activate_for: []\n"
+        "when_to_use: during a mismatch test\n"
         "---\nbody\n",
         encoding="utf-8",
     )
@@ -340,7 +334,7 @@ def test_catalog_rejects_name_mismatch_and_duplicate_ids(
 
 
 @pytest.mark.asyncio
-async def test_session_auto_activation_invoke_idempotency_and_resource_gate(
+async def test_session_explicit_activation_invoke_idempotency_and_resource_gate(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
@@ -348,7 +342,6 @@ async def test_session_auto_activation_invoke_idempotency_and_resource_gate(
         root,
         "common",
         "direction",
-        auto_activate_for=("challenge",),
         body="Classify the challenge.\n",
     )
     (auto / "references").mkdir()
@@ -357,14 +350,16 @@ async def test_session_auto_activation_invoke_idempotency_and_resource_gate(
     catalog = SkillCatalog(root)
     service = _SkillStateService()
 
-    challenge = _context(catalog, "challenge", service=service)
-    await challenge.ensure_auto_activated()
+    challenge = _context(catalog, "solver", service=service)
+    assert challenge.render_system_context() == ""
+    assert service.writes == 0
+    await challenge.invoke("common/direction")
     assert service.writes == 1
     assert "<active_skills>" in challenge.render_system_context()
     assert "Classify the challenge." in challenge.render_system_context()
-    assert "common/direction" not in catalog.listing("challenge")
+    assert "common/direction" in catalog.listing("solver")
 
-    execution = _context(catalog, "execution", service=service, agent_id="execution")
+    execution = _context(catalog, "worker", service=service, agent_id="execution")
     with pytest.raises(SkillCatalogError) as inactive:
         execution.read_resource(
             "common/direction", resource="references/web.md", offset=0, limit=10
@@ -377,16 +372,21 @@ async def test_session_auto_activation_invoke_idempotency_and_resource_gate(
     assert repeated["activation_status"] == "already_active"
     assert repeated["instructions"] is None
     assert service.writes == 2
-    assert execution.read_resource(
-        "common/direction", resource="references/web.md", offset=0, limit=10
-    )["content"] == "web rules"
+    assert (
+        execution.read_resource(
+            "common/direction", resource="references/web.md", offset=0, limit=10
+        )["content"]
+        == "web rules"
+    )
 
 
 @pytest.mark.asyncio
-async def test_skill_tools_are_strict_solo_and_return_safe_errors(tmp_path: Path) -> None:
+async def test_skill_tools_are_strict_solo_and_return_safe_errors(
+    tmp_path: Path,
+) -> None:
     root = _root(tmp_path)
     _skill(root, "challenge", "plan-web")
-    context = _context(SkillCatalog(root), "challenge")
+    context = _context(SkillCatalog(root), "solver")
     tools = SkillTools(context)
     registry = ToolRegistry([tools])
     definitions = registry.definitions()
@@ -402,7 +402,12 @@ async def test_skill_tools_are_strict_solo_and_return_safe_errors(tmp_path: Path
 
     async def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
         prepared = await ToolExecutor(registry).execute(
-            [{"id": name, "function": {"name": name, "arguments": json.dumps(arguments)}}]
+            [
+                {
+                    "id": name,
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            ]
         )
         assert prepared[0].result is not None
         return prepared[0].result
@@ -449,7 +454,7 @@ async def test_activation_budget_is_checked_before_state_write(
     root = _root(tmp_path)
     _skill(root, "execution", "large", body="x" * 200)
     service = _SkillStateService()
-    context = _context(SkillCatalog(root), "execution", service=service)
+    context = _context(SkillCatalog(root), "worker", service=service)
     monkeypatch.setattr(session_module, "MAX_ACTIVE_CONTEXT_CHARS", 100)
     with pytest.raises(SkillCatalogError) as error:
         await context.invoke("execution/large")
@@ -464,7 +469,7 @@ def test_session_restore_rejects_changed_skill_content(tmp_path: Path) -> None:
     with pytest.raises(SkillCatalogError) as error:
         _context(
             catalog,
-            "execution",
+            "worker",
             active_skills=[
                 {
                     "skill_id": "execution/immutable",
@@ -479,12 +484,11 @@ def test_session_restore_rejects_changed_skill_content(tmp_path: Path) -> None:
 
 def test_challenge_strategy_skill_is_llm_selected_not_auto_activated() -> None:
     catalog = SkillCatalog(Path(__file__).resolve().parents[1] / "agent" / "skills")
-    skill = catalog.get("challenge", "challenge/challenge-threat-modeling")
+    skill = catalog.get("solver", "challenge/challenge-threat-modeling")
 
-    assert "challenge" not in skill.auto_activate_for
     assert "first technical dispatch" in skill.when_to_use
     listing = catalog.listing(
-        "challenge",
+        "solver",
         selection_text=(
             "No attack-surface model exists and the direction is uncertain before "
             "the first technical dispatch"

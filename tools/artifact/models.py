@@ -10,7 +10,11 @@ class ToolArguments(BaseModel):
 
 
 class ArtifactPathArguments(ToolArguments):
-    file_path: str = Field(min_length=1, max_length=512)
+    file_path: str = Field(
+        min_length=1,
+        max_length=512,
+        description="Logical workspace path such as agent/bin/app or shared/bin/app; absolute paths and $TMPDIR belong in Shell only.",
+    )
 
 
 class ArtifactDisassembleArguments(ArtifactPathArguments):

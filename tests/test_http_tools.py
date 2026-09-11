@@ -1,6 +1,7 @@
 """Contract tests for the durable generic HTTP interaction engine."""
 
 from __future__ import annotations
+from tests.resource_runtime import another_resource_agent
 
 import asyncio
 import base64
@@ -28,67 +29,38 @@ from tools.system.policy import SystemToolError, WorkspacePolicy
 from tests.resource_runtime import install_resource_runtime
 
 
-def _tool_call(name: str, arguments: dict[str, object], call_id: str) -> dict[str, object]:
+def _tool_call(
+    name: str, arguments: dict[str, object], call_id: str
+) -> dict[str, object]:
     return {
         "id": call_id,
         "function": {"name": name, "arguments": json.dumps(arguments)},
     }
 
 
-def test_probe_normalizes_only_unambiguous_shapes() -> None:
-    wrapped = HttpProbeArguments.model_validate(
-        {
-            "arguments": {
-                "cases": {
-                    "url": "https://target.test/{{path}}",
-                    "variables": {"path": {"values": ["/", "/admin"]}},
-                },
-                "concurrency": 2,
-            }
-        }
-    )
-    assert len(wrapped.cases) == 1
-    assert wrapped.concurrency == 2
-
-    moved = HttpProbeArguments.model_validate(
-        {
-            "cases": [
-                {
-                    "url": "https://target.test/{{path}}",
-                    "variables": {"path": {"values": ["/"]}},
-                    "wait_seconds": 4,
-                }
-            ]
-        }
-    )
-    assert moved.wait_seconds == 4
-    assert "wait_seconds" not in moved.cases[0].model_fields_set
-
-    with pytest.raises(ValueError, match="ambiguous"):
-        HttpProbeArguments.model_validate(
-            {
-                "cases": [
-                    {"url": "https://target.test/a", "concurrency": 2},
-                    {"url": "https://target.test/b"},
-                ]
-            }
-        )
-    with pytest.raises(ValueError, match="cannot appear"):
-        HttpProbeArguments.model_validate(
-            {
-                "cases": [
-                    {"url": "https://target.test/a", "wait_seconds": 4}
-                ],
-                "wait_seconds": 5,
-            }
-        )
+@pytest.mark.parametrize("arguments", [
+    {"arguments": {"cases": [{"url": "http://target.test/"}]}},
+    {"cases": {"url": "http://target.test/"}},
+    {"cases": [{"url": "http://target.test/", "wait_seconds": 4}]},
+    {"cases": [{"url": "http://target.test/", "concurrency": 2},
+               {"url": "http://target.test/"}]},
+    {"cases": [{"url": "http://target.test/", "wait_seconds": 4}], "wait_seconds": 5},
+    {"cases": [{"url": "http://target.test/"}], "session_id": "ordered"},
+])
+def test_probe_rejects_obsolete_shapes(arguments) -> None:
     with pytest.raises(ValueError):
-        HttpProbeArguments.model_validate(
-            {
-                "cases": [{"url": "https://target.test/a"}],
-                "session_id": "ordered",
-            }
-        )
+        HttpProbeArguments.model_validate(arguments)
+
+
+def test_probe_accepts_strict_flat_cases() -> None:
+    arguments = HttpProbeArguments.model_validate({
+        "cases": [{"url": "http://target.test/{{path}}",
+                   "variables": {"path": {"values": ["a", "b"]}}}],
+        "concurrency": 2, "wait_seconds": 4,
+    })
+    assert arguments.concurrency == 2
+    assert arguments.wait_seconds == 4
+    assert len(arguments.cases) == 1
 
 
 @pytest.mark.asyncio
@@ -152,12 +124,22 @@ async def test_http_tool_executor_preserves_validated_nested_models() -> None:
         [
             _tool_call(
                 "system_http_request",
-                {"url": "https://target.test/", "body": {"type": "json", "value": {"a": 1}}},
+                {
+                    "url": "https://target.test/",
+                    "body": {"type": "json", "value": {"a": 1}},
+                },
                 "request",
             ),
             _tool_call(
                 "system_http_probe",
-                {"cases": [{"url": "https://target.test/{{id}}", "variables": {"id": {"values": [1, 2]}}}]},
+                {
+                    "cases": [
+                        {
+                            "url": "https://target.test/{{id}}",
+                            "variables": {"id": {"values": [1, 2]}},
+                        }
+                    ]
+                },
                 "probe",
             ),
             _tool_call(
@@ -167,12 +149,18 @@ async def test_http_tool_executor_preserves_validated_nested_models() -> None:
             ),
             _tool_call(
                 "system_http_output",
-                {"interaction_id": "interaction-test", "filters": {"body_contains": "needle"}},
+                {
+                    "interaction_id": "interaction-test",
+                    "filters": {"body_contains": "needle"},
+                },
                 "body-filter",
             ),
             _tool_call(
                 "system_http_output",
-                {"interaction_id": "interaction-test", "filters": {"body_regex": "n.*e"}},
+                {
+                    "interaction_id": "interaction-test",
+                    "filters": {"body_regex": "n.*e"},
+                },
                 "regex-filter",
             ),
         ]
@@ -201,9 +189,7 @@ async def test_http_tool_executor_preserves_validated_nested_models() -> None:
     assert len(received) == 5
 
 
-async def _manager(
-    root: Path, handler
-) -> tuple[StateService, HttpProbeManager, str]:
+async def _manager(root: Path, handler) -> tuple[StateService, HttpProbeManager, str]:
     run_root = root / "runs"
     service = StateService(run_root / "run-1" / "state.sqlite3", run_root=run_root)
     await service.create_run("run-1")
@@ -231,9 +217,7 @@ async def _wait_for_http_start(
 
 
 @pytest.mark.asyncio
-async def test_real_http_loopback_smoke(
-    tmp_path: Path, unused_tcp_port: int
-) -> None:
+async def test_real_http_loopback_smoke(tmp_path: Path, unused_tcp_port: int) -> None:
     body = b"loopback-http-ok"
 
     async def handle(
@@ -253,9 +237,7 @@ async def test_real_http_loopback_smoke(
 
     server = await asyncio.start_server(handle, "127.0.0.1", unused_tcp_port)
     run_root = tmp_path / "runs"
-    service = StateService(
-        run_root / "loopback" / "state.sqlite3", run_root=run_root
-    )
+    service = StateService(run_root / "loopback" / "state.sqlite3", run_root=run_root)
     await service.create_run("loopback")
     agent = await service.register_agent(
         "loopback", role="chief", initial_prompt="http loopback"
@@ -287,12 +269,18 @@ async def test_real_http_loopback_smoke(
 
 
 @pytest.mark.asyncio
-async def test_request_persists_full_body_and_runs_analysis_on_demand(tmp_path: Path) -> None:
-    payload = b"<html><title>Probe</title><form action='/x'><input name='id'></form></html>"
+async def test_request_persists_full_body_and_runs_analysis_on_demand(
+    tmp_path: Path,
+) -> None:
+    payload = (
+        b"<html><title>Probe</title><form action='/x'><input name='id'></form></html>"
+    )
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["cache-control"] == "no-cache"
-        return httpx.Response(200, headers={"content-type": "text/html"}, content=payload)
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=payload
+        )
 
     service, manager, agent_id = await _manager(tmp_path, handler)
     result = await manager.start_request(
@@ -307,7 +295,7 @@ async def test_request_persists_full_body_and_runs_analysis_on_demand(tmp_path: 
     request_id = result["results"][0]["request_id"]
 
     assert result["analysis_status"] == "not_requested"
-    assert result["recommended_action"] == "analyze_or_cleanup"
+    assert result["recommended_action"] == "read_results_before_cleanup"
     analyzed = await manager.analyze(
         agent_id,
         interaction_id=result["interaction_id"],
@@ -339,9 +327,7 @@ async def test_disk_pressure_reclaims_old_terminal_bodies_but_keeps_metadata(
         return httpx.Response(200, text=f"body:{request.url.path}")
 
     run_root = tmp_path / "runs"
-    service = StateService(
-        run_root / "run-1" / "state.sqlite3", run_root=run_root
-    )
+    service = StateService(run_root / "run-1" / "state.sqlite3", run_root=run_root)
     await service.create_run("run-1")
     agent = await service.register_agent(
         "run-1", role="chief", initial_prompt="reclaim test"
@@ -351,9 +337,7 @@ async def test_disk_pressure_reclaims_old_terminal_bodies_but_keeps_metadata(
         policy,
         service,
         "run-1",
-        engine=HttpInteractionEngine(
-            policy, transport=httpx.MockTransport(handler)
-        ),
+        engine=HttpInteractionEngine(policy, transport=httpx.MockTransport(handler)),
         disk_reserve_bytes=10**30,
         disk_reserve_percent=0,
     )
@@ -528,9 +512,7 @@ async def test_probe_reuses_pool_and_does_not_queue_automatic_analysis(
         concurrency=8,
         wait_seconds=None,
     )
-    work = await service.list_resource_work(
-        "run-1", owner_id=result["interaction_id"]
-    )
+    work = await service.list_resource_work("run-1", owner_id=result["interaction_id"])
     assert [item["phase"] for item in work] == ["execution"]
     assert result["analysis_status"] == "not_requested"
     assert result["connection_pool"]["pool_count"] == 1
@@ -609,9 +591,7 @@ async def test_keep_alive_probe_uses_no_more_connections_than_concurrency(
 
     server = await asyncio.start_server(handle, "127.0.0.1", unused_tcp_port)
     run_root = tmp_path / "runs"
-    service = StateService(
-        run_root / "keepalive" / "state.sqlite3", run_root=run_root
-    )
+    service = StateService(run_root / "keepalive" / "state.sqlite3", run_root=run_root)
     await service.create_run("keepalive")
     agent = await service.register_agent(
         "keepalive", role="chief", initial_prompt="keepalive"
@@ -621,9 +601,7 @@ async def test_keep_alive_probe_uses_no_more_connections_than_concurrency(
         policy,
         service,
         "keepalive",
-        engine=HttpInteractionEngine(
-            policy, transport=httpx.AsyncHTTPTransport()
-        ),
+        engine=HttpInteractionEngine(policy, transport=httpx.AsyncHTTPTransport()),
     )
     await manager.initialize()
     install_resource_runtime(manager, service, "keepalive", root=tmp_path)
@@ -697,7 +675,9 @@ async def test_session_is_private_and_tracks_cookie_updates(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_path: Path) -> None:
+async def test_zero_wait_returns_running_and_output_does_not_repeat_request(
+    tmp_path: Path,
+) -> None:
     release = asyncio.Event()
     calls = 0
 
@@ -714,8 +694,12 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
         wait_seconds=0,
     )
     assert result["status"] == "queued"
+    assert result["result_state"] == "pending"
+    assert result["read_result"]["tool"] == "system_http_output"
     await asyncio.wait_for(
-        asyncio.create_task(_wait_for_http_start(manager, agent_id, result["interaction_id"])),
+        asyncio.create_task(
+            _wait_for_http_start(manager, agent_id, result["interaction_id"])
+        ),
         timeout=1,
     )
     assert result["recommended_wait_seconds"] == 20
@@ -726,8 +710,14 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
     first = await manager.output(agent_id, interaction_id=result["interaction_id"])
     second = await manager.output(agent_id, interaction_id=result["interaction_id"])
     assert first["results"] == second["results"]
+    reread = await manager.output(agent_id, **first["read_result"]["arguments"])
+    assert reread["results"] == first["results"]
+    assert first["result_state"] == "available"
+    read_body = first["request_catalog"][0]["read_response"]
+    assert read_body["tool"] == "system_http_response"
+    assert read_body["arguments"]["request_id"] == first["request_id"]
     assert first["analysis_status"] == "not_requested"
-    assert first["recommended_action"] == "analyze_or_cleanup"
+    assert first["recommended_action"] == "read_results_before_cleanup"
     finished = await manager.output(agent_id, interaction_id=result["interaction_id"])
     assert finished["recommended_wait_seconds"] == 0
     assert calls == 1
@@ -736,7 +726,59 @@ async def test_zero_wait_returns_running_and_output_does_not_repeat_request(tmp_
 
 
 @pytest.mark.asyncio
-async def test_pause_marks_active_request_interrupted_without_replay(tmp_path: Path) -> None:
+async def test_repeated_http_calls_execute_against_current_server_state(
+    tmp_path: Path,
+) -> None:
+    state = {"value": "before"}
+    post_calls = 0
+    get_values: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(200, text=f"post-{post_calls}")
+        get_values.append(state["value"])
+        return httpx.Response(200, text=state["value"])
+
+    service, manager, agent_id = await _manager(tmp_path, handler)
+    try:
+        first = await manager.start_request(
+            agent_id,
+            request=HttpRequestSpec(
+                request_intent="mutable", url="https://target.test/state"
+            ),
+            wait_seconds=None,
+        )
+        state["value"] = "after"
+        second = await manager.start_request(
+            agent_id,
+            request=HttpRequestSpec(
+                request_intent="mutable", url="https://target.test/state"
+            ),
+            wait_seconds=None,
+        )
+        assert get_values == ["before", "after"]
+        assert first["interaction_id"] != second["interaction_id"]
+
+        post_spec = HttpRequestSpec(
+            request_intent="repeat-post",
+            method="POST",
+            url="https://target.test/state",
+            body={"type": "json", "value": {"value": 1}},
+        )
+        await manager.start_request(agent_id, request=post_spec, wait_seconds=None)
+        await manager.start_request(agent_id, request=post_spec, wait_seconds=None)
+        assert post_calls == 2
+    finally:
+        await manager.finish_run()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_marks_active_request_interrupted_without_replay(
+    tmp_path: Path,
+) -> None:
     started = asyncio.Event()
 
     async def handler(_request: httpx.Request) -> httpx.Response:
@@ -752,7 +794,9 @@ async def test_pause_marks_active_request_interrupted_without_replay(tmp_path: P
     )
     await started.wait()
     await manager.pause_run()
-    row = await service.get_http_interaction("run-1", agent_id, result["interaction_id"])
+    row = await service.get_http_interaction(
+        "run-1", agent_id, result["interaction_id"]
+    )
     assert row["status"] == "interrupted"
     assert row["execution_status"] == "interrupted"
     output = await manager.output(agent_id, interaction_id=result["interaction_id"])
@@ -761,7 +805,9 @@ async def test_pause_marks_active_request_interrupted_without_replay(tmp_path: P
     assert interrupted["body_complete"] is False
     resumed = HttpProbeManager(WorkspacePolicy(tmp_path), service, "run-1")
     await resumed.initialize(resume=True)
-    row = await service.get_http_interaction("run-1", agent_id, result["interaction_id"])
+    row = await service.get_http_interaction(
+        "run-1", agent_id, result["interaction_id"]
+    )
     assert row["status"] == "interrupted"
     await service.close()
 
@@ -772,7 +818,7 @@ async def test_ownership_and_resource_disk_admission(tmp_path: Path) -> None:
         return httpx.Response(200)
 
     service, manager, agent_id = await _manager(tmp_path, handler)
-    other = await service.register_agent("run-1", role="chief", initial_prompt="other")
+    other = await another_resource_agent(service, "run-1")
     result = await manager.start_request(
         agent_id,
         request=HttpRequestSpec(request_intent="owner", url="https://target.test/"),
@@ -810,16 +856,23 @@ def test_http_tool_contract_and_plaintext_audit(tmp_path: Path) -> None:
     manager = HttpProbeManager(policy, service, "run-1")
     from agent.tooling import ToolRegistry
 
-    definitions = ToolRegistry([HttpTools(manager.bind("execution-test"))]).definitions()
+    definitions = ToolRegistry(
+        [HttpTools(manager.bind("execution-test"))]
+    ).definitions()
     schema_chars = sum(
         len(json.dumps(item["function"]["parameters"], separators=(",", ":")))
         for item in definitions
     )
-    assert schema_chars <= 17_500
+    # Includes the new typed replay overrides and comparison references.
+    # Includes the bounded custom-wordlist candidate cap.
+    assert schema_chars <= 21_850
     names = [item["function"]["name"] for item in definitions]
     assert names == [
+        "system_http_replay",
+        "system_http_compare",
         "system_http_request",
         "system_http_probe",
+        "system_http_plan",
         "system_web_path_probe",
         "system_web_fingerprint",
         "system_http_analyze",
@@ -936,9 +989,7 @@ def test_probe_path_encoding_preserves_separators_and_rejects_bad_ports(
             url="http://target.test{{path}}",
         ),
         variables={
-            "path": HttpVariableSource(
-                values=["/druid/index.html"], encoding="path"
-            )
+            "path": HttpVariableSource(values=["/druid/index.html"], encoding="path")
         },
     )
     expanded = engine.expand_cases(
@@ -958,7 +1009,11 @@ def test_probe_path_encoding_preserves_separators_and_rejects_bad_ports(
             [invalid], id_factory=lambda: "fixed", default_group_id="group"
         )
     assert caught.value.code == "invalid_expanded_url"
-    assert caught.value.detail == {"case_index": 0, "request_index": 1}
+    assert caught.value.detail == {
+        "case_index": 0, "request_index": 1,
+        "fields": [{"path": "cases.0.url", "code": "invalid_expanded_url",
+                    "message": "Expanded URL is invalid"}],
+    }
 
 
 @pytest.mark.asyncio
@@ -1019,7 +1074,9 @@ async def test_output_filters_and_binary_body_chunks(tmp_path: Path) -> None:
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            201, headers={"content-type": "image/png", "x-test": "needle"}, content=payload
+            201,
+            headers={"content-type": "image/png", "x-test": "needle"},
+            content=payload,
         )
 
     service, manager, agent_id = await _manager(tmp_path, handler)
@@ -1068,7 +1125,7 @@ async def test_request_group_isolation_and_terminal_cleanup_metadata(
         ),
         wait_seconds=None,
     )
-    other = await service.register_agent("run-1", role="chief", initial_prompt="other")
+    other = await another_resource_agent(service, "run-1")
     with pytest.raises(SystemToolError) as caught:
         await manager.start_request(
             other["agent_id"],
@@ -1084,9 +1141,7 @@ async def test_request_group_isolation_and_terminal_cleanup_metadata(
     cleaned = await manager.cleanup(agent_id, interaction_id=first["interaction_id"])
     repeated = await manager.cleanup(agent_id, interaction_id=first["interaction_id"])
     stopped = await manager.stop(agent_id, interaction_id=first["interaction_id"])
-    row = await service.get_http_interaction(
-        "run-1", agent_id, first["interaction_id"]
-    )
+    row = await service.get_http_interaction("run-1", agent_id, first["interaction_id"])
     assert cleaned["cleaned"] is True
     assert repeated["already_cleaned"] is True
     assert stopped["output_cleaned"] is True
@@ -1130,9 +1185,7 @@ async def test_batch_session_updates_are_serialized_and_agent_private(
     assert session["updated_by"]["request_id"] == result["results"][-1]["request_id"]
     sqlite_dump = " ".join(
         json.dumps(item)
-        for item in await service.list_agent_events(
-            "run-1", agent_id, after_sequence=0
-        )
+        for item in await service.list_agent_events("run-1", agent_id, after_sequence=0)
     )
     assert "step=one" not in sqlite_dump
     await manager.finish_run()
@@ -1171,6 +1224,8 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
         "run-1",
         storage_root=tmp_path,
         psutil_module=FakePsutil,
+        disk_reserve_bytes=0,
+        disk_reserve_percent=0.0,
     )
     manager = HttpProbeManager(
         policy,
@@ -1187,7 +1242,11 @@ async def test_runtime_resource_queue_exposes_reason_and_resumes(
         wait_seconds=0,
     )
     assert result["status"] == "queued"
-    work = (await service.list_resource_work("run-1", owner_id=result["interaction_id"]))[0]
+    assert result["result_state"] == "pending"
+    assert result["read_result"]["tool"] == "system_http_output"
+    work = (
+        await service.list_resource_work("run-1", owner_id=result["interaction_id"])
+    )[0]
     denied = await controller.admit_resource_work(work["work_id"])
     assert denied["reason"] == "cpu_limit"
 
@@ -1232,6 +1291,8 @@ async def test_resume_keeps_landed_response_and_analysis_remains_on_demand(
         service,
         "run-1",
         engine=engine,
+        disk_reserve_bytes=0,
+        disk_reserve_percent=0.0,
     )
     result = await manager.start_request(
         agent["agent_id"],
@@ -1240,25 +1301,44 @@ async def test_resume_keeps_landed_response_and_analysis_remains_on_demand(
         ),
         wait_seconds=0,
     )
-    controller = ResourceController(service, "run-1", storage_root=tmp_path)
-    execution_work = (await service.list_resource_work(
-        "run-1", owner_id=result["interaction_id"], statuses={"queued"}
-    ))[0]
+    controller = ResourceController(
+        service,
+        "run-1",
+        storage_root=tmp_path,
+        disk_reserve_bytes=0,
+        disk_reserve_percent=0.0,
+    )
+    execution_work = (
+        await service.list_resource_work(
+            "run-1", owner_id=result["interaction_id"], statuses={"queued"}
+        )
+    )[0]
     await controller.admit_resource_work(
         execution_work["work_id"], sample={"cpu_percent": 0.0, "memory_percent": 0.0}
     )
     assert (await controller.claim_resource_work(execution_work["work_id"]))["claimed"]
     await manager.launch_work(
-        result["interaction_id"], execution_work["phase"], work_id=execution_work["work_id"]
+        result["interaction_id"],
+        execution_work["phase"],
+        work_id=execution_work["work_id"],
     )
     await controller.mark_resource_started(execution_work["work_id"])
     await manager._live[result["interaction_id"]].execution_done.wait()
-    result = await manager.output(agent["agent_id"], interaction_id=result["interaction_id"])
+    result = await manager.output(
+        agent["agent_id"], interaction_id=result["interaction_id"]
+    )
     assert result["execution_status"] == "completed"
     assert result["analysis_status"] == "not_requested"
     await manager.pause_run()
 
-    resumed = HttpProbeManager(policy, service, "run-1", engine=engine)
+    resumed = HttpProbeManager(
+        policy,
+        service,
+        "run-1",
+        engine=engine,
+        disk_reserve_bytes=0,
+        disk_reserve_percent=0.0,
+    )
     await resumed.initialize(resume=True)
     install_resource_runtime(resumed, service, "run-1", root=tmp_path)
     output = await resumed.analyze(
@@ -1269,3 +1349,25 @@ async def test_resume_keeps_landed_response_and_analysis_remains_on_demand(
     assert calls == 1
     await resumed.finish_run()
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_redirect_and_final_error_are_separate(tmp_path):
+    async def handler(request):
+        if request.url.path == '/start':
+            return httpx.Response(302, headers={'location': '/final'})
+        return httpx.Response(500, text='fixture failure')
+
+    service, manager, agent_id = await _manager(tmp_path, handler)
+    try:
+        page = await manager.start_probe(agent_id, cases=[HttpProbeCase(request=HttpRequestSpec(
+            request_intent='redirect fixture', url='https://target.test/start', follow_redirects=True))],
+            concurrency=1, wait_seconds=None)
+        response = next(item for item in page['results'] if item['type'] == 'response')
+        assert response['initial_status_code'] == 302
+        assert response['status_code'] == 500
+        assert response['follow_redirects'] is True
+        assert response['redirect_chain'] == [{'url': 'https://target.test/start', 'status_code': 302, 'location': '/final'}]
+    finally:
+        await manager.finish_run()
+        await service.close()

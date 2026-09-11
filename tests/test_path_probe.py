@@ -1,6 +1,7 @@
 """Tests for the dirsearch-backed web path probe tool."""
 
 from __future__ import annotations
+from tests.resource_runtime import another_resource_agent
 
 import asyncio
 import json
@@ -19,7 +20,12 @@ from third_party.dirsearch.filters import (
     parse_time_filters,
 )
 from tools.http import HttpInteractionEngine, HttpProbeManager, HttpTools
-from tools.http.models import HttpOutputFilters, HttpRequestSpec
+from tools.http.models import (
+    HttpOutputFilters,
+    HttpProbeCase,
+    HttpRequestSpec,
+    HttpVariableSource,
+)
 from tools.http.path_probe import PathProbeEngine, PathProbeOptions
 from tools.system.policy import SystemToolError, WorkspacePolicy
 from tests.resource_runtime import install_resource_runtime
@@ -50,7 +56,9 @@ async def _manager(
 
 
 def _soft_404() -> httpx.Response:
-    return httpx.Response(200, content=b"<html><title>Soft 404</title>nothing here</html>")
+    return httpx.Response(
+        200, content=b"<html><title>Soft 404</title>nothing here</html>"
+    )
 
 
 def test_profile_scopes_and_dedupe(tmp_path: Path) -> None:
@@ -96,10 +104,81 @@ def test_custom_wordlist_exclusions_and_extensions(tmp_path: Path) -> None:
     assert "admin.php" in forced_paths
     assert "admin/" in forced_paths
 
+    capped = PathProbeEngine(
+        WorkspacePolicy(tmp_path),
+        PathProbeOptions(
+            profile="quick",
+            url="http://x.test/",
+            wordlist_paths=("paths.txt",),
+            max_candidates=2,
+        ),
+    )
+    assert capped.build_paths() == ["admin", "admin.php"]
+
+
+def test_packaged_wordlist_is_read_from_release_not_agent_workspace(
+    tmp_path: Path,
+) -> None:
+    options = PathProbeOptions(
+        profile="quick",
+        url="http://x.test/",
+        packaged_wordlists=("web-paths-quick.txt",),
+        max_candidates=5,
+    )
+    engine = PathProbeEngine(WorkspacePolicy(tmp_path), options)
+    paths = engine.build_paths()
+
+    packaged = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "wordlists"
+        / "ctf"
+        / "web-paths-quick.txt"
+    )
+    expected = [line.strip().lstrip("/") for line in packaged.read_text().splitlines() if line.strip()][:5]
+    assert paths == expected
+    assert options.from_plan(options.to_plan()).packaged_wordlists == (
+        "web-paths-quick.txt",
+    )
+
+
+def test_unknown_packaged_wordlist_is_rejected(tmp_path: Path) -> None:
+    engine = PathProbeEngine(
+        WorkspacePolicy(tmp_path),
+        PathProbeOptions(
+            profile="quick",
+            url="http://x.test/",
+            packaged_wordlists=("not-a-release-list.txt",),
+        ),
+    )
+    with pytest.raises(SystemToolError) as error:
+        engine.build_paths()
+    assert error.value.code == "packaged_wordlist_unknown"
+
+
+def test_packaged_wordlist_can_feed_http_probe_variables(tmp_path: Path) -> None:
+    engine = HttpInteractionEngine(WorkspacePolicy(tmp_path))
+    requests = engine.expand_cases(
+        [
+            HttpProbeCase(
+                request=HttpRequestSpec(
+                    url="http://x.test/read?file={{file}}",
+                ),
+                variables={
+                    "file": HttpVariableSource(file_path="packaged:linux-lfi.txt")
+                },
+            )
+        ],
+        id_factory=iter(range(200)).__next__,
+        default_group_id="group",
+    )
+    assert len(requests) == 105
+    assert any(item.variables["file"] == "/etc/passwd" for item in requests)
+    assert any(item.variables["file"] == "/proc/self/environ" for item in requests)
 
 
 @pytest.mark.asyncio
-async def test_large_wordlist_streams_plan_without_fixed_limit(tmp_path: Path) -> None:
+async def test_large_wordlist_is_capped_in_plan(tmp_path: Path) -> None:
     count = 50_010
     (tmp_path / "large.txt").write_text(
         "".join(f"path-{index}\n" for index in range(count)), encoding="utf-8"
@@ -108,22 +187,22 @@ async def test_large_wordlist_streams_plan_without_fixed_limit(tmp_path: Path) -
     async def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("queued path probe must not send requests")
 
-    service, manager, agent_id = await _manager(
-        tmp_path, handler, start_runtime=False
-    )
+    service, manager, agent_id = await _manager(tmp_path, handler, start_runtime=False)
     result = await manager.start_path_probe(
         agent_id,
         url="https://target.test/",
         profile="quick",
         wordlist_paths=("large.txt",),
+        max_candidates=256,
         wait_seconds=0,
     )
     assert result["execution_status"] == "queued"
     interaction_dir = manager._interaction_dir(agent_id, result["interaction_id"])
     plan = json.loads((interaction_dir / "plan.json").read_text(encoding="utf-8"))
-    assert plan["request_count"] == count
+    assert plan["request_count"] == 256
+    assert plan["options"]["max_candidates"] == 256
     assert "requests" not in plan
-    assert sum(1 for _ in (interaction_dir / "requests.ndjson").open()) == count
+    assert sum(1 for _ in (interaction_dir / "requests.ndjson").open()) == 256
     await manager.stop(agent_id, interaction_id=result["interaction_id"])
     await manager.finish_run()
     await service.close()
@@ -138,9 +217,7 @@ async def test_concurrent_run_and_agent_cleanup_tolerate_missing_plan(
     async def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("queued path probe must not send requests")
 
-    service, manager, agent_id = await _manager(
-        tmp_path, handler, start_runtime=False
-    )
+    service, manager, agent_id = await _manager(tmp_path, handler, start_runtime=False)
     result = await manager.start_path_probe(
         agent_id,
         url="https://target.test/",
@@ -148,18 +225,14 @@ async def test_concurrent_run_and_agent_cleanup_tolerate_missing_plan(
         wordlist_paths=["small.txt"],
         wait_seconds=0,
     )
-    interaction_dir = manager._interaction_dir(
-        agent_id, result["interaction_id"]
-    )
+    interaction_dir = manager._interaction_dir(agent_id, result["interaction_id"])
     (interaction_dir / "plan.json").unlink()
     # Exercise both shutdown owners against the same Interaction lock.  The
     # first caller removes the private files; the other 999 calls must observe
     # the terminal SQLite state and remain idempotent.
     await asyncio.gather(
         *(
-            manager.finish_agent(agent_id)
-            if index % 2
-            else manager.finish_run()
+            manager.finish_agent(agent_id) if index % 2 else manager.finish_run()
             for index in range(1_000)
         )
     )
@@ -178,9 +251,7 @@ async def test_agent_cleanup_treats_worker_file_race_as_already_cleaned(
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(404)
 
-    service, manager, agent_id = await _manager(
-        tmp_path, handler, start_runtime=False
-    )
+    service, manager, agent_id = await _manager(tmp_path, handler, start_runtime=False)
     result = await manager.start_path_probe(
         agent_id,
         url="https://target.test/",
@@ -255,9 +326,9 @@ async def test_scan_persists_only_matches_with_bodies(tmp_path: Path) -> None:
     interaction_dir = manager._interaction_dir(agent_id, result["interaction_id"])
     journal_lines = [
         line
-        for line in interaction_dir.joinpath("results.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        for line in interaction_dir.joinpath("results.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line
     ]
     assert len(journal_lines) == 2
@@ -324,9 +395,7 @@ async def test_ownership_is_agent_isolated(tmp_path: Path) -> None:
 
     (tmp_path / "paths.txt").write_text("a.php\n")
     service, manager, agent_id = await _manager(tmp_path, handler)
-    second = await service.register_agent(
-        "run-1", role="chief", initial_prompt="second agent"
-    )
+    second = await another_resource_agent(service, "run-1")
     second_id = second["agent_id"]
     result = await manager.start_path_probe(
         agent_id,
@@ -396,19 +465,13 @@ async def test_stop_is_idempotent_and_cleanup_is_terminal_only(tmp_path: Path) -
         wordlist_paths=("paths.txt",),
         wait_seconds=None,
     )
-    stopped = await manager.stop(
-        agent_id, interaction_id=result["interaction_id"]
-    )
+    stopped = await manager.stop(agent_id, interaction_id=result["interaction_id"])
     assert stopped["status"] in {"completed", "stopped"}
     again = await manager.stop(agent_id, interaction_id=result["interaction_id"])
     assert again["interaction_id"] == result["interaction_id"]
-    cleaned = await manager.cleanup(
-        agent_id, interaction_id=result["interaction_id"]
-    )
+    cleaned = await manager.cleanup(agent_id, interaction_id=result["interaction_id"])
     assert cleaned["cleaned"] is True
-    repeated = await manager.cleanup(
-        agent_id, interaction_id=result["interaction_id"]
-    )
+    repeated = await manager.cleanup(agent_id, interaction_id=result["interaction_id"])
     assert repeated["already_cleaned"] is True
     with pytest.raises(SystemToolError) as caught:
         await manager.output(
@@ -563,7 +626,9 @@ def test_tool_definition_policy_and_prompt(tmp_path: Path) -> None:
     manager = HttpProbeManager(WorkspacePolicy(tmp_path), service, "run-1")
     from agent.tooling import ToolRegistry
 
-    definitions = ToolRegistry([HttpTools(manager.bind("execution-test"))]).definitions()
+    definitions = ToolRegistry(
+        [HttpTools(manager.bind("execution-test"))]
+    ).definitions()
     names = {item["function"]["name"] for item in definitions}
     assert "system_web_path_probe" in names
     description = next(
@@ -581,11 +646,4 @@ def test_tool_definition_policy_and_prompt(tmp_path: Path) -> None:
     assert "max_total_requests" not in schema["properties"]
     assert "wordlist_max_size" not in schema["properties"]
     assert schema["properties"]["profile"]["default"] == "quick"
-    assert AgentPolicy("execution").allows("system_web_path_probe")
-    prompt = (
-        Path(__file__).resolve().parents[1]
-        / "agent"
-        / "prompts"
-        / "execution_system.txt"
-    ).read_text(encoding="utf-8")
-    assert "system_web_path_probe" in prompt
+    assert AgentPolicy("worker").allows("system_web_path_probe")

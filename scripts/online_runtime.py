@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.config import AgentSettings
+from agent.config import AgentSettings, normalize_selected_challenge_codes
 from agent.prompts import load_prompt
 from agent.runtime import AgentRuntime, RuntimePausedError
 from challenges_sdk import ChallengesClient, ChallengesSettings
@@ -189,13 +189,13 @@ def _write_current_run(path: Path, run_id: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _read_launch_config(path: Path) -> tuple[str, bool]:
+def _read_launch_config(path: Path) -> tuple[str, bool, list[str] | None]:
     try:
         raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Runtime launch config could not be read: {path}") from exc
-    if not isinstance(raw, dict) or set(raw) != {"mode", "run_id"}:
-        raise ValueError("Runtime launch config must contain only mode and run_id")
+    if not isinstance(raw, dict) or not {"mode", "run_id"} <= set(raw) or set(raw) - {"mode", "run_id", "selected_challenge_codes"}:
+        raise ValueError("Runtime launch config requires mode and run_id, with optional selected_challenge_codes")
     mode = raw.get("mode")
     run_id = raw.get("run_id")
     if mode not in {"fresh", "resume"}:
@@ -204,7 +204,10 @@ def _read_launch_config(path: Path) -> tuple[str, bool]:
         raise ValueError("Runtime launch run_id is invalid")
     if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in run_id):
         raise ValueError("Runtime launch run_id contains unsupported characters")
-    return run_id, mode == "resume"
+    selected = normalize_selected_challenge_codes(raw.get("selected_challenge_codes"))
+    if mode == "resume" and selected is not None:
+        raise ValueError("Resume cannot replace selected_challenge_codes")
+    return run_id, mode == "resume", selected
 
 
 async def run_online(
@@ -218,6 +221,7 @@ async def run_online(
     run_root: Path | None,
     wait_seconds: float,
     current_run_file: Path | None,
+    selected_challenge_codes: list[str] | None = None,
 ) -> int:
     if hosted:
         token = _read_benchmark_token_from_environment()
@@ -225,7 +229,12 @@ async def run_online(
         if benchmark_token_file is None:
             raise ValueError("--benchmark-token-file is required outside hosted mode")
         token = _read_benchmark_token(benchmark_token_file)
-    settings = AgentSettings()
+    if resume and selected_challenge_codes is not None:
+        raise ValueError("Resume cannot replace selected_challenge_codes")
+    settings = AgentSettings(**(
+        {"selected_challenge_codes": selected_challenge_codes}
+        if selected_challenge_codes is not None else {}
+    ))
     workspace = workspace_root.expanduser().resolve()
     state_root = (
         run_root or workspace / ".aion" / "runs"
@@ -367,6 +376,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite run id; fresh runs default to a unique online run id",
     )
     parser.add_argument(
+        "--challenge-code", action="append", dest="selected_challenge_codes",
+        help="limit a new run to this challenge; repeat for multiple challenges",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="resume the existing --run-id instead of creating a new run",
@@ -374,7 +387,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--launch-config-file",
         type=Path,
-        help="internal JSON file containing mode and run_id",
+        help="internal JSON file containing mode, run_id and optional selected_challenge_codes",
     )
     parser.add_argument(
         "--vpn-config",
@@ -413,16 +426,19 @@ async def async_main() -> int:
         parser.error("--wait-seconds must not be negative")
     if args.hosted and args.vpn_config is not None:
         parser.error("--vpn-config cannot be used with --hosted")
-    if args.launch_config_file is not None and (args.resume or args.run_id):
-        parser.error("--launch-config-file cannot be combined with --resume or --run-id")
+    if args.launch_config_file is not None and (args.resume or args.run_id or args.selected_challenge_codes is not None):
+        parser.error("--launch-config-file cannot be combined with --resume, --run-id or --challenge-code")
+    if args.resume and args.selected_challenge_codes is not None:
+        parser.error("--resume cannot replace selected_challenge_codes with --challenge-code")
     if args.resume and not args.run_id:
         parser.error("--resume requires --run-id")
     try:
         if args.launch_config_file is not None:
-            run_id, resume = _read_launch_config(args.launch_config_file)
+            run_id, resume, selected = _read_launch_config(args.launch_config_file)
         else:
             run_id = args.run_id or f"online-{uuid4().hex[:12]}"
             resume = args.resume
+            selected = normalize_selected_challenge_codes(args.selected_challenge_codes)
         return await run_online(
             run_id=run_id,
             resume=resume,
@@ -433,6 +449,7 @@ async def async_main() -> int:
             run_root=args.run_root,
             wait_seconds=args.wait_seconds,
             current_run_file=args.current_run_file,
+            selected_challenge_codes=selected,
         )
     except ValueError as exc:
         parser.error(str(exc))

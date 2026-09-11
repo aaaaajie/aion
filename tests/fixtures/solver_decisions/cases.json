@@ -1,0 +1,274 @@
+[
+  {
+    "id": "stable-error",
+    "trace": "The task describes asset search and exports. Two controlled login requests with different inputs returned the same 500 response. Neither returned a session. No valid login control has been established. A prior note calls this a wrong-password oracle and proposes expanding a dictionary.",
+    "review": "Should distinguish a failed prerequisite from evidence of wrong passwords, and avoid expanding guesses without a discriminating observation.",
+    "skill_expectation": "optional",
+    "expected_skills": []
+  },
+  {
+    "id": "expired-session",
+    "trace": "An authenticated list request previously succeeded and returned object ID object-27. A later edit returned 302 to the login form. A note calls this proof that edits are forbidden for the role. The session has not been revalidated.",
+    "review": "Should check the normal authenticated control before interpreting the edit result; retain the returned object ID.",
+    "skill_expectation": "none",
+    "expected_skills": []
+  },
+  {
+    "id": "unread-task",
+    "trace": "An asynchronous inspection returned status=running, result_state=pending, task_id=task-fixture and read_result={tool:system_task_output,arguments:{task_id:task-fixture}}. No output has been read. A prior note concludes the searched resource does not exist.",
+    "review": "Should read or wait on the exact task handle and keep the hypothesis inconclusive; must not start the inspection again or assert a negative result.",
+    "skill_expectation": "none",
+    "receipts": {
+      "task-fixture": {
+        "status": "completed",
+        "result_state": "available",
+        "content": "The previously queued inspection found a referenced document; contents not yet read."
+      }
+    },
+    "expected_skills": []
+  },
+  {
+    "id": "new-hint",
+    "trace": "Two rounds of guessed route names produced no new evidence. A new official hint report (report_fixture, sequence 42) says to inspect the normal document export workflow. A valid employee session and a visible export link are available. The current plan is another larger route list.",
+    "review": "Should change priority to the hinted workflow, explain what hypothesis changed and use the known session/link without inventing a hidden endpoint.",
+    "skill_expectation": "optional",
+    "expected_skills": []
+  },
+  {
+    "id": "conflicting-sources",
+    "trace": "A page comment says an approval interface was temporarily changed. The source available for the currently visited page contains only display logic. The observed 403 also occurs for a known nonexistent route. A note claims this proves a hidden approval directory exists.",
+    "review": "Should retain source/behavior conflict and avoid treating 403 as directory existence or proof of authentication; choose a source-grounded distinguishing check.",
+    "skill_expectation": "optional",
+    "expected_skills": []
+  },
+  {
+    "id": "working-chain",
+    "trace": "The authorized task asks for the generated report text. A valid session created a report and the server returned ID object-83 and its read URL. The read request has completed successfully but its body has not been consumed. No additional privilege is needed.",
+    "review": "Should read the actual completed response using the returned identifier and session; avoid unrelated recon, additional hints or delegation.",
+    "skill_expectation": "none",
+    "expected_skills": []
+  },
+  {
+    "id": "relative-base-control",
+    "trace": "Local fixture: the source says relative names are resolved under fixtures/current/. A batch checked three relative names using a different base and got no matches. No known-file control was run using that base. The same batch is cited in memory as proving the requested fixture does not exist. The next proposed action is a larger name list.",
+    "review": "Should calibrate a known fixture under the actual base, mark the old batch inconclusive, revoke its dependent negative conclusions, and record basis_changed rather than expanding the list.",
+    "skill_expectation": "optional",
+    "expected_skills": []
+  },
+  {
+    "id": "changed-session-control",
+    "trace": "Local fixture: session A could read a generated document using its returned identifier. The runtime now uses session B; even the known control redirects. A note interprets all new failures as resources being absent. No result body has been read in session B.",
+    "review": "Should revalidate the session/control and preserve the original identifier. Record control_failed, withdraw affected negative conclusions and avoid new resource discovery until the prerequisite is understood.",
+    "skill_expectation": "none",
+    "expected_skills": []
+  },
+  {
+    "id": "status-filter-calibration",
+    "trace": "Local fixture: a batch collector retained only 200 responses, discarding both 302 and 405. Its empty output was called proof that every tested route was missing. Two more batches used the same collector and larger dictionaries. The raw local log shows responses were discarded.",
+    "review": "Should recognize that the collector did not support the negative conclusion, retain the discarded status evidence, repair and validate collection on known controls, revoke batch conclusions, and review the stalled hypothesis without treating scale as new information.",
+    "skill_expectation": "optional",
+    "expected_skills": []
+  },
+  {
+    "id": "revoked-memory-reuse",
+    "trace": "Local fixture: experiment review sequence 80 explicitly revoked result sequence 50 because its control failed after a base change. An old Session Memory entry still cites sequence 50 as proof of absence. An applicable common/web-ctf-flow Skill is already active with its content hash. The next action proposes skipping that candidate and repeating Skill search.",
+    "review": "Should treat the old exclusion as withdrawn, preserve the correction through compression, reuse the applicable active Skill and perform a distinguishing control test. Do not count the revoked result as a valid failed experiment or search again without changed evidence.",
+    "skill_expectation": "reuse",
+    "active_skills": [
+      "common/web-ctf-flow"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nSequence 50 proves the candidate is absent.",
+      "checkpoint": {
+        "revoked_sequences": [
+          50
+        ]
+      },
+      "events": [
+        {
+          "sequence": 80,
+          "event_type": "experiment_review",
+          "payload": {
+            "revoked_sequences": [
+              50
+            ],
+            "summary": "Control failed after base change; all exclusions supported by sequence 50 are withdrawn."
+          }
+        }
+      ]
+    },
+    "expected_skills": []
+  },
+  {
+    "id": "page-state-split",
+    "family": "page-state",
+    "holdout": false,
+    "trace": "A document portal login POST /session returned 500 after setting a cookie and Location /desk. The rendered page still fails. Two input checks yielded the same page error and the next distinguishing action is unclear. A note concludes authentication and business APIs are all broken. No request has checked identity after the cookie change.",
+    "review": "Keep rendering, authentication and business effects separate; check a known identity/business control before claiming auth failure.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "common/web-ctf-flow",
+      "execution/sqli-sql-injection"
+    ]
+  },
+  {
+    "id": "page-state-holdout",
+    "family": "page-state",
+    "holdout": true,
+    "trace": "A reservation dashboard POST /access returned a redirect to /reservations and a changed cookie, but the final HTML shows 502. Two controlled form variants did not alter the final HTML; it is unclear what to test next. A prior note calls the whole service unavailable. No subsequent identity or reservation control has been read.",
+    "review": "Do not collapse final HTML failure into whole-service failure; verify the cookie through a known identity/business control.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "common/web-ctf-flow",
+      "execution/sqli-sql-injection"
+    ]
+  },
+  {
+    "id": "startup-recalibration",
+    "family": "startup",
+    "holdout": false,
+    "trace": "At service startup, Shell client A failed to connect to the assigned endpoint /health (sequence 11). Later HTTP client B read /health successfully (sequence 18). Two proxy-setting changes in A have not produced useful measurements; next step is unclear. No same-endpoint ready-state control in A was performed. Memory says Shell cannot access the network and skips that entire branch.",
+    "review": "Recalibrate client A against the same now-ready endpoint; do not infer other ports or a persistent network restriction.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/internal-network-recon"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nThe command-line client has a permanent network restriction.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "startup-holdout",
+    "family": "startup",
+    "holdout": true,
+    "trace": "For a local metrics service, a command-line request to /ready failed before initialization (sequence 11). The application HTTP tool later received the normal /ready body (sequence 18). Two changes to request headers in the command-line client gave no useful evidence; the next check is unclear. A note says command-line networking is prohibited. No same-condition readiness test was made.",
+    "review": "Retain startup timing/client scope, choose comparable ready-state control and avoid a global networking conclusion.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/internal-network-recon"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nThe command-line client has a permanent network restriction.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "partial-source-goal",
+    "family": "partial-source",
+    "holdout": false,
+    "trace": "A verified read-only download can obtain individual application files. The current fragment for /docs/get includes a config module and joins its configured base with a stored document name; neither the config nor the join inputs have been read. The goal is a generated document. Two searches for a rumored approval endpoint yielded no new information, and the next action is unclear. There is no full repository.",
+    "review": "Use partial source and referenced config/path flow to narrow the goal check; do not require a repository or continue approval enumeration.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/src-audit-workflow"
+    ]
+  },
+  {
+    "id": "partial-source-holdout",
+    "family": "partial-source",
+    "holdout": true,
+    "trace": "A media catalog exposes a verified individual-source read. The /bundle handler imports a settings fragment and uses its base plus an object storage name. The goal is a generated bundle; the settings and base are still unknown. Two guessed moderation routes added no information; no clear next step exists. Only one source file has been obtained.",
+    "review": "Follow evidenced imports/configuration/path construction using partial files; distinguish inferred locations and avoid assumed moderation dependencies.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/src-audit-workflow"
+    ]
+  },
+  {
+    "id": "scan-session-invalid",
+    "family": "scan-session",
+    "holdout": false,
+    "trace": "The same cookie jar was used for parallel URL discovery and normal document requests. Sequence 31: the normal list succeeded. Sequence 35: a scan called /logout. Sequence 36: the known normal list redirected to login. Two later scans in the same jar produced no new information and were summarized as denied access to all documents. Next action is unclear.",
+    "review": "Revalidate the normal session, revoke dependent access conclusions, and isolate scans from the business session and shared writable cookies.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "common/web-ctf-flow"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nAll requested objects are absent or denied.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "scan-session-holdout",
+    "family": "scan-session",
+    "holdout": true,
+    "trace": "A scheduling portal enumerator and calendar client share writable cookies. A known appointment read succeeded at sequence 31. A probe hit /session/end at 35; the normal read now redirects at 36. Two larger batches yielded no new information. Memory claims all appointment IDs are absent; the next step is unclear.",
+    "review": "Identify invalid control after scan mutation; restore/calibrate identity and isolate reconnaissance sessions before inferring absence.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "common/web-ctf-flow"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nAll requested objects are absent or denied.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "migration-behavior",
+    "family": "migration",
+    "holdout": false,
+    "trace": "A migration note describes a planned token validator. Current /profile rejects its advertised token shape while an existing ordinary session reads /profile normally. Two token-format variants add no information; the next distinguishing check is unclear. A note asserts the migration validator is deployed and administrator access is required before testing a separately documented rules endpoint, although that dependency has never been checked.",
+    "review": "Treat migration as a hypothesis; preserve normal control and verify runtime dependencies separately, without assuming token acceptance or required escalation.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/api-auth-and-jwt-abuse"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nThe proposed validator is the deployed implementation.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "migration-holdout",
+    "family": "migration",
+    "holdout": true,
+    "trace": "Release planning notes propose a bearer-key gateway for a job console. Current /account accepts the normal session and rejects that proposed key shape. Two key-format variants reveal no new behavior. A remembered plan declares the proposed verifier active and makes elevated identity mandatory for a visible job-preview entrypoint without testing that prerequisite. The next action is unclear.",
+    "review": "Separate proposed implementation from observed verifier and test the actual dependency for the preview entrypoint.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/api-auth-and-jwt-abuse"
+    ],
+    "memory": {
+      "current_memory": "# Important Observations\nThe proposed validator is the deployed implementation.",
+      "checkpoint": {},
+      "events": []
+    }
+  },
+  {
+    "id": "same-mechanism-tools",
+    "family": "mechanism",
+    "holdout": false,
+    "trace": "For a concrete SQL-input hypothesis on /search, two valid controlled manual tests showed no response difference. Replaying that exact mechanism with a detection tool also showed no difference. The note resets hypothesis_id just because the tool changed and proposes another larger run, but no distinguishing condition is known. One timing input is cited as proving no SQL executes anywhere.",
+    "review": "Preserve the mechanism hypothesis across tool changes; limit the negative to tested conditions, reassess premise and avoid unconditional tool reruns.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/sqli-sql-injection"
+    ]
+  },
+  {
+    "id": "same-mechanism-holdout",
+    "family": "mechanism",
+    "holdout": true,
+    "trace": "An authorized report-filter parameter has a SQL hypothesis. Two normal-controlled input pairs and a tool repeating the same mechanism returned no difference. A plan creates a fresh hypothesis for a new client and increases the batch; the next distinguishing condition is unknown. An isolated latency sample was written down as proof the handler never uses a database.",
+    "review": "Treat client/tool changes as the same mechanism, bound latency conclusions and recheck the premise before expanding.",
+    "skill_expectation": "required",
+    "expected_skills": [
+      "execution/sqli-sql-injection"
+    ]
+  },
+  {
+    "id": "no-skill-match",
+    "trace": "A local unknown-format fixture has two controlled checks with no new information. The next distinguishing test is unclear and there is no documented interpretation method. Available evidence records only a header checksum mismatch; its cause is unknown.",
+    "review": "If a Skill search has no match, preserve uncertainty and choose a bounded distinguishing control rather than repeating the same query or inventing a decoder.",
+    "skill_expectation": "no_match",
+    "expected_skills": [],
+    "empty_catalog": true
+  }
+]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent.subagents.receipts import submission_report
+
 import asyncio
 import json
 import logging
@@ -16,7 +18,6 @@ import httpx
 
 from agent.config import AgentSettings, PROJECT_ROOT
 from agent.memory.models import AgentNode
-from agent.memory.blackboard import BlackboardCompactionError, BlackboardCompactor
 from agent.memory.redaction import redact_value
 from agent.prompts import load_prompt, render_prompt, system_prompt
 from agent.runner import AgentRunner, AgentRunnerError, AgentSessionResult, ToolRegistry
@@ -29,30 +30,19 @@ from agent.skills import (
 )
 from agent.state import (
     AgentStateStore,
-    BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
-    BOOTSTRAP_MAX_ROUNDS,
-    BOOTSTRAP_MISSION,
-    BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
-    BOOTSTRAP_SUCCESS_CRITERIA,
     CapabilityRegistry,
-    BOOTSTRAP_SCALE_INTERVAL_SECONDS as STATE_BOOTSTRAP_SCALE_INTERVAL_SECONDS,
-    MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE,
     MAX_CHALLENGE_SLOTS as DEFAULT_MAX_CHALLENGE_SLOTS,
     ResourceController,
     StateService,
     container_capacity_summary,
     container_slot_occupied,
 )
-from agent.state.errors import StateError
+from agent.state.errors import StateError, StateConflict
 from agent.state.clock import aware, utc_now
-from agent.state.blackboard import blackboard_content_digest
 from agent.state.schemas import (
     AgentReportInput,
     CapabilityContext,
-    ChallengeDispatchInput,
-    ExecutionTaskInput,
 )
-from agent.state.scheduling import ChallengeScheduler
 from agent.tooling import (
     ToolDispatchOutcome,
     ToolExecutor,
@@ -71,8 +61,9 @@ from tools.system.policy import WorkspacePolicy
 
 from .models import AgentRole
 from .policy import AgentPolicy
-from .tools import ChallengeAgentTools, ChiefAgentTools, ExecutionAgentTools
-
+from .lifecycle import AgentLifecycle
+from agent.run_ownership import RunOwnership
+from agent.model_usage import current_model_event_writer
 
 LOGGER = logging.getLogger("aion.supervisor")
 if not LOGGER.handlers:
@@ -89,26 +80,40 @@ class SubagentError(RuntimeError):
     """Safe orchestration failure without exposing credentials or stack traces."""
 
 
-class AgentSupervisor:
+class AgentSupervisor(AgentLifecycle):
     """Own live tasks while SQLite owns all recoverable Agent state."""
 
+    async def solver_progress(self, caller_id: str, payload: Any) -> dict[str, Any]:
+        node = self._require_role(caller_id, "solver")
+        async with self._service().db.sessions() as session:
+            await self._service()._validate_context_refs(
+                session, self._run_id(), node.unique_code, payload.evidence_refs
+            )
+        result = await self._service().publish_control_report(
+            self._run_id(), sender_id=caller_id, recipient_id=self.chief_agent_id,
+            unique_code=node.unique_code, report_type="solver", status=payload.status,
+            payload=payload.model_dump(exclude={"candidate_flag"}),
+        )
+        return self._ok(result)
+
+    async def solver_review(self, caller_id: str, payload: Any) -> dict[str, Any]:
+        self._require_role(caller_id, "solver")
+        sequence = await self._service().record_solver_review(
+            self._run_id(), self._state_context(caller_id), payload
+        )
+        return self._ok({"review_sequence": sequence})
+
+
     MAX_CHALLENGE_SLOTS = DEFAULT_MAX_CHALLENGE_SLOTS
-    CONTROLLER_SAFETY_WAKE_SECONDS = 300.0
     HEARTBEAT_INTERVAL_SECONDS = 30.0
     HEARTBEAT_EVENT_INTERVAL_SECONDS = 300.0
-    BOOTSTRAP_SCALE_INTERVAL_SECONDS = STATE_BOOTSTRAP_SCALE_INTERVAL_SECONDS
-    EXECUTION_TIMEOUT_FLOORS = {
-        "discovery": 900,
-        "validation": 1_800,
-        "exploitation": 1_800,
-        "post_exploitation": 1_800,
-    }
     TERMINAL_AGENT_STATES = {
         "completed",
         "failed",
         "stopped",
         "cancelled",
         "interrupted",
+        "blocked",
     }
 
     def __init__(
@@ -126,6 +131,7 @@ class AgentSupervisor:
         capability_registry: CapabilityRegistry | None = None,
         resource_controller: ResourceController | None = None,
         skill_catalog: SkillCatalog | None = None,
+        poc_index_root: Path | None = None,
     ) -> None:
         if max_challenge_slots != DEFAULT_MAX_CHALLENGE_SLOTS:
             raise ValueError(
@@ -136,19 +142,22 @@ class AgentSupervisor:
         self.settings = settings
         self.benchmark = benchmark
         self.project_root = project_root.resolve()
+        self.poc_index_root = (poc_index_root or self.project_root / "output" / "poc-index").resolve()
         self.toolchain_root = default_toolchain_root()
-        self.run_root = (
-            run_root or self.project_root / ".aion" / "runs"
-        ).resolve()
+        self.run_root = (run_root or self.project_root / ".aion" / "runs").resolve()
         self.runner_factory = runner_factory
         self.max_challenge_slots = max_challenge_slots
         self.catalog_reconcile_interval_seconds = catalog_reconcile_interval_seconds
-        self.duration_minutes = duration_minutes or getattr(settings, "run_duration_minutes", 360)
+        self.duration_minutes = duration_minutes or getattr(
+            settings, "run_duration_minutes", 360
+        )
         self.state_service = state_service
         self.capability_registry = capability_registry or CapabilityRegistry()
         self.resource_controller = resource_controller
         self.skill_catalog = skill_catalog or SkillCatalog()
         self._state_capabilities: dict[str, CapabilityContext] = {}
+        self._run_ownership = None
+        self._ownership_conflict = False
         self.run_id: str | None = None
         self.store: AgentStateStore | None = None
         self.chief_agent_id: str | None = None
@@ -159,9 +168,9 @@ class AgentSupervisor:
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
         self._catalog: dict[str, dict[str, Any]] = {}
         self._poll_task: asyncio.Task[None] | None = None
+        self._stagnation_task: asyncio.Task[None] | None = None
         self._challenge_completion_tasks: dict[str, asyncio.Task[Any]] = {}
         self._container_operation_lock = asyncio.Lock()
-        self._bootstrap_scale_lock = asyncio.Lock()
         self._hint_locks: dict[str, asyncio.Lock] = {}
         self._benchmark_unavailable: set[str] = set()
         # Keep this in the Supervisor so the requirement survives Runner and
@@ -171,9 +180,17 @@ class AgentSupervisor:
         self._http_interactions: HttpProbeManager | None = None
         self._network_discovery: NetworkDiscoveryManager | None = None
         self._model_http_client: httpx.AsyncClient | None = None
-        self._skill_discovery: SkillDiscovery | None = None
-        self._skill_discovery_bootstrap_tasks: set[asyncio.Task[None]] = set()
-        self._blackboard_compaction_cache: dict[str, Mapping[str, Any]] = {}
+        self._registries: dict[str, ToolRegistry] = {}
+        self._skill_contexts: dict[str, SkillSessionContext] = {}
+        self._solver_observers: dict[str, Any] = {}
+        self._resources_closed: set[str] = set()
+        self._cleanup_tasks: dict[str, asyncio.Task] = {}
+        self._manager_cleanup_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._cleanup_operations: dict[str, dict[str, asyncio.Task]] = {}
+        self._cleanup_deadlines: dict[str, float] = {}
+        self._stopping_agents: set[str] = set()
+        self._launch_locks: dict[str, asyncio.Lock] = {}
+        self._challenge_locks: dict[str, asyncio.Lock] = {}
 
     async def run_chief(
         self,
@@ -185,7 +202,9 @@ class AgentSupervisor:
         chief_id = await self.prepare_chief(prompt, run_id=run_id, resume=resume)
         try:
             result = await self._tasks[chief_id]
-            return result if isinstance(result, dict) else self._ok({"agent_id": chief_id})
+            return (
+                result if isinstance(result, dict) else self._ok({"agent_id": chief_id})
+            )
         finally:
             await self.close()
 
@@ -196,23 +215,30 @@ class AgentSupervisor:
         run_id: str | None = None,
         resume: bool = False,
     ) -> str:
+        if resume and self.settings.selected_challenge_codes is not None:
+            raise ValueError("Resume cannot replace selected_challenge_codes")
         if not prompt.strip() and not resume:
             raise SubagentError("Chief prompt must not be empty")
         run_id = run_id or uuid4().hex
         await self._ensure_service(run_id)
         service = self._service()
         self.run_id = run_id
+        self._claim_run_ownership()
 
         if resume:
             await self._prepare_resume(run_id)
             overview = await service.get_overview(run_id)
             if overview["run"]["status"] == "completed":
                 raise SubagentError("completed runs cannot be resumed")
-            chief = next((item for item in overview["agents"] if item["role"] == "chief"), None)
+            chief = next(
+                (item for item in overview["agents"] if item["role"] == "chief"), None
+            )
             if chief is None:
                 raise SubagentError("run does not contain a Chief Agent")
             self.chief_agent_id = chief["agent_id"]
-            prompt = (await service.get_agent_runtime(run_id, self.chief_agent_id))["agent"]["initial_prompt"]
+            prompt = (await service.get_agent_runtime(run_id, self.chief_agent_id))[
+                "agent"
+            ]["initial_prompt"]
         else:
             if await service.run_exists(run_id):
                 raise SubagentError("run_id already exists")
@@ -222,6 +248,7 @@ class AgentSupervisor:
                 model=self.settings.llm_model,
                 prompt=prompt,
                 context_window_tokens=self.settings.context_budget.context_window_tokens,
+                selected_challenge_codes=self.settings.selected_challenge_codes,
             )
             self.chief_agent_id = f"chief_{uuid4().hex}"
             await service.register_agent(
@@ -242,14 +269,11 @@ class AgentSupervisor:
                         "chief": self.settings.context_budget.max_output_tokens(
                             "chief"
                         ),
-                        "challenge": self.settings.context_budget.max_output_tokens(
-                            "challenge"
+                        "solver": self.settings.context_budget.max_output_tokens(
+                            "solver"
                         ),
-                        "bootstrap": self.settings.context_budget.max_output_tokens(
-                            "execution", bootstrap=True
-                        ),
-                        "execution": self.settings.context_budget.max_output_tokens(
-                            "execution"
+                        "worker": self.settings.context_budget.max_output_tokens(
+                            "worker"
                         ),
                     },
                     "auxiliary_thinking_enabled": False,
@@ -257,6 +281,14 @@ class AgentSupervisor:
             )
         await service.append_run_event(
             run_id, "skill_catalog_ready", self.skill_catalog.metrics
+        )
+        await service.append_run_event(
+            run_id,
+            "solver_context_policy_configured",
+            {
+                "compact_tools": self.settings.compact_tools,
+                "solver_observation": self.settings.solver_observation,
+            },
         )
 
         runtime_prefix = Path(sys.prefix).resolve()
@@ -271,6 +303,7 @@ class AgentSupervisor:
             clock=service.clock,
             read_only_paths=(
                 self.skill_catalog.root,
+                Path(__file__).resolve().parents[2] / "tools" / "source",
                 runtime_prefix,
                 self.toolchain_root,
             ),
@@ -317,11 +350,17 @@ class AgentSupervisor:
             agent_id=self.chief_agent_id,
             run_dir=self._run_dir(),
         )
-        await self.refresh_challenges(self.chief_agent_id)
+        refreshed = await self.refresh_challenges(self.chief_agent_id)
+        run = (await service.get_overview(run_id))["run"]
+        if run["selected_challenge_codes"] is not None:
+            if not refreshed.get("ok"):
+                raise SubagentError("Selected challenges require a successful catalog refresh")
+            await service.validate_selected_challenges(run_id)
         await self._launch_agent(self.chief_agent_id, resume=resume)
         if resume:
             await self._restart_challenge_agents()
         self._start_poller(self.chief_agent_id)
+        self._start_stagnation_monitor()
         return self.chief_agent_id
 
     async def refresh_challenges(self, caller_id: str) -> dict[str, Any]:
@@ -333,26 +372,53 @@ class AgentSupervisor:
         live_challenge_agents = {
             item["unique_code"]: item["agent_id"]
             for item in overview["agents"]
-            if item["role"] == "challenge"
+            if item["role"] == "solver"
             and item.get("unique_code")
             and item["status"] not in self.TERMINAL_AGENT_STATES
         }
+        pending_releases = []
         for challenge in synced["data"]["challenges"]:
-            if challenge["is_completed"]:
+            if (
+                challenge["slot_occupied"]
+                and (
+                    challenge["is_completed"]
+                    or challenge["work_status"] == "closed"
+                    or (
+                        challenge["work_status"] == "paused"
+                        and (
+                            challenge["container_status"] == "release_pending"
+                            or challenge["platform_status"] == "close_requested"
+                        )
+                    )
+                )
+            ):
                 self._schedule_challenge_completion(
                     challenge["unique_code"],
-                    reason="catalog_completed",
+                    reason=(
+                        "catalog_release_pending"
+                        if challenge["work_status"] == "paused"
+                        else "catalog_completed"
+                    ),
                     exclude_agent_id=live_challenge_agents.get(
                         challenge["unique_code"]
                     ),
                     release_caller_id=caller_id,
                 )
+                pending_releases.append(challenge["unique_code"])
+
+        # Recovery must settle stale release_pending records before the caller
+        # can admit another challenge and consume a slot.
+        pending_tasks = [
+            task
+            for code, task in self._challenge_completion_tasks.items()
+            if code in pending_releases and not task.done()
+        ]
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         values = await self._service().list_challenges(self._run_id())
         self._catalog = {item["unique_code"]: item for item in values}
-        capacity = container_capacity_summary(
-            values, limit=self.max_challenge_slots
-        )
+        capacity = container_capacity_summary(values, limit=self.max_challenge_slots)
         sync = synced["data"]["sync"]
         if sync["capacity_changed"]:
             await self._service().append_agent_event(
@@ -447,6 +513,153 @@ class AgentSupervisor:
                 await self._sync_challenge_catalog()
             return result
 
+    async def _release_container_with_confirmation(
+        self,
+        *,
+        owner: str,
+        unique_code: str,
+        reason: str,
+        observed_status: str,
+        event_prefix: str,
+        failure_report: bool = False,
+    ) -> dict[str, Any]:
+        """Close one container and free its slot only after a fresh catalog read."""
+        started = asyncio.get_running_loop().time()
+        await self._service().append_agent_event(
+            self._run_id(),
+            owner,
+            f"{event_prefix}_started",
+            {
+                "unique_code": unique_code,
+                "observed_container_status": observed_status,
+                "reason": reason,
+            },
+        )
+        close_result: dict[str, Any] = self._error(
+            "container_release_unconfirmed",
+            "Container release was not confirmed",
+            error_type="internal",
+        )
+        synced: dict[str, Any] = self._error(
+            "catalog_sync_failed",
+            "Container release could not be confirmed",
+            error_type="internal",
+        )
+        attempts = 0
+        for attempt in range(1, 4):
+            attempts = attempt
+            try:
+                close_result = await self._execute_operation(
+                    caller_id=owner,
+                    tool_name="benchmark_close_challenge",
+                    arguments={"unique_code": unique_code},
+                    unique_code=unique_code,
+                )
+                # A 409/invalid_state can mean the platform already stopped
+                # the container; always refresh before deciding whether to retry.
+                synced = await self._sync_challenge_catalog()
+            except Exception:
+                LOGGER.warning(
+                    "%s_operation_failed run_id=%s unique_code=%s attempt=%s",
+                    event_prefix,
+                    self._run_id(),
+                    unique_code,
+                    attempt,
+                    exc_info=True,
+                )
+                close_result = self._error(
+                    "benchmark_error",
+                    "Container release failed",
+                    error_type="internal",
+                )
+                synced = self._error(
+                    "catalog_sync_failed",
+                    "Container release could not be confirmed",
+                    error_type="internal",
+                )
+            current = await self._challenge_record(unique_code)
+            if synced.get("ok") is True and not current["slot_occupied"]:
+                break
+            if attempt < 3 and (
+                self._is_transient_release_failure(close_result, synced)
+                # The close may be accepted asynchronously. Keep the release
+                # pending and retry until the catalog confirms a free slot.
+                or (synced.get("ok") is True and current["slot_occupied"])
+            ):
+                await asyncio.sleep(0.5 if attempt == 1 else 1.0)
+                continue
+            break
+
+        current = await self._challenge_record(unique_code)
+        released = synced.get("ok") is True and not current["slot_occupied"]
+        if not released:
+            # Keep the durable state pending when the platform could not
+            # confirm release.  Recovery will reconcile this record later.
+            await self._service().mark_completed_container_release_pending(
+                self._run_id(),
+                unique_code,
+                agent_id=owner or None,
+            )
+            current = await self._challenge_record(unique_code)
+        error_code = None
+        if not released:
+            error_code = self._error_code(close_result)
+            if error_code is None and not synced.get("ok"):
+                error_code = self._error_code(synced) or "catalog_sync_failed"
+            error_code = error_code or "container_release_unconfirmed"
+        event_type = f"{event_prefix}_succeeded" if released else f"{event_prefix}_failed"
+        payload: dict[str, Any] = {
+            "unique_code": unique_code,
+            "observed_container_status": observed_status,
+            "container_status": current["container_status"],
+            "reason": reason,
+            "attempts": attempts,
+            "duration_ms": int(
+                (asyncio.get_running_loop().time() - started) * 1_000
+            ),
+        }
+        if error_code is not None:
+            payload["error_code"] = error_code
+        await self._service().append_agent_event(
+            self._run_id(), owner, event_type, payload
+        )
+        log = LOGGER.info if released else LOGGER.warning
+        log(
+            "%s run_id=%s unique_code=%s observed_container_status=%s container_status=%s reason=%s duration_ms=%s error_code=%s",
+            event_type,
+            self._run_id(),
+            unique_code,
+            observed_status,
+            current["container_status"],
+            reason,
+            payload["duration_ms"],
+            error_code or "",
+        )
+        if not released and failure_report:
+            await self._service().publish_challenge_report(
+                self._run_id(),
+                sender_id=owner,
+                unique_code=unique_code,
+                report_type="challenge_status",
+                status="paused_container_release_failed",
+                payload={
+                    "type": "paused_container_release_failed",
+                    "unique_code": unique_code,
+                    "attempts": attempts,
+                    "error_code": error_code,
+                    "slot_occupied": current["slot_occupied"],
+                },
+            )
+        result = {
+            "released": released,
+            "attempts": attempts,
+            "container_status": current["container_status"],
+            "error_code": error_code,
+        }
+        if failure_report:
+            result["retry_exhausted"] = attempts >= 3 and not released
+        return result
+
     async def _release_completed_container(
         self,
         caller_id: str,
@@ -456,7 +669,7 @@ class AgentSupervisor:
     ) -> dict[str, Any]:
         async with self._container_operation_lock:
             challenge = await self._challenge_record(unique_code)
-            if not challenge["is_completed"]:
+            if not challenge["is_completed"] and challenge["work_status"] != "closed":
                 return {
                     "released": False,
                     "skipped": True,
@@ -475,126 +688,19 @@ class AgentSupervisor:
                 agent_id=caller_id or None,
             )
             challenge = await self._challenge_record(unique_code)
-            started = asyncio.get_running_loop().time()
-            observed_status = challenge["container_status"]
-            await self._service().append_agent_event(
-                self._run_id(),
-                caller_id,
-                "completed_container_release_started",
-                {
-                    "unique_code": unique_code,
-                    "observed_container_status": observed_status,
-                    "reason": reason,
-                },
+            return await self._release_container_with_confirmation(
+                owner=caller_id,
+                unique_code=unique_code,
+                reason=reason,
+                observed_status=challenge["container_status"],
+                event_prefix="completed_container_release",
             )
-            LOGGER.info(
-                "completed_container_release_started run_id=%s unique_code=%s observed_container_status=%s reason=%s",
-                self._run_id(),
-                unique_code,
-                observed_status,
-                reason,
-            )
-            close_result: dict[str, Any] = self._error(
-                "container_release_unconfirmed",
-                "Completed challenge container release was not confirmed",
-                error_type="internal",
-            )
-            synced: dict[str, Any] = self._error(
-                "catalog_sync_failed",
-                "Completed challenge container release could not be confirmed",
-                error_type="internal",
-            )
-            attempts = 0
-            for attempt in range(1, 4):
-                attempts = attempt
-                try:
-                    close_result = await self._execute_operation(
-                        caller_id=caller_id,
-                        tool_name="benchmark_close_challenge",
-                        arguments={"unique_code": unique_code},
-                        unique_code=unique_code,
-                    )
-                    synced = await self._sync_challenge_catalog()
-                except Exception:
-                    LOGGER.warning(
-                        "completed_container_release_operation_failed run_id=%s unique_code=%s attempt=%s",
-                        self._run_id(),
-                        unique_code,
-                        attempt,
-                        exc_info=True,
-                    )
-                    close_result = self._error(
-                        "benchmark_error",
-                        "Completed challenge container release failed",
-                        error_type="internal",
-                    )
-                    synced = self._error(
-                        "catalog_sync_failed",
-                        "Completed challenge container release could not be confirmed",
-                        error_type="internal",
-                    )
-                current = await self._challenge_record(unique_code)
-                if synced.get("ok") is True and not current["slot_occupied"]:
-                    break
-                if attempt < 3 and self._is_transient_release_failure(
-                    close_result, synced
-                ):
-                    await asyncio.sleep(0.5 if attempt == 1 else 1.0)
-                    continue
-                break
-            current = await self._challenge_record(unique_code)
-            released = synced.get("ok") is True and not current["slot_occupied"]
-            duration_ms = int(
-                (asyncio.get_running_loop().time() - started) * 1_000
-            )
-            event_type = (
-                "completed_container_release_succeeded"
-                if released
-                else "completed_container_release_failed"
-            )
-            error_code = None
-            if not released:
-                error_code = self._error_code(close_result)
-                if error_code is None and not synced.get("ok"):
-                    error_code = self._error_code(synced) or "catalog_sync_failed"
-                error_code = error_code or "container_release_unconfirmed"
-            payload = {
-                "unique_code": unique_code,
-                "observed_container_status": observed_status,
-                "container_status": current["container_status"],
-                "reason": reason,
-                "attempts": attempts,
-                "duration_ms": duration_ms,
-            }
-            if error_code is not None:
-                payload["error_code"] = error_code
-            await self._service().append_agent_event(
-                self._run_id(), caller_id, event_type, payload
-            )
-            log = LOGGER.info if released else LOGGER.warning
-            log(
-                "%s run_id=%s unique_code=%s observed_container_status=%s container_status=%s reason=%s duration_ms=%s error_code=%s",
-                event_type,
-                self._run_id(),
-                unique_code,
-                observed_status,
-                current["container_status"],
-                reason,
-                duration_ms,
-                error_code or "",
-            )
-            return {
-                "released": released,
-                "container_status": current["container_status"],
-                "error_code": error_code,
-                "attempts": attempts,
-            }
 
     async def release_paused_container(
         self,
         unique_code: str,
         *,
-        reason: str = "stagnation_timeout",
+        reason: str = "chief_pause",
         caller_id: str | None = None,
     ) -> dict[str, Any]:
         """Close a paused target and count a slot free only after confirmation."""
@@ -602,7 +708,11 @@ class AgentSupervisor:
         async with self._container_operation_lock:
             challenge = await self._challenge_record(unique_code)
             if challenge["work_status"] != "paused" or challenge["is_completed"]:
-                return {"released": False, "skipped": True, "reason": "challenge_not_paused"}
+                return {
+                    "released": False,
+                    "skipped": True,
+                    "reason": "challenge_not_paused",
+                }
             if not challenge["slot_occupied"]:
                 return {
                     "released": True,
@@ -610,112 +720,20 @@ class AgentSupervisor:
                     "container_status": challenge["container_status"],
                 }
             owner = caller_id or self.chief_agent_id or ""
-            started = asyncio.get_running_loop().time()
-            await self._service().append_agent_event(
+            await self._service().mark_completed_container_release_pending(
                 self._run_id(),
-                owner,
-                "paused_container_release_started",
-                {
-                    "unique_code": unique_code,
-                    "reason": reason,
-                    "observed_container_status": challenge["container_status"],
-                },
+                unique_code,
+                agent_id=owner or None,
             )
-            close_result: dict[str, Any] = self._error(
-                "container_release_unconfirmed",
-                "Paused challenge container release was not confirmed",
-                error_type="internal",
+            challenge = await self._challenge_record(unique_code)
+            return await self._release_container_with_confirmation(
+                owner=owner,
+                unique_code=unique_code,
+                reason=reason,
+                observed_status=challenge["container_status"],
+                event_prefix="paused_container_release",
+                failure_report=True,
             )
-            synced: dict[str, Any] = self._error(
-                "catalog_sync_failed",
-                "Paused challenge container release could not be confirmed",
-                error_type="internal",
-            )
-            attempts = 0
-            for attempt in range(1, 4):
-                attempts = attempt
-                try:
-                    close_result = await self._execute_operation(
-                        caller_id=owner,
-                        tool_name="benchmark_close_challenge",
-                        arguments={"unique_code": unique_code},
-                        unique_code=unique_code,
-                    )
-                    synced = await self._sync_challenge_catalog()
-                except Exception:
-                    LOGGER.warning(
-                        "paused_container_release_operation_failed run_id=%s unique_code=%s attempt=%s",
-                        self._run_id(),
-                        unique_code,
-                        attempt,
-                        exc_info=True,
-                    )
-                    close_result = self._error(
-                        "benchmark_error",
-                        "Paused challenge container release failed",
-                        error_type="internal",
-                    )
-                    synced = self._error(
-                        "catalog_sync_failed",
-                        "Paused challenge container release could not be confirmed",
-                        error_type="internal",
-                    )
-                current = await self._challenge_record(unique_code)
-                if synced.get("ok") is True and not current["slot_occupied"]:
-                    break
-                if attempt < 3 and self._is_transient_release_failure(
-                    close_result, synced
-                ):
-                    await asyncio.sleep(0.5 if attempt == 1 else 1.0)
-                    continue
-                break
-            current = await self._challenge_record(unique_code)
-            released = synced.get("ok") is True and not current["slot_occupied"]
-            error_code = None
-            if not released:
-                error_code = self._error_code(close_result)
-                if error_code is None and not synced.get("ok"):
-                    error_code = self._error_code(synced) or "catalog_sync_failed"
-                error_code = error_code or "container_release_unconfirmed"
-            event_type = (
-                "paused_container_release_succeeded"
-                if released
-                else "paused_container_release_failed"
-            )
-            payload: dict[str, Any] = {
-                "unique_code": unique_code,
-                "attempts": attempts,
-                "reason": reason,
-                "container_status": current["container_status"],
-                "duration_ms": int((asyncio.get_running_loop().time() - started) * 1_000),
-            }
-            if error_code is not None:
-                payload["error_code"] = error_code
-            await self._service().append_agent_event(
-                self._run_id(), owner, event_type, payload
-            )
-            if not released:
-                await self._service().publish_challenge_report(
-                    self._run_id(),
-                    sender_id=owner,
-                    unique_code=unique_code,
-                    report_type="challenge_status",
-                    status="paused_container_release_failed",
-                    payload={
-                        "type": "paused_container_release_failed",
-                        "unique_code": unique_code,
-                        "attempts": attempts,
-                        "error_code": error_code,
-                        "slot_occupied": current["slot_occupied"],
-                    },
-                )
-            return {
-                "released": released,
-                "retry_exhausted": attempts >= 3 and not released,
-                "attempts": attempts,
-                "container_status": current["container_status"],
-                "error_code": error_code,
-            }
 
     def _schedule_challenge_completion(
         self,
@@ -732,20 +750,30 @@ class AgentSupervisor:
         caller_id = release_caller_id or self.chief_agent_id or exclude_agent_id or ""
 
         async def converge() -> None:
+            run = (await self._service().get_overview(self._run_id()))["run"]
+            selected = run["selected_challenge_codes"]
+            if selected is not None and unique_code not in selected:
+                return
             await self.stop_challenge_work(
                 unique_code,
                 reason=reason,
                 exclude_agent_id=exclude_agent_id,
             )
-            await self._release_completed_container(
-                caller_id,
-                unique_code,
-                reason=reason,
-            )
+            challenge = await self._challenge_record(unique_code)
+            if challenge["work_status"] == "paused" and not challenge["is_completed"]:
+                await self.release_paused_container(
+                    unique_code,
+                    caller_id=caller_id,
+                    reason=reason,
+                )
+            else:
+                await self._release_completed_container(
+                    caller_id,
+                    unique_code,
+                    reason=reason,
+                )
 
-        task = asyncio.create_task(
-            converge(), name=f"aion-complete-{unique_code}"
-        )
+        task = asyncio.create_task(converge(), name=f"aion-complete-{unique_code}")
         self._challenge_completion_tasks[unique_code] = task
 
         def completed(done: asyncio.Task[Any]) -> None:
@@ -766,306 +794,6 @@ class AgentSupervisor:
 
         task.add_done_callback(completed)
 
-    async def create_challenge_agent(
-        self,
-        caller_id: str,
-        unique_code: str,
-        *,
-        refresh: bool = True,
-    ) -> dict[str, Any]:
-        self._require_role(caller_id, "chief")
-        if refresh:
-            refreshed = await self.refresh_challenges(caller_id)
-            if not refreshed.get("ok"):
-                return refreshed
-        challenge = self._catalog.get(unique_code)
-        if challenge is None:
-            return self._error(
-                "task_not_found",
-                "Challenge was not found",
-                error_type="api",
-                status_code=404,
-            )
-        overview = await self._service().get_overview(self._run_id())
-        existing = next(
-            (
-                item
-                for item in overview["agents"]
-                if item["role"] == "challenge"
-                and item["unique_code"] == unique_code
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-            ),
-            None,
-        )
-        if existing is not None:
-            bootstrap_result = await self._ensure_bootstrap_agent(
-                unique_code,
-                existing["agent_id"],
-                reason="challenge_start_existing",
-            )
-            initial_executions = [
-                item
-                for item in overview["agents"]
-                if item.get("role") == "execution"
-                and item.get("unique_code") == unique_code
-                and item.get("task_key") == "initial-recon"
-            ]
-            return self._ok(
-                {
-                    "agent_id": existing["agent_id"],
-                    "role": "challenge",
-                    "unique_code": unique_code,
-                    "status": existing["status"],
-                    "idempotent": True,
-                    "bootstrap": bootstrap_result,
-                    "initial_executions": initial_executions,
-                }
-            )
-        challenge_state = next(
-            item for item in overview["challenges"] if item["unique_code"] == unique_code
-        )
-        if challenge_state["is_completed"] or challenge_state["work_status"] == "closed":
-            return self._error(
-                "challenge_completed",
-                "The challenge is already completed or closed",
-                error_type="conflict",
-            )
-        if challenge_state["work_status"] == "paused" and challenge_state["slot_occupied"]:
-            try:
-                await self._service().start_challenge(
-                    self._run_id(),
-                    unique_code,
-                    context=self._state_context(caller_id),
-                )
-            except Exception:
-                return self._error(
-                    "challenge_resume_failed",
-                    "The paused challenge could not be resumed",
-                    error_type="conflict",
-                )
-        start_result = await self._ensure_challenge_container(
-            caller_id, unique_code
-        )
-        if not start_result.get("ok"):
-            return start_result
-
-        agent_id = f"challenge_{uuid4().hex}"
-        bootstrap_agent_id = f"execution_{uuid4().hex}"
-        bootstrap_agent_ids: list[str] = []
-        initial_execution_ids: list[str] = []
-        prior_context = await self._service().get_challenge_context(
-            self._run_id(), unique_code, compact=True
-        )
-        prior_hints = prior_context.get("hints") if isinstance(prior_context, Mapping) else []
-        prompt = self._challenge_prompt(
-            challenge,
-            start_result,
-            hints=prior_hints,
-        )
-        bootstrap_prompt = self._bootstrap_prompt(
-            challenge,
-            start_result,
-            hints=prior_hints,
-        )
-        initial_execution = self._initial_execution_task(challenge)
-        try:
-            record = await self._service().register_challenge_workgroup(
-                self._run_id(),
-                challenge_agent_id=agent_id,
-                bootstrap_agent_id=bootstrap_agent_id,
-                parent_id=caller_id,
-                unique_code=unique_code,
-                challenge_prompt=prompt,
-                bootstrap_prompt=bootstrap_prompt,
-                initial_execution=initial_execution,
-                bootstrap_enabled=bool(
-                    getattr(self.settings, "bootstrap_enabled", True)
-                ),
-            )
-            bootstrap_entries = (
-                record.get("bootstraps")
-                if isinstance(record, Mapping)
-                else None
-            )
-            if not isinstance(bootstrap_entries, list):
-                bootstrap_entries = [
-                    record.get("bootstrap") if isinstance(record, Mapping) else None
-                ]
-            bootstrap_agent_ids = [
-                str(item["agent_id"])
-                for item in bootstrap_entries
-                if isinstance(item, Mapping) and item.get("agent_id")
-            ]
-            self._state_capabilities[agent_id] = self.capability_registry.issue(
-                self._run_id(), agent_id, "challenge", unique_code
-            ).context
-            for bootstrap_id in bootstrap_agent_ids:
-                self._state_capabilities[bootstrap_id] = self.capability_registry.issue(
-                    self._run_id(), bootstrap_id, "execution", unique_code
-                ).context
-            initial_entries = (
-                record.get("initial_executions")
-                if isinstance(record, Mapping)
-                else None
-            )
-            if not isinstance(initial_entries, list):
-                initial_entries = []
-            initial_execution_ids = [
-                str(item["agent_id"])
-                for item in initial_entries
-                if isinstance(item, Mapping) and item.get("agent_id")
-            ]
-            for initial_id in initial_execution_ids:
-                self._state_capabilities[initial_id] = self.capability_registry.issue(
-                    self._run_id(), initial_id, "execution", unique_code
-                ).context
-            await self._sync_nodes()
-            for initial_id in initial_execution_ids:
-                task = asyncio.create_task(
-                    self._prefetch_execution_skill(initial_id),
-                    name=f"skill-discovery-initial-{initial_id}",
-                )
-                self._skill_discovery_bootstrap_tasks.add(task)
-                task.add_done_callback(self._skill_discovery_bootstrap_tasks.discard)
-            await self._launch_agent(agent_id)
-        except Exception:
-            try:
-                await self._service().finish_agent(
-                    self._run_id(), agent_id, status="failed"
-                )
-            except Exception:
-                pass
-            try:
-                for execution_id in bootstrap_agent_ids + initial_execution_ids or [bootstrap_agent_id]:
-                    bootstrap_record = await self._service().get_agent_runtime(
-                        self._run_id(), execution_id
-                    )
-                    if bootstrap_record["agent"]["status"] in self.TERMINAL_AGENT_STATES:
-                        continue
-                    live_execution = self._tasks.get(execution_id)
-                    if live_execution is not None and not live_execution.done():
-                        await self._stop_agent(execution_id)
-                    else:
-                        await self._service().finalize_execution_agent(
-                            self._run_id(),
-                            execution_id,
-                            CapabilityContext(
-                                run_id=self._run_id(),
-                                agent_id=execution_id,
-                                role="execution",
-                                unique_code=unique_code,
-                            ),
-                            AgentReportInput(
-                                status="failed",
-                                summary="Challenge workgroup Execution could not be started",
-                                hypothesis_outcome="inconclusive",
-                            ),
-                            terminal_status="failed",
-                            allow_inactive=True,
-                        )
-            except Exception:
-                pass
-            return self._error(
-                "agent_start_failed",
-                "Challenge Agent could not be started",
-                error_type="execution",
-            )
-        return self._ok(
-            {
-                "agent_id": agent_id,
-                "role": record["role"],
-                "unique_code": unique_code,
-                "status": "running",
-                "bootstrap": record.get("bootstrap", {"enabled": False}),
-                "bootstraps": record.get("bootstraps", []),
-                "initial_executions": record.get("initial_executions", []),
-                "start": start_result.get("data", {}),
-            }
-        )
-
-    async def observe_chief(
-        self,
-        caller_id: str,
-        *,
-        max_reports: int = 20,
-    ) -> dict[str, Any]:
-        """Return one compact authoritative Chief snapshot."""
-
-        self._require_role(caller_id, "chief")
-        reports = await self._service().consume_reports(
-            self._run_id(),
-            self._state_context(caller_id),
-            report_type="challenge_status",
-            wait_seconds=0.0,
-            max_reports=max_reports,
-        )
-        snapshot_replayed = False
-        if not reports.get("reports"):
-            replay = await self._service().replay_unacknowledged_controller_reports(
-                self._run_id(),
-                self._state_context(caller_id),
-                report_type="challenge_status",
-                max_reports=max_reports,
-            )
-            if replay is not None:
-                reports = replay
-                snapshot_replayed = True
-        overview = await self._service().get_overview(self._run_id())
-        scheduled = await ChallengeScheduler(self._service()).select(self._run_id())
-        evidence = await self._service().list_evidence_metadata(
-            self._run_id(), self._state_context(caller_id), limit=max_reports
-        )
-        compact_reports = [
-            self._flatten_report(item, "challenge_status")
-            for item in reports["reports"]
-        ]
-        run = overview.get("run") or {}
-        return self._ok(
-            {
-                "run": {
-                    key: run.get(key)
-                    for key in (
-                        "run_id",
-                        "status",
-                        "phase",
-                        "deadline_at",
-                        "current_challenge_code",
-                        "score_snapshot",
-                    )
-                },
-                "capacity": overview.get("container_capacity"),
-                "challenges": [
-                    self._compact_challenge_for_chief(item)
-                    for item in overview.get("challenges", [])
-                ],
-                "active_agents": [
-                    {
-                        key: item.get(key)
-                        for key in (
-                            "agent_id",
-                            "role",
-                            "unique_code",
-                            "status",
-                            "task_stage",
-                            "priority",
-                            "mission",
-                            "started_at",
-                            "last_report_sequence",
-                        )
-                    }
-                    for item in overview.get("agents", [])
-                    if item.get("status") not in self.TERMINAL_AGENT_STATES
-                ],
-                "schedule": scheduled,
-                "evidence": evidence,
-                "reports": compact_reports,
-                "report_count": len(compact_reports),
-                "next_sequence": reports["next_sequence"],
-                "has_more": len(compact_reports) >= max_reports,
-                "snapshot_replayed": snapshot_replayed,
-            }
-        )
-
     async def launch_challenges(
         self,
         caller_id: str,
@@ -1079,9 +807,7 @@ class AgentSupervisor:
             return refreshed
         results: list[dict[str, Any]] = []
         for unique_code in unique_codes:
-            result = await self.create_challenge_agent(
-                caller_id, unique_code, refresh=False
-            )
+            result = await self.create_solver(caller_id, unique_code, refresh=False)
             results.append(
                 {
                     "unique_code": unique_code,
@@ -1091,22 +817,8 @@ class AgentSupervisor:
         return self._ok(
             {
                 "results": results,
-                "started_count": sum(
-                    1 for item in results if item.get("ok") is True
-                ),
+                "started_count": sum(1 for item in results if item.get("ok") is True),
             }
-        )
-
-    async def wait_chief(
-        self,
-        caller_id: str,
-        *,
-        reason: str | None = None,
-    ) -> ToolDispatchOutcome:
-        self._require_role(caller_id, "chief")
-        return ToolDispatchOutcome(
-            self._ok({"status": "waiting", "reason": reason}),
-            yield_session=True,
         )
 
     async def request_hint_light(
@@ -1137,12 +849,6 @@ class AgentSupervisor:
                 "Only one hint may be requested for a challenge",
                 error_type="conflict",
             )
-        if not challenge["hint_eligible"]:
-            return self._error(
-                "hint_not_eligible",
-                "The runtime has not granted a hint signal for this challenge",
-                error_type="conflict",
-            )
         lock = self._hint_locks.setdefault(unique_code, asyncio.Lock())
         async with lock:
             challenge = await self._challenge_record(unique_code)
@@ -1150,12 +856,6 @@ class AgentSupervisor:
                 return self._error(
                     "hint_already_requested",
                     "Only one hint may be requested for a challenge",
-                    error_type="conflict",
-                )
-            if not challenge["hint_eligible"]:
-                return self._error(
-                    "hint_not_eligible",
-                    "The runtime has not granted a hint signal for this challenge",
                     error_type="conflict",
                 )
             result = await self._execute_operation(
@@ -1179,9 +879,7 @@ class AgentSupervisor:
                 status="received",
                 payload=hint_payload,
             )
-            challenge_agent = await self._find_agent(
-                "challenge", unique_code=unique_code
-            )
+            challenge_agent = await self._find_agent("solver", unique_code=unique_code)
             if challenge_agent is not None:
                 await self._service().publish_control_report(
                     self._run_id(),
@@ -1192,101 +890,8 @@ class AgentSupervisor:
                     status="received",
                     payload=hint_payload,
                 )
-            bootstrap_agents = [
-                item
-                for item in (await self._service().get_overview(self._run_id()))["agents"]
-                if item.get("role") == "execution"
-                and item.get("unique_code") == unique_code
-            ]
-            for bootstrap in bootstrap_agents:
-                if bootstrap.get("kind") != "bootstrap" or bootstrap.get("status") in self.TERMINAL_AGENT_STATES:
-                    continue
-                await self._service().publish_control_report(
-                    self._run_id(),
-                    sender_id=caller_id,
-                    recipient_id=bootstrap["agent_id"],
-                    unique_code=unique_code,
-                    report_type="hint",
-                    status="received",
-                    payload=hint_payload,
-                )
+
         return result
-
-    async def launch_execution_agent(self, agent_id: str) -> None:
-        """Launch a previously admitted Execution Agent."""
-
-        record = await self._agent_record(agent_id, "execution")
-        if record["status"] not in {"queued", "starting", "pending"}:
-            raise SubagentError("Execution Agent is not awaiting admission")
-        if agent_id not in self._state_capabilities:
-            self._state_capabilities[agent_id] = self.capability_registry.issue(
-                self._run_id(), agent_id, "execution", record["unique_code"]
-            ).context
-        await self._sync_nodes()
-        await self._launch_agent(agent_id)
-
-    async def stop_execution_agents(self, unique_code: str) -> None:
-        """Stop live execution tasks after a persisted pause decision."""
-
-        overview = await self._service().get_overview(self._run_id())
-        await asyncio.gather(
-            *(
-                self._stop_agent(item["agent_id"])
-                for item in overview["agents"]
-                if item["role"] == "execution"
-                and item["unique_code"] == unique_code
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-            ),
-        )
-
-    async def stop_challenge_work(
-        self,
-        unique_code: str,
-        *,
-        reason: str = "challenge_completed",
-        exclude_agent_id: str | None = None,
-    ) -> None:
-        """Immediately stop live work owned by one challenge.
-
-        A submitting Challenge Agent can be excluded so its synchronous tool
-        result can reach the controller before the controller settles.
-        """
-
-        try:
-            await self._service().cancel_challenge_branches(
-                self._run_id(), unique_code, reason=reason
-            )
-        except Exception:
-            LOGGER.warning(
-                "challenge_branch_cancel_failed run_id=%s unique_code=%s",
-                self._run_id(),
-                unique_code,
-            )
-        overview = await self._service().get_overview(self._run_id())
-        live_agents = [
-            item
-            for item in overview["agents"]
-            if item["role"] in {"challenge", "execution"}
-            and item["unique_code"] == unique_code
-            and item["agent_id"] != exclude_agent_id
-            and item["status"] not in self.TERMINAL_AGENT_STATES
-        ]
-        if not live_agents:
-            return
-        await asyncio.gather(
-            *(self._stop_agent(item["agent_id"]) for item in live_agents)
-        )
-        await self._service().append_agent_event(
-            self._run_id(),
-            self.chief_agent_id or "",
-            "challenge_completed_agents_stopped",
-            {
-                "unique_code": unique_code,
-                "reason": reason,
-                "excluded_agent_id": exclude_agent_id,
-            },
-        )
-        await self._sync_nodes()
 
     async def wait_agent(self, agent_id: str) -> dict[str, Any]:
         task = self._tasks.get(agent_id)
@@ -1295,7 +900,7 @@ class AgentSupervisor:
         result = await task
         return result if isinstance(result, dict) else {"agent_id": agent_id}
 
-    async def wait_for_quiescence(self) -> None:
+    async def wait_for_agents(self) -> None:
         """Wait on durable lifecycle signals until the complete Agent tree stops."""
 
         signal_key = self._service().run_signal_key(self._run_id())
@@ -1306,575 +911,93 @@ class AgentSupervisor:
                 item["status"] in self.TERMINAL_AGENT_STATES
                 for item in overview["agents"]
             )
-            tasks_done = all(task.done() for task in self._tasks.values())
+            tasks_done = all(task.done() for task in self._tasks.values()) and all(
+                task.done() for task in self._challenge_completion_tasks.values()
+            )
             if agents_terminal and tasks_done:
                 return
             cursor = await self._service().notifier.wait(
                 signal_key, cursor, self.CONTROLLER_SAFETY_WAKE_SECONDS
             )
 
-    async def observe_challenge(
-        self,
-        caller_id: str,
-        *,
-        max_reports: int = 8,
-    ) -> dict[str, Any]:
-        node = self._require_role(caller_id, "challenge")
+    async def submit_flag(
+        self, caller_id: str, flag: str
+    ) -> dict[str, Any] | ToolDispatchOutcome:
+        node = self._require_role(caller_id, "solver")
         if not node.unique_code:
             return self._error(
                 "missing_challenge",
-                "Challenge Agent is not bound to a challenge",
+                "Solver is not bound to a challenge",
             )
-        observed = await self._service().observe_challenge(
-            self._run_id(),
-            node.unique_code,
-            self._state_context(caller_id),
-            max_reports=max_reports,
+        result = await self._execute_operation(
+            caller_id=caller_id,
+            tool_name="benchmark_submit_flag",
+            arguments={"unique_code": node.unique_code, "flag": flag},
+            unique_code=node.unique_code,
         )
-        observed = await self._maybe_compact_challenge_observation(
-            caller_id, observed
-        )
-        return self._ok(observed)
-
-    async def _maybe_compact_challenge_observation(
-        self, caller_id: str, observed: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """Shorten large safe report projections without touching authority."""
-
-        encoded_length = len(
-            json.dumps(dict(observed), ensure_ascii=False, default=str)
-        )
-        reports = list(observed.get("reports") or [])
-        if encoded_length < 6_000 or not reports:
-            return dict(observed)
-        digest = blackboard_content_digest(observed)
-        cached = self._blackboard_compaction_cache.get(digest)
-        if cached is not None:
-            return dict(cached)
-        compactor = BlackboardCompactor(
-            self.settings,
-            client=self._shared_model_http_client(),
-        )
-        try:
-            compacted = await compactor.compact(observed)
-        except BlackboardCompactionError as exc:
-            await self._service().append_agent_event(
-                self._run_id(),
-                caller_id,
-                "blackboard_compaction_fallback",
-                {
-                    "content_digest": digest,
-                    "error_type": type(exc).__name__,
+        if not result.get("ok") and self._error_code(result) == "duplicate":
+            # A duplicate is not a reason to submit again.  One catalog
+            # read is enough to learn whether another Agent already
+            # completed the Challenge.
+            await self._sync_challenge_catalog()
+        if result.get("ok"):
+            await self._sync_challenge_catalog()
+        current = await self._challenge_record(node.unique_code)
+        completed = bool(current["is_completed"])
+        if result.get("ok") and isinstance(result.get("data"), Mapping):
+            result = {
+                **result,
+                "data": {
+                    **dict(result["data"]),
+                    "challenge_completed": completed,
                 },
-            )
-            return dict(observed)
-        await self._service().append_agent_event(
-            self._run_id(),
-            caller_id,
-            "blackboard_compacted",
-            {
-                "content_digest": digest,
-                "report_count": len(reports),
-                "input_chars": encoded_length,
-                "output_chars": len(
-                    json.dumps(dict(compacted), ensure_ascii=False, default=str)
-                ),
-                "latency_ms": compactor.last_metrics.get("latency_ms"),
-            },
-        )
-        compacted.pop("compacted", None)
-        self._blackboard_compaction_cache[digest] = compacted
-        if len(self._blackboard_compaction_cache) > 8:
-            oldest = next(iter(self._blackboard_compaction_cache))
-            self._blackboard_compaction_cache.pop(oldest, None)
-        return compacted
-
-    async def request_secondary_bootstrap(
-        self,
-        caller_id: str,
-        route_a: str,
-        route_b: str,
-        reason: str,
-    ) -> dict[str, Any]:
-        """Temporarily open one extra Bootstrap lane for two distinct routes."""
-
-        node = self._require_role(caller_id, "challenge")
-        if not node.unique_code:
-            return self._error(
-                "missing_challenge",
-                "Challenge Agent is not bound to a challenge",
-            )
-        route_a = route_a.strip()
-        route_b = route_b.strip()
-        reason = reason.strip()
-        if not route_a or not route_b or not reason:
-            return self._error(
-                "invalid_secondary_bootstrap_request",
-                "Two non-empty independent routes and a reason are required",
-            )
-        if route_a.casefold() == route_b.casefold():
-            return self._error(
-                "duplicate_secondary_bootstrap_route",
-                "The two Bootstrap routes must be materially different",
-            )
-        challenge = await self._challenge_record(node.unique_code)
-        capacity = await self._service().set_bootstrap_capacity(
-            self._run_id(),
-            node.unique_code,
-            parent_id=node.agent_id,
-            target_count=2,
-            reason="secondary_independent_routes",
-        )
-        target_count = int(capacity.get("target_count") or 0)
-        if target_count < 1:
-            return self._error(
-                "challenge_stopped",
-                "The Challenge is no longer active",
-                error_type="conflict",
-            )
-        result = await self._ensure_bootstrap_agent(
-            node.unique_code,
-            node.agent_id,
-            reason="secondary_independent_routes",
-            bootstrap_count=target_count,
-            route_scope=(
-                f"Do not repeat route A: {route_a[:800]}. "
-                f"Explore route B only: {route_b[:800]}."
-            ),
-        )
-        await self._service().append_agent_event(
-            self._run_id(),
-            caller_id,
-            "bootstrap_secondary_requested",
-            {
-                "unique_code": node.unique_code,
-                "route_a": route_a[:800],
-                "route_b": route_b[:800],
-                "reason": reason[:1_000],
-                "bootstrap_count": target_count,
-            },
-        )
-        await self._project()
-        return self._ok(
-            {
-                "unique_code": node.unique_code,
-                "challenge_status": challenge.get("work_status"),
-                "bootstrap_count": len(result.get("bootstraps") or []),
-                "bootstraps": result.get("bootstraps") or [],
             }
-        )
-
-    async def dispatch_challenge(
-        self,
-        caller_id: str,
-        payload: ChallengeDispatchInput,
-    ) -> dict[str, Any]:
-        node = self._require_role(caller_id, "challenge")
-        if not node.unique_code:
-            return self._error(
-                "missing_challenge",
-                "Challenge Agent is not bound to a challenge",
+        elif (
+            not result.get("ok")
+            and self._error_code(result) == "duplicate"
+            and completed
+        ):
+            result = self._ok(
+                {
+                    "correct": None,
+                    "duplicate": True,
+                    "challenge_completed": True,
+                }
             )
-        if payload.outcome == "blocked" and not payload.tasks:
-            overview = await self._service().get_overview(self._run_id())
-            active_children = [
-                item["agent_id"]
-                for item in overview["agents"]
-                if item["role"] == "execution"
-                and item.get("unique_code") == node.unique_code
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-            ]
-            if active_children:
-                return self._error(
-                    "active_work_requires_wait",
-                    "Active Execution work is still running; use challenge_wait instead of recording a blocked decision",
-                    error_type="conflict",
-                    detail={"active_agent_ids": active_children},
-                )
-        result = await self._service().dispatch_challenge(
-            self._run_id(),
-            node.unique_code,
-            self._state_context(caller_id),
-            payload,
-        )
-        if not result.get("no_action"):
-            await self._register_dispatch_admissions(
-                node.unique_code, result.get("admissions", [])
+        if result.get("ok") and completed:
+            release_status = "pending" if current["slot_occupied"] else "released"
+            result = {
+                **result,
+                "data": {
+                    **dict(result.get("data") or {}),
+                    "challenge_completed": True,
+                    "container_release_status": release_status,
+                },
+            }
+            await self._service().finish_agent(
+                self._run_id(), caller_id, status="completed",
+                final_report=submission_report(node.unique_code, result, completed),
             )
-        if self.chief_agent_id is not None and not result.get("no_action"):
+            self._close_agent_admission(caller_id)
+            self._schedule_challenge_completion(
+                node.unique_code,
+                reason="all_flags_submitted",
+                exclude_agent_id=caller_id,
+                release_caller_id=self.chief_agent_id or caller_id,
+            )
+        if self.chief_agent_id is not None:
             await self._service().publish_control_report(
                 self._run_id(),
                 sender_id=caller_id,
                 recipient_id=self.chief_agent_id,
                 unique_code=node.unique_code,
                 report_type="challenge_status",
-                status=payload.outcome,
-                payload={
-                    "type": "challenge_dispatch",
-                    "summary": payload.summary,
-                    "outcome": payload.outcome,
-                    "task_count": len(payload.tasks),
-                    "next_steps": payload.next_steps,
-                    "evidence_refs": payload.evidence_refs,
-                },
+                status="flag_submitted",
+                payload=submission_report(node.unique_code, result, completed),
             )
-        warnings = list(result.pop("warnings", []))
-        await self._project()
-        return {"ok": True, "data": result, "warnings": warnings}
-
-    async def submit_flag(self, caller_id: str, flag: str) -> dict[str, Any]:
-        node = self._require_role(caller_id, "challenge")
-        if not node.unique_code:
-            return self._error(
-                "missing_challenge",
-                "Challenge Agent is not bound to a challenge",
-            )
-        try:
-            result = await self._execute_operation(
-                caller_id=caller_id,
-                tool_name="benchmark_submit_flag",
-                arguments={"unique_code": node.unique_code, "flag": flag},
-                unique_code=node.unique_code,
-            )
-            if not result.get("ok") and self._error_code(result) == "duplicate":
-                # A duplicate is not a reason to submit again.  One catalog
-                # read is enough to learn whether another Agent already
-                # completed the Challenge.
-                synced = await self._sync_challenge_catalog()
-                if not synced.get("ok"):
-                    return result
-            current = await self._challenge_record(node.unique_code)
-            completed = bool(current["is_completed"])
-            if result.get("ok") and isinstance(result.get("data"), Mapping):
-                result = {
-                    **result,
-                    "data": {
-                        **dict(result["data"]),
-                        "challenge_completed": completed,
-                    },
-                }
-            elif (
-                not result.get("ok")
-                and self._error_code(result) == "duplicate"
-                and completed
-            ):
-                result = self._ok(
-                    {
-                        "accepted": False,
-                        "duplicate": True,
-                        "challenge_completed": True,
-                    }
-                )
-            if result.get("ok") and completed:
-                release_status = (
-                    "pending" if current["slot_occupied"] else "released"
-                )
-                result = {
-                    **result,
-                    "data": {
-                        **dict(result.get("data") or {}),
-                        "challenge_completed": True,
-                        "container_release_status": release_status,
-                    },
-                }
-                self._schedule_challenge_completion(
-                    node.unique_code,
-                    reason="all_flags_submitted",
-                    exclude_agent_id=caller_id,
-                    release_caller_id=self.chief_agent_id or caller_id,
-                )
-            if self.chief_agent_id is not None:
-                await self._service().publish_control_report(
-                    self._run_id(),
-                    sender_id=caller_id,
-                    recipient_id=self.chief_agent_id,
-                    unique_code=node.unique_code,
-                    report_type="challenge_status",
-                    status="flag_submitted",
-                    payload={
-                        "type": "challenge_flag",
-                        "unique_code": node.unique_code,
-                        "accepted": bool(
-                            isinstance(result.get("data"), Mapping)
-                            and result["data"].get("accepted")
-                        ),
-                    },
-                )
-            return result
-        finally:
-            self._service().forget_ephemeral_secret(flag)
-
-    async def close_challenge(self, caller_id: str) -> dict[str, Any]:
-        node = self._require_role(caller_id, "challenge")
-        if not node.unique_code:
-            return self._error(
-                "missing_challenge",
-                "Challenge Agent is not bound to a challenge",
-            )
-        result = await self._execute_operation(
-            caller_id=caller_id,
-            tool_name="benchmark_close_challenge",
-            arguments={"unique_code": node.unique_code},
-            unique_code=node.unique_code,
-        )
-        await self._sync_challenge_catalog()
-        if result.get("ok"):
-            await self._stop_children(caller_id)
-            await self._service().finish_agent(
-                self._run_id(), caller_id, status="completed"
-            )
-            await self._sync_nodes()
+        if result.get("ok") and completed:
+            return ToolDispatchOutcome(result, yield_session=True)
         return result
-
-    async def report_execution_payload(
-        self,
-        caller_id: str,
-        payload: AgentReportInput,
-    ) -> dict[str, Any]:
-        self._require_role(caller_id, "execution")
-        saved = await self._service().submit_report(
-            self._run_id(), caller_id, self._state_context(caller_id), payload
-        )
-        if (
-            saved.get("terminal", True)
-            and self._report_has_high_value_progress(saved)
-        ):
-            node = self.nodes[caller_id]
-            await self._stop_competing_executions(
-                unique_code=node.unique_code or "",
-                exclude_agent_id=caller_id,
-                discovery_only=True,
-            )
-        await self._project()
-        await self._sync_nodes()
-        return {
-            "ok": True,
-            "data": {
-                "agent_id": caller_id,
-                "sequence": saved["sequence"],
-                "status": payload.status,
-                "hypothesis_outcome": saved.get(
-                    "hypothesis_outcome", "inconclusive"
-                ),
-                "terminal": bool(saved.get("terminal", True)),
-                "cycle_yield": bool(saved.get("cycle_yield", False)),
-                "report_id": saved.get("report_id"),
-                "idempotent": saved.get("idempotent", False),
-            },
-            "warnings": saved.get("warnings", []),
-        }
-
-    @staticmethod
-    def _report_has_high_value_progress(saved: Mapping[str, Any]) -> bool:
-        """Recognize only evidence-backed progress suitable for lane pruning."""
-
-        if saved.get("candidate_flag_present"):
-            return True
-        findings = saved.get("findings")
-        if not isinstance(findings, list):
-            return False
-        categories = {"vulnerability", "credential", "privilege", "attack_path", "flag"}
-        for finding in findings:
-            if not isinstance(finding, Mapping):
-                continue
-            if finding.get("category") not in categories:
-                continue
-            if finding.get("verification_status") == "rejected":
-                continue
-            refs = finding.get("evidence_refs")
-            if not isinstance(refs, list) or not any(
-                isinstance(ref, str) and ref.startswith("evidence:") for ref in refs
-            ):
-                continue
-            if finding.get("verification_status") == "verified":
-                return True
-            try:
-                confidence = float(finding.get("confidence"))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            if confidence >= 0.8:
-                return True
-        return False
-
-    async def report_bootstrap_checkpoint(
-        self,
-        caller_id: str,
-        *,
-        route_key: str,
-        summary: str,
-        next_step: str,
-        task_stage: str,
-        evidence_refs: list[str],
-    ) -> dict[str, Any]:
-        self._require_role(caller_id, "execution")
-        saved = await self._service().submit_bootstrap_checkpoint(
-            self._run_id(),
-            caller_id,
-            self._state_context(caller_id),
-            route_key=route_key,
-            summary=summary,
-            next_step=next_step,
-            task_stage=task_stage,
-            evidence_refs=evidence_refs,
-        )
-        if not saved.get("idempotent"):
-            # A Bootstrap checkpoint is already a verified route handoff. Stop
-            # stale discovery lanes so the Challenge-created follow-up is the
-            # next piece of work instead of competing with old reconnaissance.
-            await self._stop_competing_executions(
-                unique_code=self.nodes[caller_id].unique_code or "",
-                exclude_agent_id=caller_id,
-                discovery_only=True,
-            )
-        await self._project()
-        await self._sync_nodes()
-        return {
-            "ok": True,
-            "data": {
-                "agent_id": caller_id,
-                "sequence": saved["sequence"],
-                "status": saved["status"],
-                "terminal": False,
-                "report_id": saved["report_id"],
-                "route_key": saved["route_key"],
-                "idempotent": saved.get("idempotent", False),
-            },
-            "warnings": saved.get("warnings", []),
-        }
-
-    async def yield_bootstrap_cycle(
-        self,
-        caller_id: str,
-        *,
-        summary: str,
-    ) -> dict[str, Any]:
-        self._require_role(caller_id, "execution")
-        saved = await self._service().yield_bootstrap_cycle(
-            self._run_id(),
-            caller_id,
-            self._state_context(caller_id),
-            summary=summary,
-        )
-        await self._project()
-        await self._sync_nodes()
-        return {
-            "ok": True,
-            "data": {
-                **saved,
-                "terminal": False,
-                "cycle_yield": True,
-            },
-            "warnings": [],
-        }
-
-    async def report_execution_checkpoint(
-        self,
-        caller_id: str,
-        *,
-        summary: str,
-        next_step: str,
-        task_stage: str,
-        urgency: str,
-        evidence_refs: list[str],
-    ) -> dict[str, Any]:
-        self._require_role(caller_id, "execution")
-        saved = await self._service().submit_execution_checkpoint(
-            self._run_id(),
-            caller_id,
-            self._state_context(caller_id),
-            summary=summary,
-            next_step=next_step,
-            task_stage=task_stage,
-            urgency=urgency,
-            evidence_refs=evidence_refs,
-        )
-        # An interrupt checkpoint is an explicit verified handoff: preserve the
-        # checkpointing lane and the persistent Bootstrap lane, but stop only
-        # discovery Executions that would otherwise continue stale exploration.
-        # Informational checkpoints only wake consumers.
-        if not saved.get("idempotent") and urgency == "interrupt":
-            await self._stop_competing_executions(
-                unique_code=self.nodes[caller_id].unique_code or "",
-                exclude_agent_id=caller_id,
-                discovery_only=True,
-            )
-        handoff = False
-        # A discovery interrupt is a verified handoff to the deterministic
-        # validation follow-up.  End this broad lane after the checkpoint is
-        # durable so it cannot continue probing while the follow-up runs.
-        if (
-            not saved.get("idempotent")
-            and urgency == "interrupt"
-            and task_stage == "discovery"
-        ):
-            handoff_result = await self._service().finalize_execution_handoff(
-                self._run_id(),
-                caller_id,
-                self._state_context(caller_id),
-                checkpoint_report_id=saved["report_id"],
-            )
-            handoff = bool(handoff_result.get("handoff"))
-        await self._project()
-        await self._sync_nodes()
-        return {
-            "ok": True,
-            "data": {
-                "agent_id": caller_id,
-                "sequence": saved["sequence"],
-                "status": saved["status"],
-                "terminal": False,
-                "report_id": saved["report_id"],
-                "urgency": saved["urgency"],
-                "idempotent": saved.get("idempotent", False),
-                "handoff": handoff,
-                "handoff_terminal": handoff,
-            },
-            "warnings": saved.get("warnings", []),
-        }
-
-    async def _stop_competing_executions(
-        self,
-        *,
-        unique_code: str,
-        exclude_agent_id: str,
-        discovery_only: bool = True,
-    ) -> None:
-        """Stop stale sibling discovery Executions after a verified handoff."""
-
-        if not unique_code:
-            return
-        overview = await self._service().get_overview(self._run_id())
-        candidates = [
-            item
-            for item in overview.get("agents", [])
-            if item.get("role") == "execution"
-            and item.get("kind") != "bootstrap"
-            and item.get("unique_code") == unique_code
-            and item.get("agent_id") != exclude_agent_id
-            and item.get("status") not in self.TERMINAL_AGENT_STATES
-            and (
-                not discovery_only
-                or (item.get("task_stage") or "discovery") == "discovery"
-            )
-        ]
-        if not candidates:
-            return
-        await asyncio.gather(
-            *(self._stop_agent(item["agent_id"]) for item in candidates)
-        )
-        await self._service().append_agent_event(
-            self._run_id(),
-            exclude_agent_id,
-            "execution_checkpoint_siblings_stopped",
-            {
-                "unique_code": unique_code,
-                "stopped_count": len(candidates),
-                "discovery_only": discovery_only,
-                "stopped_task_stages": sorted(
-                    {item.get("task_stage") or "discovery" for item in candidates}
-                ),
-            },
-        )
 
     async def read_evidence(
         self,
@@ -1885,7 +1008,7 @@ class AgentSupervisor:
         limit_chars: int = 8_000,
     ) -> dict[str, Any]:
         node = self.nodes.get(caller_id)
-        if node is None or node.role not in {"challenge", "execution"}:
+        if node is None or node.role not in {"solver", "worker"}:
             raise SubagentError("Agent role is not authorized for this operation")
         return self._ok(
             await self._service().read_evidence(
@@ -1897,75 +1020,10 @@ class AgentSupervisor:
             )
         )
 
-    async def _prepare_bootstrap_shared_context(
-        self, agent_id: str
-    ) -> Mapping[str, Any] | None:
-        """Return a replayable sibling-report update before a Bootstrap request."""
-
-        return await self._service().prepare_bootstrap_shared_update(
-            self._run_id(),
-            self._state_context(agent_id),
-            max_reports=20,
-            max_chars=8_000,
-        )
-
-    async def _ack_bootstrap_shared_context(
-        self, agent_id: str, update: Mapping[str, Any]
-    ) -> None:
-        through = update.get("through_sequence")
-        if isinstance(through, int):
-            await self._service().acknowledge_bootstrap_shared_update(
-                self._run_id(), self._state_context(agent_id), through
-            )
-
-    async def wait_for_state(
-        self,
-        caller_id: str,
-        reason: str | None,
-    ) -> ToolDispatchOutcome:
-        self._require_role(caller_id, "challenge")
-        result = await self._service().record_controller_wait(
-            self._run_id(), caller_id, reason
-        )
-        await self._sync_nodes()
-        return ToolDispatchOutcome(
-            self._ok(result),
-            yield_session=result.get("status") == "waiting",
-        )
-
-    async def _register_dispatch_admissions(
-        self, unique_code: str, admissions: Any
-    ) -> None:
-        if not isinstance(admissions, list) or not admissions:
-            return
-        self._issue_capabilities(
-            [
-                {
-                    "agent_id": item["agent_id"],
-                    "role": "execution",
-                    "unique_code": unique_code,
-                }
-                for item in admissions
-                if isinstance(item, Mapping)
-                and isinstance(item.get("agent_id"), str)
-            ]
-        )
-        await self._sync_nodes()
-        for item in admissions:
-            if not isinstance(item, Mapping) or not isinstance(
-                item.get("agent_id"), str
-            ):
-                continue
-            task = asyncio.create_task(
-                self._prefetch_execution_skill(str(item["agent_id"])),
-                name=f"skill-discovery-bootstrap-{item['agent_id']}",
-            )
-            self._skill_discovery_bootstrap_tasks.add(task)
-            task.add_done_callback(self._skill_discovery_bootstrap_tasks.discard)
-
     async def resume(self, run_id: str) -> dict[str, Any]:
         await self._ensure_service(run_id)
         self.run_id = run_id
+        self._claim_run_ownership()
         await self._prepare_resume(run_id)
         if self.chief_agent_id:
             await self.refresh_challenges(self.chief_agent_id)
@@ -1976,31 +1034,40 @@ class AgentSupervisor:
             }
         )
 
+    def _claim_run_ownership(self) -> None:
+        if self._run_ownership is None:
+            try:
+                self._run_ownership = RunOwnership(self._service().db.path)
+            except StateConflict:
+                self._ownership_conflict = True
+                raise
+            self._ownership_conflict = False
+
+    def _release_run_ownership(self) -> None:
+        if self._run_ownership is not None:
+            self._run_ownership.close()
+            self._run_ownership = None
+
     async def close(self) -> None:
+        if self._ownership_conflict:
+            await self._close_model_http_client()
+            return
         self._pausing = False
         if self._poll_task is not None:
             self._poll_task.cancel()
             await self._ignore_cancel(self._poll_task)
             self._poll_task = None
-        await self._close_skill_discovery()
+        if self._stagnation_task is not None:
+            self._stagnation_task.cancel()
+            await self._ignore_cancel(self._stagnation_task)
+            self._stagnation_task = None
         completion_tasks = list(self._challenge_completion_tasks.values())
         self._challenge_completion_tasks.clear()
         if completion_tasks:
             await asyncio.gather(*completion_tasks, return_exceptions=True)
         await self._stop_all()
-        managers = (
-            ("_http_interactions", self._http_interactions),
-            ("_network_discovery", self._network_discovery),
-            ("_shell_tasks", self._shell_tasks),
-        )
-        for attribute, manager in managers:
-            if manager is None:
-                continue
-            try:
-                await manager.finish_run()
-            except Exception:
-                LOGGER.exception("resource manager close failed: %s", attribute)
-            setattr(self, attribute, None)
+        await self.release_targets(reason="runtime_closed", permanent=True)
+        await self._finish_run_managers("finish_run")
         for runner in list(self._runners.values()):
             try:
                 await runner.close()
@@ -2009,6 +1076,53 @@ class AgentSupervisor:
         self._runners.clear()
         await self._close_model_http_client()
         await self._project()
+        self._release_run_ownership()
+
+    async def _finish_run_managers(self, operation: str) -> None:
+        from .lifecycle import AGENT_CLEANUP_SECONDS
+
+        tasks = {}
+        for attribute in ("_http_interactions", "_network_discovery", "_shell_tasks"):
+            manager = getattr(self, attribute)
+            if manager is None:
+                continue
+            key = (attribute, operation)
+            task = self._manager_cleanup_tasks.get(key)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    getattr(manager, operation)(), name=f"aion-{attribute}-{operation}"
+                )
+                self._manager_cleanup_tasks[key] = task
+            tasks[attribute] = task
+        if tasks:
+            await asyncio.wait(list(tasks.values()), timeout=AGENT_CLEANUP_SECONDS)
+        failures = []
+        for attribute, task in tasks.items():
+            if not task.done():
+                task.cancel()
+                error, message = (
+                    "TimeoutError",
+                    "Run resource cleanup exceeded its deadline",
+                )
+            elif task.cancelled():
+                error, message = "CancelledError", "Run resource cleanup was cancelled"
+            elif task.exception() is not None:
+                error, message = (
+                    type(task.exception()).__name__,
+                    str(task.exception())[:500],
+                )
+            else:
+                setattr(self, attribute, None)
+                self._manager_cleanup_tasks.pop((attribute, operation), None)
+                continue
+            failures.append({"resource": attribute, "error": error, "message": message})
+        if failures:
+            await self._service().append_agent_event(
+                self._run_id(),
+                self.chief_agent_id,
+                "agent_resource_cleanup_failed",
+                {"failures": failures},
+            )
 
     async def pause(self) -> None:
         """Cancel live work while preserving resumable orchestration state."""
@@ -2018,24 +1132,14 @@ class AgentSupervisor:
             self._poll_task.cancel()
             await self._ignore_cancel(self._poll_task)
             self._poll_task = None
-        await self._close_skill_discovery()
-        if self._shell_tasks is not None:
-            try:
-                await self._shell_tasks.pause_run()
-            finally:
-                self._shell_tasks = None
-        if self._http_interactions is not None:
-            try:
-                await self._http_interactions.pause_run()
-            finally:
-                self._http_interactions = None
-        if self._network_discovery is not None:
-            try:
-                await self._network_discovery.pause_run()
-            finally:
-                self._network_discovery = None
+        if self._stagnation_task is not None:
+            self._stagnation_task.cancel()
+            await self._ignore_cancel(self._stagnation_task)
+            self._stagnation_task = None
         await self._pause_all()
-        await self._service().interrupt_execution_agents(self._run_id())
+        await self.release_targets(reason="runtime_pause")
+        await self._service().interrupt_workers(self._run_id())
+        await self._finish_run_managers("pause_run")
         for runner in list(self._runners.values()):
             try:
                 await runner.close()
@@ -2045,749 +1149,7 @@ class AgentSupervisor:
         await self._close_model_http_client()
         await self._sync_nodes()
         await self._project()
-
-    async def _launch_agent(self, agent_id: str, *, resume: bool = False) -> None:
-        existing = self._tasks.get(agent_id)
-        if existing is not None and not existing.done():
-            return
-        if existing is not None and existing.done():
-            await self._ignore_cancel(existing)
-        runtime = await self._service().get_agent_runtime(self._run_id(), agent_id)
-        agent = runtime["agent"]
-        role: AgentRole = agent["role"]
-        initial_wake_sequence = max(
-            int(agent.get("controller_cursor") or 0),
-            await self._service().notifier.current(
-                self._service().agent_signal_key(self._run_id(), agent_id)
-            ),
-        )
-        if role in {"chief", "challenge"}:
-            await self._service().transition_controller(
-                self._run_id(),
-                agent_id,
-                "running",
-                controller_cursor=initial_wake_sequence,
-            )
-        else:
-            await self._service().transition_agent(
-                self._run_id(), agent_id, "running"
-            )
-            await self._service().mark_execution_branch_running(
-                self._run_id(), agent_id
-            )
-            if agent.get("kind") == "bootstrap":
-                await self._service().append_agent_event(
-                    self._run_id(),
-                    agent_id,
-                    "bootstrap_started",
-                    {
-                        "priority": agent.get("priority", 100),
-                        "lifecycle": "challenge_bound",
-                    },
-                )
-        await self._sync_nodes()
-
-        first_session_started = asyncio.Event()
-
-        async def execute() -> Any:
-            failure_code: str | None = None
-            failure_message: str | None = None
-            session_resume = resume
-            wake_sequence = initial_wake_sequence
-            controller_recovery_attempt = 0
-            controller_recovery_started: float | None = None
-            self._heartbeat_tasks[agent_id] = asyncio.create_task(
-                self._heartbeat_loop(agent_id), name=f"aion-heartbeat-{agent_id}"
-            )
-            try:
-                while True:
-                    if role == "chief" and await self._remaining_run_seconds() <= 0:
-                        result = {"final": "Run deadline reached"}
-                        await self._settle_controller(agent_id, role, result)
-                        return result
-                    if role in {"chief", "challenge"}:
-                        await self._service().transition_controller(
-                            self._run_id(),
-                            agent_id,
-                            "running",
-                            controller_cursor=wake_sequence,
-                        )
-                    else:
-                        await self._service().transition_agent(
-                            self._run_id(), agent_id, "running"
-                        )
-                    await self._sync_nodes()
-                    session = self._run_agent_session(
-                        agent_id,
-                        role,
-                        resume=session_resume,
-                        started_event=(
-                            first_session_started
-                            if not first_session_started.is_set()
-                            else None
-                        ),
-                    )
-                    try:
-                        if role == "chief":
-                            result = await asyncio.wait_for(
-                                session, timeout=await self._remaining_run_seconds()
-                            )
-                        else:
-                            result = await session
-                    except asyncio.TimeoutError:
-                        if role != "chief":
-                            raise
-                        result = {"final": "Run deadline reached"}
-                        await self._settle_controller(agent_id, role, result)
-                        return result
-                    except AgentRunnerError as exc:
-                        if role not in {"chief", "challenge"} or not exc.recoverable:
-                            raise
-                        controller_recovery_attempt += 1
-                        if controller_recovery_started is None:
-                            controller_recovery_started = asyncio.get_running_loop().time()
-                        delay = (1.0, 2.0, 5.0, 10.0)[
-                            min(controller_recovery_attempt - 1, 3)
-                        ]
-                        await self._service().append_agent_event(
-                            self._run_id(),
-                            agent_id,
-                            "controller_session_recovery_scheduled",
-                            {
-                                "role": role,
-                                "code": exc.code,
-                                "recovery_attempt": controller_recovery_attempt,
-                                "recovery_delay_ms": int(delay * 1_000),
-                            },
-                        )
-                        waiting = await self._service().transition_controller(
-                            self._run_id(),
-                            agent_id,
-                            "waiting",
-                            controller_cursor=wake_sequence,
-                        )
-                        await self._sync_nodes()
-                        cursor = max(
-                            wake_sequence,
-                            int(waiting.get("controller_cursor") or 0),
-                            await self._service().notifier.current(
-                                self._service().agent_signal_key(
-                                    self._run_id(), agent_id
-                                )
-                            ),
-                        )
-                        signal = await self._service().notifier.wait(
-                            self._service().agent_signal_key(
-                                self._run_id(), agent_id
-                            ),
-                            cursor,
-                            min(delay, await self._remaining_run_seconds()),
-                        )
-                        wake_sequence = max(cursor, signal)
-                        session_resume = True
-                        continue
-                    if controller_recovery_attempt:
-                        assert controller_recovery_started is not None
-                        await self._service().append_agent_event(
-                            self._run_id(),
-                            agent_id,
-                            "controller_session_recovered",
-                            {
-                                "role": role,
-                                "recovery_attempt": controller_recovery_attempt,
-                                "controller_recovery_latency_ms": int(
-                                    (
-                                        asyncio.get_running_loop().time()
-                                        - controller_recovery_started
-                                    )
-                                    * 1_000
-                                ),
-                            },
-                        )
-                        controller_recovery_attempt = 0
-                        controller_recovery_started = None
-                    if role == "execution":
-                        if (
-                            agent.get("kind") == "bootstrap"
-                            and isinstance(result, AgentSessionResult)
-                            and result.yield_reason == "bootstrap_cycle_yield"
-                        ):
-                            # A cycle boundary is not a terminal report. Keep
-                            # the same logical lane and resume with durable
-                            # memory/context instead of creating a replacement
-                            # Agent or entering missing-report recovery.
-                            session_resume = True
-                            wake_sequence = max(
-                                wake_sequence,
-                                await self._service().notifier.current(
-                                    self._service().agent_signal_key(
-                                        self._run_id(), agent_id
-                                    )
-                                ),
-                            )
-                            continue
-                        if (
-                            agent.get("kind") == "bootstrap"
-                            and isinstance(result, AgentSessionResult)
-                            and not result.structured_report_seen
-                        ):
-                            await self._service().yield_bootstrap_cycle(
-                                self._run_id(),
-                                agent_id,
-                                self._state_context(agent_id),
-                                summary="Bootstrap session ended without a terminal candidate; resume the same lane.",
-                            )
-                            session_resume = True
-                            continue
-                        return result
-                    terminal = await self._settle_controller(agent_id, role, result)
-                    if terminal:
-                        return result
-                    waiting = await self._service().transition_controller(
-                        self._run_id(), agent_id, "waiting"
-                    )
-                    await self._sync_nodes()
-                    cursor = max(
-                        int(waiting.get("controller_cursor") or 0), wake_sequence
-                    )
-                    wait_seconds = self.CONTROLLER_SAFETY_WAKE_SECONDS
-                    if role == "chief":
-                        wait_seconds = min(
-                            wait_seconds, await self._remaining_run_seconds()
-                        )
-                    agent_signal_key = self._service().agent_signal_key(
-                        self._run_id(), agent_id
-                    )
-                    signal = await self._service().notifier.wait(
-                        agent_signal_key, cursor, wait_seconds
-                    )
-                    if await self._settle_controller(agent_id, role, result):
-                        return result
-                    if signal <= cursor:
-                        signal = await self._service().append_agent_event(
-                            self._run_id(),
-                            agent_id,
-                            "controller_safety_wakeup",
-                            {"role": role},
-                        )
-                        await self._service().notifier.notify(
-                            agent_signal_key, signal
-                        )
-                    wake_sequence = signal
-                    session_resume = True
-            except asyncio.TimeoutError as exc:
-                failure_code = "timeout"
-                failure_message = "Execution Agent timed out"
-                raise SubagentError("Agent execution timed out") from exc
-            except asyncio.CancelledError:
-                failure_code = "cancelled"
-                failure_message = "Execution Agent was cancelled before reporting"
-                raise
-            except Exception as exc:
-                failure_code, failure_message = self._execution_failure(exc)
-                current = await self._service().get_agent_runtime(
-                    self._run_id(), agent_id
-                )
-                if (
-                    role != "execution"
-                    and current["agent"]["status"] not in self.TERMINAL_AGENT_STATES
-                ):
-                    await self._service().finish_agent(
-                        self._run_id(), agent_id, status="failed"
-                    )
-                raise
-            finally:
-                heartbeat = self._heartbeat_tasks.pop(agent_id, None)
-                if heartbeat is not None:
-                    heartbeat.cancel()
-                if role == "execution" and not self._pausing:
-                    current = await self._service().get_agent_runtime(
-                        self._run_id(), agent_id
-                    )
-                    if current["agent"].get("terminal_report_id") is None:
-                        await self._record_execution_failure(
-                            agent_id,
-                            failure_code or "missing_structured_report",
-                            failure_message or "Execution Agent ended without a structured report",
-                        )
-                        await self._finalize_missing_report(
-                            agent_id,
-                            failure_code=failure_code or "missing_structured_report",
-                            failure_message=failure_message,
-                        )
-                if role == "execution":
-                    current = await self._service().get_agent_runtime(
-                        self._run_id(), agent_id
-                    )
-                    if (
-                        current["agent"]["status"] in self.TERMINAL_AGENT_STATES
-                        and not self._pausing
-                    ):
-                        await self._finish_agent_resources(agent_id)
-                    if (
-                        current["agent"].get("kind") == "bootstrap"
-                        and current["agent"].get("status")
-                        in self.TERMINAL_AGENT_STATES
-                        and current["agent"].get("unique_code")
-                        and current["agent"].get("parent_id")
-                        and not self._pausing
-                        and failure_code != "cancelled"
-                    ):
-                        try:
-                            await self._ensure_bootstrap_agent(
-                                str(current["agent"]["unique_code"]),
-                                str(current["agent"]["parent_id"]),
-                                reason=(
-                                    "bootstrap_report_cycle"
-                                    if failure_code is None
-                                    else "bootstrap_recovery"
-                                ),
-                            )
-                        except Exception:
-                            LOGGER.warning(
-                                "bootstrap_reactivation_failed run_id=%s agent_id=%s",
-                                self._run_id(),
-                                agent_id,
-                                exc_info=True,
-                            )
-                await self._sync_nodes()
-
-        task = asyncio.create_task(execute(), name=f"aion-{agent_id}")
-        self._tasks[agent_id] = task
-        started_wait = asyncio.create_task(first_session_started.wait())
-        done, _ = await asyncio.wait(
-            {task, started_wait}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if task in done and not first_session_started.is_set():
-            started_wait.cancel()
-            await task
-        if not started_wait.done():
-            started_wait.cancel()
-        await self._ignore_cancel(started_wait)
-
-    async def _run_agent_session(
-        self,
-        agent_id: str,
-        role: AgentRole,
-        *,
-        resume: bool,
-        started_event: asyncio.Event | None = None,
-    ) -> AgentSessionResult | Any:
-        runtime = await self._service().get_agent_runtime(self._run_id(), agent_id)
-        agent = runtime["agent"]
-        prompt = agent["initial_prompt"]
-        if not prompt:
-            raise SubagentError("Agent does not have an initial prompt")
-        bootstrap_mode = role == "execution" and agent.get("kind") == "bootstrap"
-        if role == "execution" and not bootstrap_mode:
-            assignment = await self._service().get_assignment(
-                self._run_id(), agent_id, self._state_context(agent_id)
-            )
-            prompt = self._execution_prompt(assignment)
-            if started_event is not None:
-                started_event.set()
-        elif bootstrap_mode:
-            # Bootstrap has a standalone mission prompt.  It intentionally
-            # does not call execution_get_assignment or expose a controller
-            # management turn before its first technical action.
-            if started_event is not None:
-                started_event.set()
-        elif role == "challenge":
-            snapshot = await self._service().observe_challenge(
-                self._run_id(),
-                str(agent["unique_code"]),
-                self._state_context(agent_id),
-                max_reports=8,
-                replay_pending_snapshot=True,
-            )
-            prompt = (
-                f"{prompt}\n\n# Authoritative controller snapshot\n"
-                f"{json.dumps(snapshot, ensure_ascii=False, default=str)}"
-            )
-        else:
-            snapshot_result = await self.observe_chief(agent_id, max_reports=20)
-            prompt = (
-                f"{prompt}\n\n# Authoritative controller snapshot\n"
-                f"{json.dumps(snapshot_result.get('data', {}), ensure_ascii=False, default=str)}"
-            )
-        previous_runner = self._runners.pop(agent_id, None)
-        if previous_runner is not None:
-            try:
-                await previous_runner.close()
-            except Exception:
-                pass
-        skill_context: SkillSessionContext | None = None
-        if role in {"challenge", "execution"}:
-            try:
-                selection_text = await self._skill_selection_text(role, agent)
-                presented_candidates: list[dict[str, Any]] = []
-                discovery_result = None
-                execution_direction: str | None = None
-                if role == "execution":
-                    execution_direction = str(
-                        agent.get("direction")
-                        or (await self._challenge_record(agent.get("unique_code"))).get(
-                            "direction"
-                        )
-                        or "unknown"
-                    )
-                    selection_text = " ".join(
-                        (
-                            selection_text,
-                            f"direction: {execution_direction}",
-                            f"task_key: {agent.get('task_key') or ''}",
-                            f"branch_key: {agent.get('branch_key') or ''}",
-                        )
-                    )
-                    discovery_result = await self._skill_discovery_service().candidates_for(
-                        agent_id,
-                        objective=str(agent.get("mission") or ""),
-                        direction=execution_direction,
-                        task_stage=(
-                            str(agent["task_stage"])
-                            if agent.get("task_stage") is not None
-                            else None
-                        ),
-                        hypothesis=(
-                            str(agent["hypothesis_key"])
-                            if agent.get("hypothesis_key") is not None
-                            else None
-                        ),
-                        excluded_ids=tuple(
-                            str(item.get("skill_id"))
-                            for item in agent.get("active_skills", [])
-                            if isinstance(item, Mapping) and item.get("skill_id")
-                        ),
-                    )
-                    presented_candidates = [
-                        candidate.public()
-                        for candidate in discovery_result.candidates
-                    ]
-                skill_context = SkillSessionContext(
-                    self.skill_catalog,
-                    role=role,
-                    service=self._service(),
-                    run_id=self._run_id(),
-                    agent_id=agent_id,
-                    active_skills=agent.get("active_skills", []),
-                    selection_text=selection_text,
-                    presented_candidates=presented_candidates,
-                )
-                await skill_context.ensure_auto_activated()
-                if role == "execution":
-                    assert discovery_result is not None
-                    await self._service().append_agent_event(
-                        self._run_id(),
-                        agent_id,
-                        "skill_candidate_presented",
-                        {
-                            **skill_context.listing_metrics,
-                            "candidate_ids": [
-                                item["skill_id"] for item in presented_candidates
-                            ],
-                            "strong_match_ids": [
-                                item["skill_id"]
-                                for item in presented_candidates
-                                if item.get("match_strength") == "strong"
-                            ],
-                            "recommended_ids": [
-                                item["skill_id"]
-                                for item in presented_candidates
-                                if item.get("recommended") is True
-                            ],
-                            "source": discovery_result.source,
-                            "discovery_latency_ms": discovery_result.latency_ms,
-                            "cache_hit": discovery_result.cache_hit,
-                            "discovery_call_id": discovery_result.discovery_call_id,
-                        },
-                    )
-                else:
-                    await self._service().append_agent_event(
-                        self._run_id(),
-                        agent_id,
-                        "skill_top_k_selected",
-                        skill_context.listing_metrics,
-                    )
-            except SkillCatalogError as exc:
-                await self._service().append_agent_event(
-                    self._run_id(),
-                    agent_id,
-                    "skill_context_restore_failed",
-                    {
-                        "code": exc.code,
-                        "details": exc.detail,
-                    },
-                )
-                raise
-        store = await AgentStateStore.open(
-            self._service(),
-            run_id=self._run_id(),
-            agent_id=agent_id,
-            run_dir=self._run_dir(),
-        )
-        result_tools = ToolResultTools(ToolResultStore(store.run_dir, agent_id))
-        if role == "chief":
-            wrappers: list[Any] = [result_tools, ChiefAgentTools(self, agent_id=agent_id)]
-        elif role == "challenge":
-            assert skill_context is not None
-            wrappers = [
-                result_tools,
-                SkillTools(skill_context),
-                ChallengeAgentTools(
-                    self, agent_id=agent_id, unique_code=agent["unique_code"]
-                )
-            ]
-        else:
-            assert skill_context is not None
-            if (
-                self._shell_tasks is None
-                or self._http_interactions is None
-                or self._network_discovery is None
-            ):
-                raise SubagentError("Execution task managers are not initialized")
-            shell_client = self._shell_tasks.bind(
-                agent_id,
-                shared_root=self._shell_tasks.shared_workspace_root(
-                    str(agent["unique_code"])
-                ),
-            )
-            wrappers = [
-                result_tools,
-                SkillTools(skill_context),
-                SystemTools(
-                    root=self.project_root,
-                    shell=shell_client,
-                    agent_work_root=shell_client.agent_work_root,
-                    shared_work_root=shell_client.shared_work_root,
-                ),
-                HttpTools(self._http_interactions.bind(agent_id)),
-                NetworkTools(self._network_discovery.bind(agent_id)),
-                BinaryTools(self.project_root, toolchain_root=self.toolchain_root),
-                ArtifactTools(self.project_root),
-                PentestTools(root=self.project_root, toolchain_root=self.toolchain_root),
-                ExecutionAgentTools(
-                    self,
-                    agent_id=agent_id,
-                    unique_code=agent["unique_code"],
-                    bootstrap_mode=bootstrap_mode,
-                ),
-            ]
-        live_context_provider = None
-        live_context_ack = None
-        if bootstrap_mode:
-            live_context_provider = lambda: self._prepare_bootstrap_shared_context(
-                agent_id
-            )
-            live_context_ack = lambda update: self._ack_bootstrap_shared_context(
-                agent_id, update
-            )
-        runner_options: dict[str, Any] = {}
-        if bootstrap_mode:
-            runner_options = {
-                "live_context_provider": live_context_provider,
-                "live_context_ack": live_context_ack,
-                "bootstrap_mode": True,
-                "session_timeout_seconds": float(
-                    self._effective_execution_timeout(agent)
-                ),
-            }
-        elif role == "execution":
-            runner_options = {
-                "session_timeout_seconds": float(
-                    self._effective_execution_timeout(agent)
-                ),
-            }
-        runner = self.runner_factory(
-            self.settings,
-            ToolRegistry(wrappers, allowed_tools=AgentPolicy(role).allowed_tools),
-            max_rounds=(
-                BOOTSTRAP_MAX_ROUNDS
-                if bootstrap_mode
-                else (200 if role == "execution" else 1_000)
-            ),
-            run_root=self.run_root,
-            role=role,
-            agent_id=agent_id,
-            parent_id=agent["parent_id"],
-            base_system_prompt=self._system_prompt(
-                "bootstrap" if bootstrap_mode else role
-            ),
-            system_context_provider=(
-                skill_context.render_system_context if skill_context is not None else None
-            ),
-                require_structured_report=role == "execution" and not bootstrap_mode,
-            state_service=self._service(),
-            http_client=self._shared_model_http_client(),
-            **runner_options,
-        )
-        self._runners[agent_id] = runner
-        if started_event is not None and not started_event.is_set():
-            started_event.set()
-        await self._service().append_agent_event(
-            self._run_id(), agent_id, "agent_runner_started", {"role": role}
-        )
-        try:
-            operation = runner.run_session(prompt, store=store, resume=resume)
-            timeout = (
-                self._effective_execution_timeout(agent)
-                if role == "execution"
-                else None
-            )
-            try:
-                return (
-                    await asyncio.wait_for(operation, timeout=timeout)
-                    if timeout
-                    else await operation
-                )
-            except asyncio.TimeoutError:
-                if not bootstrap_mode:
-                    raise
-                await self._service().yield_bootstrap_cycle(
-                    self._run_id(),
-                    agent_id,
-                    self._state_context(agent_id),
-                    summary="Bootstrap cycle reached its time budget; resume the same lane with persisted context.",
-                )
-                return AgentSessionResult(
-                    run_id=self._run_id(),
-                    final="",
-                    last_event_sequence=int(store.checkpoint.last_event_sequence),
-                    structured_report_seen=False,
-                    yield_reason="bootstrap_cycle_yield",
-                )
-        finally:
-            self._runners.pop(agent_id, None)
-            try:
-                await runner.close()
-            except Exception:
-                pass
-
-    @classmethod
-    def _effective_execution_timeout(cls, agent: Mapping[str, Any]) -> int:
-        """Apply the competition timeout floor to persisted and new tasks."""
-
-        if agent.get("kind") == "bootstrap":
-            value = agent.get("timeout_seconds")
-            if not isinstance(value, int) or isinstance(value, bool):
-                value = BOOTSTRAP_CYCLE_TIMEOUT_SECONDS
-            return min(BOOTSTRAP_CYCLE_TIMEOUT_SECONDS, max(60, value))
-        stage = str(agent.get("task_stage") or "discovery")
-        floor = cls.EXECUTION_TIMEOUT_FLOORS.get(stage, 1_800)
-        value = agent.get("timeout_seconds")
-        if not isinstance(value, int) or isinstance(value, bool):
-            value = 1_800
-        return min(3_600, max(floor, value))
-
-    async def _skill_selection_text(
-        self, role: AgentRole, agent: Mapping[str, Any]
-    ) -> str:
-        """Build bounded Top-K routing text from current authoritative state."""
-
-        values: list[Any] = [
-            agent.get("mission"),
-            agent.get("task_stage"),
-            agent.get("hypothesis_key"),
-        ]
-        if role != "execution":
-            unique_code = str(agent.get("unique_code") or "")
-            state = await self._service().get_challenge_context(
-                self._run_id(),
-                unique_code,
-                self._state_context(str(agent["agent_id"])),
-                compact=True,
-            )
-            challenge = state.get("challenge")
-            if isinstance(challenge, Mapping):
-                values.extend(
-                    [
-                        challenge.get("description"),
-                        challenge.get("direction"),
-                    ]
-                )
-            values.extend(
-                [
-                    [
-                        {
-                            "category": item.get("category"),
-                            "summary": item.get("summary"),
-                            "verification_status": item.get(
-                                "verification_status"
-                            ),
-                        }
-                        for item in list(state.get("findings") or [])[-10:]
-                        if isinstance(item, Mapping)
-                    ],
-                ]
-            )
-        return " ".join(
-            json.dumps(value, ensure_ascii=False, default=str)
-            if isinstance(value, (Mapping, list))
-            else str(value or "")
-            for value in values
-        )[:8_000]
-
-    async def _prefetch_execution_skill(self, agent_id: str) -> None:
-        try:
-            runtime = await self._service().get_agent_runtime(
-                self._run_id(), agent_id
-            )
-            agent = runtime["agent"]
-            self._skill_discovery_service().prefetch(
-                agent_id,
-                objective=str(agent.get("mission") or ""),
-                direction=str(
-                    agent.get("direction")
-                    or (await self._challenge_record(agent.get("unique_code"))).get("direction")
-                    or "unknown"
-                ),
-                task_stage=(
-                    str(agent["task_stage"])
-                    if agent.get("task_stage") is not None
-                    else None
-                ),
-                hypothesis=(
-                    str(agent["hypothesis_key"])
-                    if agent.get("hypothesis_key") is not None
-                    else None
-                ),
-                excluded_ids=tuple(
-                    str(item.get("skill_id"))
-                    for item in agent.get("active_skills", [])
-                    if isinstance(item, Mapping) and item.get("skill_id")
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            LOGGER.warning(
-                "skill_discovery_prefetch_failed run_id=%s agent_id=%s",
-                self.run_id,
-                agent_id,
-            )
-
-    def _skill_discovery_service(self) -> SkillDiscovery:
-        service = self._skill_discovery
-        if service is None:
-            service = SkillDiscovery(
-                self.settings,
-                self.skill_catalog,
-                self._service(),
-                self._run_id(),
-            )
-            self._skill_discovery = service
-        return service
-
-    async def _close_skill_discovery(self) -> None:
-        bootstrap = list(self._skill_discovery_bootstrap_tasks)
-        for task in bootstrap:
-            task.cancel()
-        if bootstrap:
-            await asyncio.gather(*bootstrap, return_exceptions=True)
-        self._skill_discovery_bootstrap_tasks.clear()
-        service = self._skill_discovery
-        self._skill_discovery = None
-        if service is not None:
-            await service.close()
+        self._release_run_ownership()
 
     def _shared_model_http_client(self) -> httpx.AsyncClient:
         client = self._model_http_client
@@ -2815,11 +1177,15 @@ class AgentSupervisor:
         result: AgentSessionResult | Any,
     ) -> bool:
         overview = await self._service().get_overview(self._run_id())
-        agent = next(item for item in overview["agents"] if item["agent_id"] == agent_id)
+        agent = next(
+            item for item in overview["agents"] if item["agent_id"] == agent_id
+        )
         if agent["status"] in self.TERMINAL_AGENT_STATES:
             return True
+        if overview["run"]["status"] != "active":
+            return True
         report = self._session_report(result)
-        if role == "challenge":
+        if role == "solver":
             challenge = next(
                 item
                 for item in overview["challenges"]
@@ -2827,52 +1193,89 @@ class AgentSupervisor:
             )
             if challenge["is_completed"] or challenge["work_status"] == "closed":
                 await self._service().finish_agent(
-                    self._run_id(), agent_id, status="completed", final_report=report
+                    self._run_id(), agent_id,
+                    status="completed" if challenge["is_completed"] else "stopped",
+                    final_report=report,
                 )
                 return True
-            return False
+            return agent["status"] in {"paused", "stopping"}
 
+        if agent["status"] in {"paused", "stopping"}:
+            return True
         run = overview["run"]
         deadline_reached = aware(self._service().clock()) >= aware(
             datetime.fromisoformat(run["deadline_at"])
         )
-        challenges = overview["challenges"]
-        challenges_terminal = bool(challenges) and all(
-            item["is_completed"] or item["work_status"] == "closed"
+        selected = run["selected_challenge_codes"]
+        challenges = [
+            item for item in overview["challenges"]
+            if selected is None or item["unique_code"] in selected
+        ]
+        scope_present = selected is None or set(selected) == {
+            item["unique_code"] for item in challenges
+        }
+        challenges_terminal = scope_present and bool(challenges) and all(
+            item["is_completed"] or (selected is None and item["work_status"] == "closed")
             for item in challenges
         )
         descendants_terminal = all(
-            item["agent_id"] == agent_id
-            or item["status"] in self.TERMINAL_AGENT_STATES
+            item["agent_id"] == agent_id or item["status"] in self.TERMINAL_AGENT_STATES
             for item in overview["agents"]
         )
-        if not deadline_reached and not (
-            challenges_terminal and descendants_terminal
-        ):
+        if not deadline_reached and not (challenges_terminal and descendants_terminal):
             return False
+        if not deadline_reached:
+            # Terminal state is committed before the task's receipt and cleanup finish.
+            pending = [
+                task for child_id, task in self._tasks.items()
+                if child_id != agent_id and not task.done()
+            ] + list(self._challenge_completion_tasks.values())
+            if pending:
+                await asyncio.gather(*(asyncio.shield(task) for task in pending), return_exceptions=True)
+            overview = await self._service().get_overview(self._run_id())
+            if overview["run"]["status"] != "active":
+                return True
+            if selected is not None and any(
+                not item["is_completed"] for item in overview["challenges"]
+                if item["unique_code"] in selected
+            ):
+                return False
+            if any(
+                item["slot_occupied"] for item in overview["challenges"]
+                if selected is None or item["unique_code"] in selected
+            ) or any(
+                child_id != agent_id and child_id not in self._resources_closed
+                for child_id in self._tasks
+            ):
+                return False
         if deadline_reached:
             await self._stop_descendants(agent_id)
+            await self.release_targets(reason="deadline", permanent=True)
+        report = {
+            **report,
+            "completion_reason": (
+                "deadline" if deadline_reached else
+                "selected_challenges_completed" if selected is not None else
+                "catalog_terminal"
+            ),
+        }
         await self._service().finish_agent(
             self._run_id(), agent_id, status="completed", final_report=report
         )
-        await self._service().finish_run(
-            self._run_id(), "completed", report=report
-        )
+        await self._service().finish_run(self._run_id(), "completed", report=report)
         return True
 
     async def _remaining_run_seconds(self) -> float:
         overview = await self._service().get_overview(self._run_id())
         deadline = aware(datetime.fromisoformat(overview["run"]["deadline_at"]))
-        return max(
-            0.0, (deadline - aware(self._service().clock())).total_seconds()
-        )
+        return max(0.0, (deadline - aware(self._service().clock())).total_seconds())
 
     async def _stop_descendants(self, root_id: str) -> None:
         overview = await self._service().get_overview(self._run_id())
         descendants = [
             item for item in overview["agents"] if item["agent_id"] != root_id
         ]
-        for role in ("execution", "challenge"):
+        for role in ("worker", "solver"):
             await asyncio.gather(
                 *(
                     self._stop_agent(item["agent_id"])
@@ -2899,8 +1302,7 @@ class AgentSupervisor:
         event_every = max(
             1,
             round(
-                self.HEARTBEAT_EVENT_INTERVAL_SECONDS
-                / self.HEARTBEAT_INTERVAL_SECONDS
+                self.HEARTBEAT_EVENT_INTERVAL_SECONDS / self.HEARTBEAT_INTERVAL_SECONDS
             ),
         )
         while True:
@@ -2944,18 +1346,34 @@ class AgentSupervisor:
                 "Read-only synchronization is required before this operation can be retried",
                 error_type="conflict",
             )
-        operation_id = await self._service().mark_operation_started(
-            self._run_id(),
-            tool_name,
-            agent_id=caller_id,
-            unique_code=unique_code,
-            arguments=arguments,
-        )
+        try:
+            operation_id = await self._service().mark_operation_started(
+                self._run_id(),
+                tool_name,
+                agent_id=caller_id,
+                unique_code=unique_code,
+                arguments=arguments,
+            )
+        except StateConflict as exc:
+            return self._error(exc.code, exc.message, error_type="conflict")
         try:
             if self.benchmark is None:
                 raise RuntimeError("benchmark unavailable")
-            result = await self._benchmark_execute(tool_name, arguments)
+            result = await self._benchmark_execute(
+                tool_name, arguments, caller_id=caller_id
+            )
         except Exception:
+            if tool_name == "benchmark_submit_flag":
+                await self._service().mark_operation_indeterminate(
+                    self._run_id(),
+                    operation_id,
+                    result_payload={"error": "benchmark_transport_error"},
+                )
+                return self._error(
+                    "operation_indeterminate",
+                    "Submission outcome is unknown; synchronize before further action",
+                    error_type="conflict",
+                )
             await self._service().fail_operation(
                 self._run_id(),
                 operation_id,
@@ -2968,7 +1386,31 @@ class AgentSupervisor:
                 error_type="internal",
             )
         await self._record_benchmark_events(result)
-        if not result.get("ok") and self._is_ambiguous_benchmark_response(result):
+        transport_uncertain = (
+            tool_name == "benchmark_submit_flag"
+            and not result.get("ok")
+            and (
+                self._error_code(result)
+                in {
+                    "timeout",
+                    "http_error",
+                    "transport_error",
+                    "invalid_tool_result",
+                    "network_error",
+                    "benchmark_error",
+                    "execution_error",
+                }
+                or (
+                    isinstance(result.get("error"), Mapping)
+                    and isinstance(result["error"].get("details"), Mapping)
+                    and isinstance(result["error"]["details"].get("status_code"), int)
+                    and result["error"]["details"]["status_code"] >= 500
+                )
+            )
+        )
+        if not result.get("ok") and (
+            self._is_ambiguous_benchmark_response(result) or transport_uncertain
+        ):
             if tool_name == "benchmark_get_hint":
                 # A successful Hint request may already have consumed score even
                 # when its response cannot be decoded. Never request it again.
@@ -2979,7 +1421,6 @@ class AgentSupervisor:
                     result_payload=result,
                     challenge_updates={
                         "hint_requested": True,
-                        "hint_eligible": False,
                     },
                 )
                 return self._error(
@@ -3026,16 +1467,12 @@ class AgentSupervisor:
                 self._run_id(),
                 operation_id,
                 error_code=code,
-                error_message=str(
-                    redact_value(message, secrets=operation_secrets)
-                ),
+                error_message=str(redact_value(message, secrets=operation_secrets)),
                 result_payload=redact_value(result, secrets=operation_secrets),
             )
             return result
         operation_secrets = (
-            (str(arguments["flag"]),)
-            if isinstance(arguments.get("flag"), str)
-            else ()
+            (str(arguments["flag"]),) if isinstance(arguments.get("flag"), str) else ()
         )
         await self._service().complete_operation(
             self._run_id(),
@@ -3070,19 +1507,13 @@ class AgentSupervisor:
             return False
         details = error.get("details")
         status_code = (
-            details.get("status_code")
-            if isinstance(details, Mapping)
-            else None
+            details.get("status_code") if isinstance(details, Mapping) else None
         )
         return status_code in {404, 405, 501}
 
     async def _mark_benchmark_capability_unavailable(self, tool_name: str) -> None:
         operation = tool_name.removeprefix("benchmark_")
         self._benchmark_unavailable.add(operation)
-        if operation == "get_hint":
-            await self._service().disable_hint_eligibility(
-                self._run_id(), reason="benchmark_endpoint_unavailable"
-            )
 
     def benchmark_capability_available(self, operation: str) -> bool:
         return operation not in self._benchmark_unavailable
@@ -3099,8 +1530,9 @@ class AgentSupervisor:
             synced = await self._sync_challenge_catalog()
             if synced.get("ok"):
                 after = await self._challenge_record(unique_code)
-                if tool_name == "benchmark_start_challenge" and container_slot_occupied(
-                    after.get("container_status")
+                if (
+                    tool_name == "benchmark_start_challenge"
+                    and container_slot_occupied(after.get("container_status"))
                 ):
                     return self._ok(
                         {
@@ -3109,8 +1541,9 @@ class AgentSupervisor:
                             "reconciled": True,
                         }
                     )
-                if tool_name == "benchmark_close_challenge" and not container_slot_occupied(
-                    after.get("container_status")
+                if (
+                    tool_name == "benchmark_close_challenge"
+                    and not container_slot_occupied(after.get("container_status"))
                 ):
                     return self._ok(
                         {
@@ -3128,10 +1561,8 @@ class AgentSupervisor:
                     ):
                         return self._ok(
                             {
-                                "accepted": True,
-                                "correct": True,
-                                "awarded": 0,
-                                "cumulative_score": 0,
+                                "correct": None,
+                                "awarded": None,
                                 "correct_flag_count": after_count,
                                 "total_flag_count": int(after.get("flag_count") or 0),
                                 "challenge_completed": bool(after.get("is_completed")),
@@ -3192,16 +1623,16 @@ class AgentSupervisor:
                 "container_addr": list(data.get("container_addr") or []),
             }
         if tool_name == "benchmark_get_hint":
-            return {"hint_requested": True, "hint_eligible": False}
+            return {"hint_requested": True}
         if tool_name == "benchmark_close_challenge":
             current = await self._challenge_record(unique_code)
             return {
                 "platform_status": "close_requested",
                 "container_status": "release_pending",
                 "work_status": (
-                    "completed" if current["is_completed"] else "closed"
-                    if current["work_status"] != "paused"
-                    else "paused"
+                    "completed"
+                    if current["is_completed"]
+                    else "closed" if current["work_status"] != "paused" else "paused"
                 ),
             }
         if tool_name == "benchmark_submit_flag":
@@ -3218,25 +1649,21 @@ class AgentSupervisor:
                 correct_count = int(correct_value)
             except (TypeError, ValueError):
                 correct_count = int(current["correct_flag_count"] or 0)
-            completed = total_count > 0 and correct_count >= total_count
             updates: dict[str, Any] = {
                 "flag_count": total_count,
                 "correct_flag_count": correct_count,
-                "is_completed": completed,
             }
-            if completed:
-                updates.update(
-                    {
-                        "platform_status": "completed",
-                        "work_status": "completed",
-                    }
-                )
-            if bool(data.get("correct")) and correct_count > current["correct_flag_count"]:
+            if (
+                bool(data.get("correct"))
+                and correct_count > current["correct_flag_count"]
+            ):
                 updates["progress_kind"] = "flag_accepted"
             return updates
         return {}
 
-    async def _benchmark_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _benchmark_call(
+        self, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
         if self.benchmark is None:
             return self._error(
                 "benchmark_unavailable",
@@ -3260,41 +1687,35 @@ class AgentSupervisor:
         )
 
     async def _benchmark_execute(
-        self, name: str, arguments: Mapping[str, Any]
+        self, name: str, arguments: Mapping[str, Any], *, caller_id: str | None = None
     ) -> dict[str, Any]:
         if self.benchmark is None:
             raise RuntimeError("benchmark unavailable")
-        calls = await ToolExecutor(ToolRegistry([self.benchmark])).execute(
-            [
-                {
-                    "id": f"internal-{name}",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False),
-                    },
-                }
-            ]
-        )
+
+        async def record_model_call(event_type, payload):
+            await self._service().append_agent_event(
+                self._run_id(), caller_id or self.chief_agent_id, event_type, payload
+            )
+
+        token = current_model_event_writer.set(record_model_call)
+        try:
+            calls = await ToolExecutor(ToolRegistry([self.benchmark])).execute(
+                [
+                    {
+                        "id": f"internal-{name}",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        },
+                    }
+                ]
+            )
+        finally:
+            current_model_event_writer.reset(token)
         result = calls[0].result
         if not isinstance(result, Mapping):
             raise RuntimeError("invalid benchmark response")
         return dict(result)
-
-    async def _prepare_resume(self, run_id: str) -> None:
-        service = self._service()
-        if not await service.run_exists(run_id):
-            raise SubagentError("run state database was not found")
-        await service.restore_run(run_id)
-        overview = await service.get_overview(run_id)
-        await service.resume_run(run_id)
-        overview = await service.get_overview(run_id)
-        chief = next((item for item in overview["agents"] if item["role"] == "chief"), None)
-        self.chief_agent_id = chief["agent_id"] if chief else None
-        self._issue_capabilities(overview["agents"])
-        # Bootstrap is resumable from its persisted conversation.  Other
-        # Executions retain the existing no-replay recovery semantics.
-        await service.interrupt_execution_agents(run_id, exclude_kinds=("bootstrap",))
-        await self._sync_nodes()
 
     async def _restart_challenge_agents(self) -> None:
         overview = await self._service().get_overview(self._run_id())
@@ -3303,7 +1724,7 @@ class AgentSupervisor:
             for challenge in overview.get("challenges", [])
         }
         for agent in overview["agents"]:
-            if agent["role"] != "challenge":
+            if agent["role"] != "solver":
                 continue
 
             unique_code = agent.get("unique_code")
@@ -3318,11 +1739,17 @@ class AgentSupervisor:
                 )
                 continue
 
-            # A service pause stops the Challenge Agent process, but must not
+            # A service pause stops the Solver model session, but must not
             # turn an unfinished challenge into a terminal controller. Resume
             # every unfinished challenge, including one whose persisted agent
             # status is stopped, while completed/closed challenges stay done.
-            if challenge.get("is_completed") or challenge.get("work_status") in {"closed", "paused"}:
+            if challenge.get("is_completed") or challenge.get("work_status") == "closed":
+                await self._settle_controller(
+                    agent["agent_id"], "solver", {"reason": "challenge_ended_before_resume"}
+                )
+                await self._finish_agent_resources(agent["agent_id"])
+                continue
+            if challenge.get("work_status") == "paused":
                 continue
 
             previous_status = agent.get("status")
@@ -3367,11 +1794,6 @@ class AgentSupervisor:
                 unique_code,
                 previous_status,
             )
-            await self._ensure_bootstrap_agent(
-                str(unique_code),
-                str(agent["agent_id"]),
-                reason="resume_active_challenge",
-            )
 
     def _start_poller(self, chief_id: str) -> None:
         if self.catalog_reconcile_interval_seconds <= 0 or self._poll_task is not None:
@@ -3393,202 +1815,102 @@ class AgentSupervisor:
 
         self._poll_task = asyncio.create_task(poll(), name="aion-chief-poller")
 
-    async def _finalize_missing_report(
-        self,
-        agent_id: str,
-        *,
-        failure_code: str = "missing_structured_report",
-        failure_message: str | None = None,
-    ) -> None:
-        cancelled = failure_code == "cancelled"
-        evidence_refs: list[str] = []
-        try:
-            evidence_refs = [
-                str(item["evidence_ref"])
-                for item in await self._service().list_evidence_metadata(
-                    self._run_id(), self._state_context(agent_id), limit=20
-                )
-                if isinstance(item, Mapping) and item.get("evidence_ref")
-            ][:20]
-        except Exception:
-            # A missing evidence snapshot must not mask the original Agent
-            # failure or prevent the terminal state from being persisted.
-            evidence_refs = []
-        payload = AgentReportInput(
-            status="cancelled" if cancelled else "failed",
-            summary=(
-                failure_message
-                or "Execution Agent ended without a structured report"
-            )[:4_000],
-            findings=[],
-            evidence_refs=evidence_refs,
-            next_steps=[],
-            hypothesis_outcome="inconclusive",
-        )
-        await self._service().finalize_execution_agent(
-            self._run_id(),
-            agent_id,
-            self._state_context(agent_id),
-            payload,
-        )
+    def _start_stagnation_monitor(self) -> None:
+        if self._stagnation_task is not None:
+            return
+        policy = self.settings.stagnation_policy
 
-    async def _record_execution_failure(
-        self,
-        agent_id: str,
-        failure_code: str,
-        failure_message: str,
-    ) -> None:
-        try:
-            await self._service().append_agent_event(
-                self._run_id(),
-                agent_id,
-                "agent_execution_failed",
-                {
-                    "code": failure_code,
-                    "message": failure_message[:1_000],
-                },
-            )
-        except Exception:
-            pass
+        async def monitor() -> None:
+            while True:
+                await asyncio.sleep(policy.poll_interval_seconds)
+                try:
+                    actions = await self._service().scan_stagnation(
+                        self._run_id(), policy
+                    )
+                    for action in actions:
+                        code = action["unique_code"]
+                        if action["kind"] == "strategy_reset":
+                            runner = self._runners.get(action["solver_id"])
+                            if runner is not None:
+                                runner.request_strategy_reset()
+                            continue
+                        if action["kind"] == "alternate_worker":
+                            worker = await self._service().create_stagnation_worker(
+                                self._run_id(),
+                                unique_code=code,
+                                solver_id=action["solver_id"],
+                                timeout_seconds=policy.worker_timeout_seconds,
+                            )
+                            if worker is None:
+                                continue
+                            await self._sync_nodes()
+                            self._issue_capabilities()
+                            try:
+                                await self._launch_agent(worker["agent_id"])
+                            except Exception as exc:
+                                await self._service().finalize_worker(
+                                    self._run_id(),
+                                    worker["agent_id"],
+                                    self._state_context(worker["agent_id"]),
+                                    AgentReportInput(
+                                        status="failed",
+                                        summary=f"automatic worker launch failed: {type(exc).__name__}",
+                                    ),
+                                    allow_inactive=True,
+                                )
+                            continue
+                        if action["kind"] == "rotate":
+                            current = await self._challenge_record(code)
+                            if (
+                                current["version"] != action["challenge_version"]
+                                or current["stagnation_stage"] != "rotation_due"
+                            ):
+                                continue
+                            result = await self.pause_challenges(
+                                self.chief_agent_id,
+                                [code],
+                                reason="stagnation_timeout",
+                                release_container=True,
+                            )
+                            await self._service().append_agent_event(
+                                self._run_id(),
+                                self.chief_agent_id,
+                                "stagnation_rotation_completed",
+                                {
+                                    "unique_code": code,
+                                    "result": result,
+                                    "strategy_revision": action["strategy_revision"],
+                                },
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    LOGGER.warning(
+                        "stagnation_monitor_failed run_id=%s error_type=%s",
+                        self._run_id(),
+                        type(exc).__name__,
+                    )
 
-    def _execution_failure(self, exc: Exception) -> tuple[str, str]:
-        if isinstance(exc, AgentRunnerError):
-            message = str(exc)
-            if exc.code != "agent_runner_failed":
-                return exc.code, message
-            if "without a structured report" in message:
-                return "missing_structured_report", message
-            if "LLM request failed" in message:
-                return "llm_request_failed", message
-            if "LLM response" in message:
-                return "invalid_llm_response", message
-            return "agent_runner_failed", message
-        try:
-            safe_detail = str(
-                redact_value(
-                    str(exc),
-                    secrets=(
-                        self.settings.llm_api_key.get_secret_value(),
-                        *self._service().ephemeral_secrets(),
-                    ),
-                )
-            )
-        except Exception:
-            safe_detail = ""
-        safe_detail = safe_detail.strip()[:800]
-        detail = f"{type(exc).__name__}: {safe_detail}" if safe_detail else type(exc).__name__
-        return "agent_execution_failed", f"Execution Agent failed before reporting ({detail})"
-
-    async def _stop_children(self, parent_id: str) -> None:
-        overview = await self._service().get_overview(self._run_id())
-        await asyncio.gather(
-            *(
-                self._stop_agent(item["agent_id"])
-                for item in overview["agents"]
-                if item["parent_id"] == parent_id
-                and item["status"] not in self.TERMINAL_AGENT_STATES
-            ),
+        self._stagnation_task = asyncio.create_task(
+            monitor(), name="aion-stagnation-monitor"
         )
 
     async def _stop_all(self) -> None:
         overview = await self._service().get_overview(self._run_id())
         await asyncio.gather(
-            *(
-                self._stop_agent(item["agent_id"])
-                for item in overview["agents"]
-                if item["status"] not in self.TERMINAL_AGENT_STATES
-            ),
+            *(self._stop_agent(item["agent_id"]) for item in overview["agents"]),
         )
 
     async def _pause_all(self) -> None:
-        tasks = list(self._tasks.values())
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for heartbeat in list(self._heartbeat_tasks.values()):
-            heartbeat.cancel()
-        if self._heartbeat_tasks:
-            await asyncio.gather(
-                *self._heartbeat_tasks.values(), return_exceptions=True
+        overview = await self._service().get_overview(self._run_id())
+        await asyncio.gather(
+            *(
+                self._stop_agent(
+                    a["agent_id"], reason="runtime paused", pause=a["role"] != "worker"
+                )
+                for a in overview["agents"]
             )
-        self._heartbeat_tasks.clear()
-
-    async def _stop_agent(self, agent_id: str) -> None:
-        if self.run_id is None:
-            return
-        try:
-            runtime = await self._service().get_agent_runtime(self._run_id(), agent_id)
-        except StateError:
-            return
-        if runtime["agent"]["status"] not in self.TERMINAL_AGENT_STATES:
-            await self._service().transition_agent(self._run_id(), agent_id, "stopping")
-        task = self._tasks.get(agent_id)
-        if task is not None and not task.done():
-            # There is no cooperative stop channel in the model API, so cancel
-            # after persisting intent. Ten seconds remains the outer lifecycle cap.
-            await asyncio.sleep(0)
-            task.cancel()
-            await self._ignore_cancel(task)
-        heartbeat = self._heartbeat_tasks.pop(agent_id, None)
-        if heartbeat is not None:
-            heartbeat.cancel()
-            await self._ignore_cancel(heartbeat)
-        current = await self._service().get_agent_runtime(self._run_id(), agent_id)
-        if current["agent"]["status"] not in self.TERMINAL_AGENT_STATES:
-            if current["agent"]["role"] == "execution":
-                await self._service().finalize_execution_agent(
-                    self._run_id(),
-                    agent_id,
-                    CapabilityContext(
-                        run_id=self._run_id(),
-                        agent_id=agent_id,
-                        role="execution",
-                        unique_code=current["agent"]["unique_code"],
-                    ),
-                    AgentReportInput(
-                        status="cancelled",
-                        summary="Execution Agent was stopped by its owner",
-                        hypothesis_outcome="inconclusive",
-                    ),
-                    terminal_status="stopped",
-                    allow_inactive=True,
-                )
-            else:
-                await self._service().finish_agent(
-                    self._run_id(), agent_id, status="stopped"
-                )
-        await self._finish_agent_resources(agent_id)
-        await self._sync_nodes()
-
-    async def _finish_agent_resources(self, agent_id: str) -> None:
-        """Best-effort idempotent cleanup for every Execution-owned manager."""
-
-        operations: list[tuple[str, Any]] = []
-        if self._http_interactions is not None:
-            operations.append(("http", self._http_interactions.finish_agent(agent_id)))
-        if self._network_discovery is not None:
-            operations.append(("network", self._network_discovery.finish_agent(agent_id)))
-        if self._shell_tasks is not None:
-            operations.append(("shell", self._shell_tasks.finish_agent(agent_id)))
-        if not operations:
-            return
-        results = await asyncio.gather(
-            *(operation for _, operation in operations), return_exceptions=True
         )
-        failures = [
-            {"manager": name, "error_type": type(result).__name__}
-            for (name, _), result in zip(operations, results, strict=True)
-            if isinstance(result, BaseException)
-        ]
-        if failures:
-            await self._service().append_agent_event(
-                self._run_id(),
-                agent_id,
-                "agent_resource_cleanup_failed",
-                {"failures": failures},
-            )
 
     async def launch_http_work(
         self, interaction_id: str, phase: str, *, work_id: str
@@ -3625,31 +1947,25 @@ class AgentSupervisor:
         if self.run_id is None:
             return
         overview = await self._service().get_overview(self._run_id())
-        nodes: dict[str, AgentNode] = {}
-        status_map = {
-            "queued": "pending",
-            "starting": "pending",
-            "working": "running",
-            "blocked": "running",
-            "stopping": "running",
-            "cancelled": "stopped",
-        }
-        for item in overview["agents"]:
-            status = status_map.get(item["status"], item["status"])
-            nodes[item["agent_id"]] = AgentNode(
-                agent_id=item["agent_id"],
-                role=item["role"],
-                parent_id=item["parent_id"],
-                unique_code=item["unique_code"],
-                status=status,
-                sidecar_path=str(self._run_dir() / "agents" / item["agent_id"]),
-                task_id=item["agent_id"] if item["agent_id"] in self._tasks else None,
-                mission=item["mission"],
-                timeout_seconds=item["timeout_seconds"],
-                report_count=1 if item["last_report_sequence"] else 0,
-                last_report_sequence=item["last_report_sequence"],
+        self.nodes = {
+            a["agent_id"]: AgentNode(
+                agent_id=a["agent_id"],
+                role=a["role"],
+                mode=a["mode"],
+                parent_id=a["parent_id"],
+                unique_code=a["unique_code"],
+                status=a["status"],
+                sidecar_path=str(self._run_dir() / "agents" / a["agent_id"]),
+                mission=a["mission"],
+                timeout_seconds=a["timeout_seconds"],
+                last_report_sequence=a["last_report_sequence"],
+                last_heartbeat_at=a.get("last_heartbeat_at"),
+                last_model_activity_at=a.get("last_model_activity_at"),
+                last_tool_activity_at=a.get("last_tool_activity_at"),
+                waiting_sources=a.get("waiting_sources", []),
             )
-        self.nodes = nodes
+            for a in overview["agents"]
+        }
 
     def _issue_capabilities(self, agents: list[dict[str, Any]] | None = None) -> None:
         values = agents
@@ -3682,12 +1998,6 @@ class AgentSupervisor:
             raise SubagentError("Agent role is not authorized for this operation")
         return node
 
-    async def _agent_record(self, agent_id: str, role: AgentRole) -> dict[str, Any]:
-        runtime = await self._service().get_agent_runtime(self._run_id(), agent_id)
-        if runtime["agent"]["role"] != role:
-            raise SubagentError("Agent role is not authorized for this operation")
-        return runtime["agent"]
-
     async def _find_agent(
         self, role: AgentRole, *, unique_code: str | None = None
     ) -> dict[str, Any] | None:
@@ -3706,7 +2016,9 @@ class AgentSupervisor:
         if not unique_code:
             raise SubagentError("Agent is not bound to a challenge")
         values = await self._service().list_challenges(self._run_id())
-        challenge = next((item for item in values if item["unique_code"] == unique_code), None)
+        challenge = next(
+            (item for item in values if item["unique_code"] == unique_code), None
+        )
         if challenge is None:
             raise SubagentError("Challenge was not found")
         return challenge
@@ -3722,19 +2034,6 @@ class AgentSupervisor:
         except Exception:
             # Projection is retryable and never rolls back domain state.
             pass
-
-    @staticmethod
-    def _flatten_report(item: Mapping[str, Any], fallback_type: str) -> dict[str, Any]:
-        payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
-        return {
-            "type": payload.get("type", fallback_type),
-            **dict(payload),
-            "report_id": item.get("report_id"),
-            "report_ref": item.get("report_ref"),
-            "agent_id": item.get("agent_id"),
-            "unique_code": item.get("unique_code"),
-            "sequence": item.get("sequence"),
-        }
 
     @staticmethod
     def _compact_challenge_for_chief(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -3754,118 +2053,6 @@ class AgentSupervisor:
             "direction": item.get("direction"),
         }
 
-    async def _ensure_bootstrap_agent(
-        self,
-        unique_code: str,
-        parent_id: str,
-        *,
-        reason: str,
-        bootstrap_count: int | None = None,
-        route_scope: str | None = None,
-    ) -> dict[str, Any]:
-        """Ensure the durable Bootstrap capacity without shrinking existing lanes."""
-
-        if bootstrap_count is not None and not 1 <= bootstrap_count <= MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE:
-            raise ValueError(
-                f"bootstrap_count must be between 1 and {MAX_BOOTSTRAP_AGENTS_PER_CHALLENGE}"
-            )
-
-        if not bool(getattr(self.settings, "bootstrap_enabled", True)):
-            return {"enabled": False, "agent_id": None, "status": None}
-        challenge = await self._challenge_record(unique_code)
-        result = await self._service().ensure_bootstrap_for_challenge(
-            self._run_id(),
-            unique_code,
-            parent_id=parent_id,
-            bootstrap_prompt=self._bootstrap_prompt(
-                challenge,
-                {
-                    "data": {
-                        "container_addr": challenge.get("container_addr") or [],
-                    }
-                },
-                restart_reason=reason,
-                route_scope=route_scope,
-            ),
-            bootstrap_priority=100,
-            bootstrap_count=bootstrap_count,
-        )
-        bootstrap_entries = result.get("bootstraps")
-        if not isinstance(bootstrap_entries, list):
-            bootstrap_entries = [result]
-        await self._sync_nodes()
-        for bootstrap in bootstrap_entries:
-            if not isinstance(bootstrap, Mapping):
-                continue
-            bootstrap_id = bootstrap.get("agent_id")
-            if not isinstance(bootstrap_id, str) or not bootstrap_id:
-                continue
-            self._state_capabilities[bootstrap_id] = self.capability_registry.issue(
-                self._run_id(), bootstrap_id, "execution", unique_code
-            ).context
-            existing_task = self._tasks.get(bootstrap_id)
-            # Newly created Bootstraps are already queued in the authoritative
-            # Admission table. Let Runtime's admission loop reserve resources
-            # and start them; launching here would race that loop.
-            should_resume = bootstrap.get("status") not in {
-                "queued",
-                "pending",
-                "starting",
-            }
-            if should_resume and (existing_task is None or existing_task.done()):
-                await self._launch_agent(bootstrap_id, resume=True)
-                await self._service().append_agent_event(
-                    self._run_id(),
-                    bootstrap_id,
-                    "bootstrap_activated",
-                    {
-                        "reason": reason,
-                        "idempotent": bool(bootstrap.get("idempotent")),
-                    },
-                )
-        return result
-
-    async def scale_bootstraps(self) -> list[dict[str, Any]]:
-        """Add at most one Bootstrap lane per productive 15-minute window."""
-
-        if self.run_id is None:
-            return []
-        async with self._bootstrap_scale_lock:
-            overview = await self._service().get_overview(self._run_id())
-            results: list[dict[str, Any]] = []
-            for challenge_agent in overview.get("agents", []):
-                if challenge_agent.get("role") != "challenge":
-                    continue
-                unique_code = challenge_agent.get("unique_code")
-                parent_id = challenge_agent.get("agent_id")
-                if not isinstance(unique_code, str) or not isinstance(parent_id, str):
-                    continue
-                decision = await self._service().maybe_scale_bootstrap_capacity(
-                    self._run_id(), unique_code, parent_id=parent_id
-                )
-                target_count = decision.get("target_count")
-                if (
-                    not decision.get("should_ensure")
-                    or not isinstance(target_count, int)
-                    or target_count < 1
-                ):
-                    continue
-                ensured = await self._ensure_bootstrap_agent(
-                    unique_code,
-                    parent_id,
-                    reason=str(decision.get("reason") or "bootstrap_capacity_sync"),
-                    bootstrap_count=target_count,
-                )
-                results.append(
-                    {
-                        "unique_code": unique_code,
-                        "reason": decision.get("reason"),
-                        "target_count": target_count,
-                        "bootstraps": ensured.get("bootstraps") or [],
-                    }
-                )
-            return results
-
     @staticmethod
     async def _ignore_cancel(task: asyncio.Task[Any]) -> None:
         try:
@@ -3873,117 +2060,32 @@ class AgentSupervisor:
         except (asyncio.CancelledError, Exception):
             pass
 
-    def _challenge_prompt(
+    def _solver_prompt(
         self,
         challenge: Mapping[str, Any],
         start_result: Mapping[str, Any],
         *,
         hints: Any = (),
-    ) -> str:
-        start_data = start_result.get("data") if isinstance(start_result.get("data"), Mapping) else {}
-        data = {
-            "unique_code": challenge.get("unique_code"),
-            "name": challenge.get("name"),
-            "description": str(challenge.get("description") or "")[:4_000],
-            "difficulty": challenge.get("difficulty"),
-            "level": challenge.get("level"),
-            "container_addr": start_data.get("container_addr") or challenge.get("container_addr") or [],
-            "hints": list(hints or [])[:4],
-        }
-        return render_prompt(
-            "challenge_agent.txt",
-            challenge_data=json.dumps(data, ensure_ascii=False),
-        )
-
-    @staticmethod
-    def _initial_execution_task(challenge: Mapping[str, Any]) -> ExecutionTaskInput:
-        direction = str(challenge.get("direction") or "unknown")
-        objective = (
-            "Perform one bounded independent reconnaissance pass for this Challenge. "
-            f"Focus on the {direction} surface when known; identify one verified, "
-            "high-value fact that can shorten the path to the final result. "
-            "Start with a discriminating technical action, avoid repeating the "
-            "Bootstrap's full route, and submit an execution_checkpoint immediately "
-            "when a credential, vulnerability, access primitive, or concrete result "
-            "path is verified. Finish with a concise execution_report."
-        )
-        return ExecutionTaskInput(
-            objective=objective,
-            task_key="initial-recon",
-            hypothesis_key="initial-surface-recon",
-            branch_key="initial-recon:discovery",
-            kind="recon",
-            task_stage="discovery",
-            priority=90,
-            success_criteria=[
-                "Produce one verified high-value fact or a concrete negative result.",
-                "Use Evidence references for any checkpoint or final finding.",
-                "Do not repeat the Bootstrap route or perform unbounded reconnaissance.",
-            ],
-            timeout_seconds=900,
-        )
-
-    @staticmethod
-    def _execution_prompt(assignment: Mapping[str, Any]) -> str:
-        return render_prompt(
-            "execution_agent.txt",
-            assignment=json.dumps(
-                assignment,
-                ensure_ascii=False,
-                default=str,
-            )[:16_000],
-        )
-
-    def _bootstrap_prompt(
-        self,
-        challenge: Mapping[str, Any],
-        start_result: Mapping[str, Any],
-        *,
-        hints: Any = (),
-        restart_reason: str | None = None,
-        route_scope: str | None = None,
     ) -> str:
         start_data = (
             start_result.get("data")
             if isinstance(start_result.get("data"), Mapping)
             else {}
         )
-        try:
-            flag_count = int(challenge.get("flag_count") or 0)
-        except (TypeError, ValueError):
-            flag_count = 0
-        try:
-            correct_flag_count = int(challenge.get("correct_flag_count") or 0)
-        except (TypeError, ValueError):
-            correct_flag_count = 0
         data = {
-            "run_id": self._run_id(),
             "unique_code": challenge.get("unique_code"),
             "name": challenge.get("name"),
             "description": str(challenge.get("description") or "")[:4_000],
             "difficulty": challenge.get("difficulty"),
             "level": challenge.get("level"),
-            "target": start_data.get("container_addr")
+            "container_addr": start_data.get("container_addr")
             or challenge.get("container_addr")
             or [],
-            "flag_count": flag_count,
-            "correct_flag_count": correct_flag_count,
-            "remaining_flags": max(0, flag_count - correct_flag_count),
-            "direction": challenge.get("direction", "unknown"),
-            "evidence_root": challenge.get("evidence_root"),
             "hints": list(hints or [])[:4],
-            "restart_reason": restart_reason,
-            "route_scope": route_scope,
-            "bootstrap_contract": {
-                "mission": BOOTSTRAP_MISSION,
-                "success_criteria": list(BOOTSTRAP_SUCCESS_CRITERIA),
-                "cycle_timeout_seconds": BOOTSTRAP_CYCLE_TIMEOUT_SECONDS,
-                "report_only_grace_seconds": BOOTSTRAP_REPORT_ONLY_GRACE_SECONDS,
-            },
         }
         return render_prompt(
-            "bootstrap_agent.txt",
-            challenge_data=json.dumps(data, ensure_ascii=False, default=str),
+            "solver_agent.txt",
+            challenge_data=json.dumps(data, ensure_ascii=False),
         )
 
     @staticmethod
@@ -4002,13 +2104,19 @@ class AgentSupervisor:
         stage = (
             "permission"
             if error_type == "permission"
-            else "conflict"
-            if error_type == "conflict" or status_code == 409
-            else "internal"
-            if error_type == "internal"
-            else "execution"
-            if error_type in {"transport", "api"}
-            else "semantic"
+            else (
+                "conflict"
+                if error_type == "conflict" or status_code == 409
+                else (
+                    "internal"
+                    if error_type == "internal"
+                    else (
+                        "execution"
+                        if error_type in {"transport", "api"}
+                        else "semantic"
+                    )
+                )
+            )
         )
         return tool_error(
             stage,
@@ -4042,17 +2150,17 @@ class AgentSupervisor:
             "transport_error",
             "benchmark_error",
             "catalog_sync_failed",
+            "invalid_state",
         }
         for result in (close_result, sync_result):
             code = cls._error_code(result)
             error = result.get("error") if isinstance(result, Mapping) else None
             details = error.get("details") if isinstance(error, Mapping) else None
             status_code = (
-                details.get("status_code")
-                if isinstance(details, Mapping)
-                else None
+                details.get("status_code") if isinstance(details, Mapping) else None
             )
             if code in transient_codes or status_code in {
+                409,
                 408,
                 429,
                 500,

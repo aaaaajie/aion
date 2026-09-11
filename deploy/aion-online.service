@@ -26,6 +26,7 @@ ExecStart=/opt/aion/current-venv/bin/python /opt/aion/current/scripts/online_run
 Restart=no
 KillSignal=SIGTERM
 KillMode=control-group
+Delegate=cpu memory pids
 TimeoutStopSec=45s
 SuccessExitStatus=130 143
 UMask=0077

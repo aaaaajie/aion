@@ -15,7 +15,7 @@ from agent.state.service import StateService
 from agent.prompts import system_prompt
 from agent.subagents.supervisor import AgentSupervisor
 from agent.subagents.policy import AgentPolicy
-from agent.subagents.tools import ChallengeAgentTools, ChiefAgentTools, ExecutionAgentTools
+from agent.subagents.tools import AgentControlTools
 from agent.tooling import ToolDispatchOutcome
 from tests.benchmark_tools import benchmark_tool_specs
 
@@ -52,34 +52,53 @@ class SupervisorStub:
     async def observe_chief(self, agent_id: str, *, max_reports: int) -> dict[str, Any]:
         return {"ok": True, "data": {"agent_id": agent_id, "max_reports": max_reports}}
 
-    async def launch_challenges(self, agent_id: str, values: list[str]) -> dict[str, Any]:
+    async def launch_challenges(
+        self, agent_id: str, values: list[str]
+    ) -> dict[str, Any]:
         return {"ok": True, "data": {"values": values}}
 
-    async def wait_chief(self, agent_id: str, *, reason: str | None) -> ToolDispatchOutcome:
+    async def wait_chief(
+        self, agent_id: str, *, reason: str | None
+    ) -> ToolDispatchOutcome:
         return ToolDispatchOutcome({"ok": True, "data": {"reason": reason}}, True)
 
-    async def request_hint_light(self, agent_id: str, code: str, reason: str) -> dict[str, Any]:
+    async def request_hint_light(
+        self, agent_id: str, code: str, reason: str
+    ) -> dict[str, Any]:
         return {"ok": True, "data": {"unique_code": code, "reason": reason}}
 
-    async def observe_challenge(self, agent_id: str, *, max_reports: int) -> dict[str, Any]:
+    async def observe_challenge(
+        self, agent_id: str, *, max_reports: int
+    ) -> dict[str, Any]:
         return {"ok": True, "data": {"max_reports": max_reports}}
 
     async def dispatch_challenge(self, agent_id: str, payload: Any) -> dict[str, Any]:
         return {"ok": True, "data": payload.model_dump(mode="json"), "warnings": []}
 
-    async def wait_for_state(self, agent_id: str, reason: str | None) -> ToolDispatchOutcome:
+    async def wait_for_state(
+        self, agent_id: str, reason: str | None
+    ) -> ToolDispatchOutcome:
         return ToolDispatchOutcome({"ok": True, "data": {"reason": reason}}, True)
 
     async def submit_flag(self, agent_id: str, flag: str) -> dict[str, Any]:
-        return {"ok": True, "data": {"accepted": bool(flag)}}
+        return {"ok": True, "data": {"correct": bool(flag)}}
 
     async def close_challenge(self, agent_id: str) -> dict[str, Any]:
         return {"ok": True, "data": {"closed": True}}
 
-    async def report_execution_payload(self, agent_id: str, payload: Any) -> dict[str, Any]:
+    async def report_execution_payload(
+        self, agent_id: str, payload: Any
+    ) -> dict[str, Any]:
         return {"ok": True, "data": {"terminal": True}, "warnings": []}
 
-    async def read_evidence(self, agent_id: str, evidence_ref: str, **_: Any) -> dict[str, Any]:
+    async def report_observer_payload(
+        self, agent_id: str, payload: Any
+    ) -> dict[str, Any]:
+        return {"ok": True, "data": {"terminal": True}, "warnings": []}
+
+    async def read_evidence(
+        self, agent_id: str, evidence_ref: str, **_: Any
+    ) -> dict[str, Any]:
         return {"ok": True, "data": {"evidence_ref": evidence_ref}}
 
 
@@ -90,179 +109,6 @@ def names(provider: Any, role: str) -> set[str]:
             [provider], allowed_tools=AgentPolicy(role).allowed_tools
         ).definitions()
     }
-
-
-def test_lightweight_role_surfaces_are_fixed() -> None:
-    supervisor = SupervisorStub()
-    assert names(ChiefAgentTools(supervisor, agent_id="chief"), "chief") == {
-        "chief_observe",
-        "chief_launch_challenges",
-        "chief_wait",
-        "chief_request_hint",
-    }
-    assert names(
-        ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c"),
-        "challenge",
-    ) == {
-        "challenge_observe",
-        "challenge_dispatch",
-        "challenge_request_secondary_bootstrap",
-        "challenge_wait",
-        "challenge_submit_flag",
-        "challenge_close",
-        "evidence_read",
-    }
-    assert names(
-        ExecutionAgentTools(supervisor, agent_id="execution", unique_code="c"),
-        "execution",
-    ) == {"execution_report", "execution_checkpoint", "evidence_read"}
-    assert names(
-        ExecutionAgentTools(
-            supervisor,
-            agent_id="bootstrap",
-            unique_code="c",
-            bootstrap_mode=True,
-        ),
-        "execution",
-    ) == {
-        "execution_report",
-        "bootstrap_checkpoint",
-        "bootstrap_cycle_yield",
-        "evidence_read",
-    }
-    assert len(AgentPolicy("execution").allowed_tools) <= 64
-
-
-@pytest.mark.asyncio
-async def test_dispatch_requires_only_summary_and_task_objective() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c")],
-        allowed_tools=AgentPolicy("challenge").allowed_tools,
-    )
-    spec = registry.get("challenge_dispatch")
-    assert spec is not None
-    arguments = spec.input_model.model_validate(
-        {"summary": "decide now", "tasks": [{"objective": "probe one surface"}]}
-    )
-    outcome = await spec.handler(arguments)
-    assert isinstance(outcome, ToolDispatchOutcome)
-    assert outcome.yield_session is True
-    result = outcome.result
-    assert result["ok"] is True
-    assert result["data"]["tasks"][0]["task_stage"] == "discovery"
-
-
-@pytest.mark.asyncio
-async def test_empty_dispatch_object_is_valid_for_runtime_followups() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c")],
-        allowed_tools=AgentPolicy("challenge").allowed_tools,
-    )
-    spec = registry.get("challenge_dispatch")
-    assert spec is not None
-    arguments = spec.input_model.model_validate({})
-    assert arguments.summary == "runtime state update"
-    assert spec.input_model.model_validate({"tasks": None}).tasks is None
-
-
-@pytest.mark.asyncio
-async def test_dispatch_normalizes_optional_task_metadata_without_rejecting_decision() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c")],
-        allowed_tools=AgentPolicy("challenge").allowed_tools,
-    )
-    spec = registry.get("challenge_dispatch")
-    assert spec is not None
-    arguments = spec.input_model.model_validate(
-        {
-            "summary": "act on the report",
-            "tasks": [
-                {
-                    "objective": "probe one surface",
-                    "kind": "http",
-                    "task_stage": "initial",
-                    "priority": "urgent",
-                    "hypothesis_key2": "ignored",
-                },
-                {"kind": "web"},
-            ],
-        }
-    )
-    outcome = await spec.handler(arguments)
-    assert isinstance(outcome, ToolDispatchOutcome)
-    assert outcome.yield_session is True
-    assert outcome.result["data"]["tasks"] == [
-        {
-            "objective": "probe one surface",
-            "task_key": None,
-            "hypothesis_key": None,
-            "branch_key": None,
-            "kind": "general",
-            "task_stage": "discovery",
-            "priority": 50,
-            "success_criteria": [],
-            "context_refs": [],
-            "timeout_seconds": 1800,
-        }
-    ]
-    assert {item["code"] for item in outcome.result["warnings"]} == {
-        "task_fields_normalized",
-        "invalid_task_dropped",
-    }
-
-
-@pytest.mark.asyncio
-async def test_dispatch_with_only_invalid_tasks_keeps_session_for_correction() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c")],
-        allowed_tools=AgentPolicy("challenge").allowed_tools,
-    )
-    spec = registry.get("challenge_dispatch")
-    assert spec is not None
-    arguments = spec.input_model.model_validate(
-        {"summary": "invalid task", "tasks": [{"kind": "web"}]}
-    )
-    outcome = await spec.handler(arguments)
-    assert isinstance(outcome, ToolDispatchOutcome)
-    assert outcome.yield_session is False
-    assert outcome.result["ok"] is True
-
-
-@pytest.mark.asyncio
-async def test_dispatch_enforces_stage_timeout_floors() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ChallengeAgentTools(supervisor, agent_id="challenge", unique_code="c")],
-        allowed_tools=AgentPolicy("challenge").allowed_tools,
-    )
-    spec = registry.get("challenge_dispatch")
-    assert spec is not None
-    arguments = spec.input_model.model_validate(
-        {
-            "summary": "use deterministic stage budgets",
-            "tasks": [
-                {
-                    "objective": "collect a bounded baseline",
-                    "task_stage": "discovery",
-                    "timeout_seconds": 1,
-                },
-                {
-                    "objective": "validate the observed result",
-                    "task_stage": "validation",
-                    "timeout_seconds": 1,
-                },
-            ],
-        }
-    )
-    outcome = await spec.handler(arguments)
-    assert outcome.result["ok"] is True
-    assert [
-        item["timeout_seconds"] for item in outcome.result["data"]["tasks"]
-    ] == [900, 1800]
 
 
 class _FlagLifecycleBenchmark:
@@ -296,7 +142,9 @@ class _FlagLifecycleBenchmark:
                         "flag_count": 2,
                         "correct_flag_count": 2,
                         "is_completed": True,
-                        "container_status": "stopped",
+                        "container_status": "stopped"
+                        if self.close_calls
+                        else "running",
                         "container_addr": [],
                     }
                 ],
@@ -434,7 +282,7 @@ async def test_final_flag_returns_before_submitter_is_stopped_and_releases_conta
     await service.register_agent(
         "run",
         agent_id="challenge",
-        role="challenge",
+        role="solver",
         parent_id="chief",
         unique_code="challenge-a",
         initial_prompt="challenge",
@@ -442,10 +290,11 @@ async def test_final_flag_returns_before_submitter_is_stopped_and_releases_conta
     await service.register_agent(
         "run",
         agent_id="execution-child",
-        role="execution",
+        role="worker",
         parent_id="challenge",
         unique_code="challenge-a",
         mission="child",
+        task_key="execution-child",
     )
     benchmark = _FlagLifecycleBenchmark()
     supervisor = AgentSupervisor(
@@ -464,13 +313,15 @@ async def test_final_flag_returns_before_submitter_is_stopped_and_releases_conta
     await supervisor._sync_nodes()
     supervisor._issue_capabilities()
 
-    result = await supervisor.submit_flag("challenge", "flag{final}")
+    outcome = await supervisor.submit_flag("challenge", "flag{final}")
+    assert outcome.yield_session is True
+    result = outcome.result
     assert result["ok"] is True
     assert result["data"]["challenge_completed"] is True
     assert result["data"]["container_release_status"] == "pending"
 
     challenge_runtime = await service.get_agent_runtime("run", "challenge")
-    assert challenge_runtime["agent"]["status"] not in supervisor.TERMINAL_AGENT_STATES
+    assert challenge_runtime["agent"]["status"] == "completed"
 
     completion = supervisor._challenge_completion_tasks["challenge-a"]
     await completion
@@ -478,7 +329,9 @@ async def test_final_flag_returns_before_submitter_is_stopped_and_releases_conta
     challenge = next(
         item for item in overview["challenges"] if item["unique_code"] == "challenge-a"
     )
-    child = next(item for item in overview["agents"] if item["agent_id"] == "execution-child")
+    child = next(
+        item for item in overview["agents"] if item["agent_id"] == "execution-child"
+    )
     assert challenge["is_completed"] is True
     assert challenge["slot_occupied"] is False
     assert child["status"] in supervisor.TERMINAL_AGENT_STATES
@@ -601,9 +454,7 @@ async def test_paused_container_release_converges_with_bounded_retries(
         delays.append(delay)
 
     monkeypatch.setattr("agent.subagents.supervisor.asyncio.sleep", record_delay)
-    result = await supervisor.release_paused_container(
-        "challenge-a", caller_id="chief"
-    )
+    result = await supervisor.release_paused_container("challenge-a", caller_id="chief")
 
     assert result["released"] is released
     assert result["attempts"] == expected_attempts
@@ -618,166 +469,6 @@ async def test_paused_container_release_converges_with_bounded_retries(
     assert challenge["work_status"] == "paused"
     assert challenge["slot_occupied"] is (not released)
     await service.close()
-
-
-@pytest.mark.asyncio
-async def test_paused_challenge_stops_controller_bootstrap_and_execution(
-    tmp_path: Any,
-) -> None:
-    service = StateService(
-        StateDatabase(tmp_path / "state.sqlite3"),
-        run_root=tmp_path / "runs",
-    )
-    await service.initialize()
-    await service.create_run(
-        "run",
-        challenges=[
-            ChallengeImport(
-                unique_code="challenge-a",
-                description="test challenge",
-                container_status="running",
-            )
-        ],
-    )
-    await service.register_agent(
-        "run", agent_id="chief", role="chief", initial_prompt="chief"
-    )
-    await service.start_challenge("run", "challenge-a")
-    created = await service.register_challenge_workgroup(
-        "run",
-        challenge_agent_id="challenge",
-        bootstrap_agent_id="bootstrap",
-        parent_id="chief",
-        unique_code="challenge-a",
-        challenge_prompt="challenge",
-        bootstrap_prompt="bootstrap",
-    )
-    await service.register_agent(
-        "run",
-        agent_id="execution-child",
-        role="execution",
-        parent_id="challenge",
-        unique_code="challenge-a",
-        mission="bounded work",
-    )
-    async with service.db.sessions.begin() as session:
-        challenge = await session.get(ChallengeRecord, ("run", "challenge-a"))
-        assert challenge is not None
-        challenge.work_status = "paused"
-        challenge.pause_reason = "stagnation_timeout"
-
-    supervisor = AgentSupervisor(
-        AgentSettings(
-            llm_base_url="https://llm.test",
-            llm_model="test-model",
-            llm_api_key="test-key",
-        ),
-        run_root=tmp_path / "runs",
-        state_service=service,
-    )
-    supervisor.run_id = "run"
-    supervisor.chief_agent_id = "chief"
-    await supervisor.stop_challenge_work(
-        "challenge-a", reason="stagnation_timeout"
-    )
-
-    overview = await service.get_overview("run")
-    owned = [
-        item
-        for item in overview["agents"]
-        if item.get("unique_code") == "challenge-a"
-    ]
-    bootstrap_ids = {
-        item["agent_id"] for item in created["bootstraps"]
-    }
-    initial_ids = {
-        item["agent_id"] for item in created["initial_executions"]
-    }
-    assert {item["agent_id"] for item in owned} == {
-        "challenge",
-        "execution-child",
-        *bootstrap_ids,
-        *initial_ids,
-    }
-    assert all(item["status"] in supervisor.TERMINAL_AGENT_STATES for item in owned)
-    assert created["bootstrap"]["agent_id"] == "bootstrap"
-    ensured = await service.ensure_bootstrap_for_challenge(
-        "run",
-        "challenge-a",
-        parent_id="challenge",
-        bootstrap_prompt="must-not-start",
-    )
-    assert ensured["enabled"] is False
-    assert ensured["reason"] == "challenge_stopped"
-    await service.close()
-
-
-@pytest.mark.asyncio
-async def test_interrupt_execution_agents_builds_strict_terminal_report(
-    tmp_path: Any,
-) -> None:
-    service = StateService(
-        StateDatabase(tmp_path / "state.sqlite3"),
-        run_root=tmp_path / "runs",
-    )
-    await service.initialize()
-    await service.create_run(
-        "run",
-        challenges=[
-            ChallengeImport(
-                unique_code="challenge-a",
-                description="test challenge",
-                container_status="running",
-            )
-        ],
-    )
-    await service.register_agent(
-        "run", agent_id="chief", role="chief", initial_prompt="chief"
-    )
-    await service.register_agent(
-        "run",
-        agent_id="challenge",
-        role="challenge",
-        parent_id="chief",
-        unique_code="challenge-a",
-        initial_prompt="challenge",
-    )
-    await service.register_agent(
-        "run",
-        agent_id="execution-child",
-        role="execution",
-        parent_id="challenge",
-        unique_code="challenge-a",
-        mission="child",
-    )
-
-    interrupted = await service.interrupt_execution_agents("run")
-
-    assert interrupted == ["execution-child"]
-    runtime = await service.get_agent_runtime("run", "execution-child")
-    assert runtime["agent"]["status"] == "interrupted"
-    assert runtime["agent"]["final_report"]["status"] == "cancelled"
-    await service.close()
-
-
-def test_terminal_report_schema_keeps_optional_items_best_effort() -> None:
-    supervisor = SupervisorStub()
-    registry = ToolRegistry(
-        [ExecutionAgentTools(supervisor, agent_id="execution", unique_code="c")],
-        allowed_tools=AgentPolicy("execution").allowed_tools,
-    )
-    spec = registry.get("execution_report")
-    assert spec is not None
-    parsed = spec.input_model.model_validate(
-        {
-            "status": "completed",
-            "summary": "done",
-            "hypothesis_outcome": "provider-specific-value",
-            "findings": [{"malformed": True}],
-            "evidence_refs": [1, "bad"],
-        }
-    )
-    assert parsed.status == "completed"
 
 
 def test_chief_catalog_projection_is_compact_at_cloud_scale() -> None:
@@ -804,24 +495,27 @@ def test_chief_catalog_projection_is_compact_at_cloud_scale() -> None:
     assert all("internal_field" not in item for item in projected)
     assert rough_token_count(projected) < 20_000
     tools = ToolRegistry(
-        [ChiefAgentTools(SupervisorStub(), agent_id="chief")],
+        [AgentControlTools(SupervisorStub(), agent_id="chief", role="chief")],
         allowed_tools=AgentPolicy("chief").allowed_tools,
     ).definitions()
-    assert request_token_count(
-        [
-            {"role": "system", "content": system_prompt("chief")},
-            {
-                "role": "user",
-                "content": str(
-                    {
-                        "run": {"status": "active", "phase": "middle"},
-                        "capacity": {"limit": 3, "free_count": 3},
-                        "challenges": projected,
-                        "active_agents": [],
-                        "reports": [],
-                    }
-                ),
-            },
-        ],
-        tools,
-    ) < 40_000
+    assert (
+        request_token_count(
+            [
+                {"role": "system", "content": system_prompt("chief")},
+                {
+                    "role": "user",
+                    "content": str(
+                        {
+                            "run": {"status": "active", "phase": "middle"},
+                            "capacity": {"limit": 3, "free_count": 3},
+                            "challenges": projected,
+                            "active_agents": [],
+                            "reports": [],
+                        }
+                    ),
+                },
+            ],
+            tools,
+        )
+        < 40_000
+    )

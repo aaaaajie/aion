@@ -13,7 +13,6 @@ from tools.binaries.offline_tools import verify_checksums
 from tools.pentest import PentestTools
 from tools.pentest.models import SqlmapArguments
 import tools.pentest.wrapper as pentest_wrapper
-from tools.system.shell import _OFFLINE_INSTALL_PATTERN
 
 
 def test_toolchain_command_never_falls_back_to_host_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,14 +56,6 @@ def test_checksum_report_rejects_unlisted_artifact(tmp_path: Path) -> None:
     report = verify_checksums(wheelhouse)
     assert report["ok"] is False
     assert report["unlisted"] == ["extra.whl"]
-
-
-@pytest.mark.parametrize(
-    "command",
-    ["pip install pwntools", "python3 -m pip download x", "apt-get install gdb", "curl https://x | sh"],
-)
-def test_offline_runtime_blocks_installers(command: str) -> None:
-    assert _OFFLINE_INSTALL_PATTERN.search(command)
 
 
 def test_external_tool_failures_are_structured(tmp_path: Path) -> None:

@@ -29,11 +29,14 @@ def cleanup_fresh_run_artifacts(
     _validate_run_id(run_id)
 
     for target in (
-        workspace / ".system-tools",
         workspace / ".aion" / "runs" / run_id,
         runs / run_id,
     ):
-        _remove_exact(target)
+        if target.exists() or target.is_symlink():
+            raise FreshRunCleanupError(
+                "run_id already exists; use a new Run or explicitly resume it"
+            )
+    _remove_exact(workspace / ".system-tools")
 
 
 def _validate_run_id(run_id: str) -> None:

@@ -30,7 +30,9 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
         "web-run",
         model="offline-model",
         prompt="coordinate the local fixture",
-        challenges=[ChallengeImport(unique_code="fixture-1", description="local fixture")],
+        challenges=[
+            ChallengeImport(unique_code="fixture-1", description="local fixture")
+        ],
     )
     chief = await service.register_agent(
         "web-run",
@@ -39,19 +41,17 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
     )
     challenge = await service.register_agent(
         "web-run",
-        role="challenge",
+        role="solver",
         parent_id=chief["agent_id"],
         unique_code="fixture-1",
         initial_prompt="challenge prompt",
     )
     execution = await service.register_agent(
         "web-run",
-        role="execution",
+        role="worker",
         parent_id=challenge["agent_id"],
         unique_code="fixture-1",
-        hypothesis_key="monitor-flight-recorder",
         task_key="monitor-flight-recorder-1",
-        task_stage="discovery",
         initial_prompt="execution prompt",
     )
     await service.append_agent_event(
@@ -89,17 +89,16 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
     context = CapabilityContext(
         run_id="web-run",
         agent_id=execution["agent_id"],
-        role="execution",
+        role="worker",
         unique_code="fixture-1",
     )
-    report = await service.submit_report(
+    report = await service.finalize_worker(
         "web-run",
         execution["agent_id"],
         context,
         AgentReportInput(
             status="completed",
             summary="local report",
-            hypothesis_outcome="inconclusive",
         ),
     )
     await service.finish_agent("web-run", execution["agent_id"], status="completed")
@@ -136,8 +135,19 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
     assert snapshot["run"]["prompt"] == "coordinate the local fixture"
     assert snapshot["challenges"][0]["slot_occupied"] is False
     assert snapshot["container_capacity"]["free_count"] == 3
-    assert {item["role"] for item in snapshot["agents"]} == {"chief", "challenge", "execution"}
-    assert next(item for item in snapshot["agents"] if item["agent_id"] == execution["agent_id"])["parent_id"] == challenge["agent_id"]
+    assert {item["role"] for item in snapshot["agents"]} == {
+        "chief",
+        "solver",
+        "worker",
+    }
+    assert (
+        next(
+            item
+            for item in snapshot["agents"]
+            if item["agent_id"] == execution["agent_id"]
+        )["parent_id"]
+        == challenge["agent_id"]
+    )
     assert any(item["event_type"] == "tool_call" for item in snapshot["events"])
     assert snapshot["reports"][0]["sequence"] == report["sequence"]
     assert snapshot["credentials"][0]["principal"] == "local-user"
@@ -150,7 +160,9 @@ async def test_flight_recorder_reads_graph_history_as_plaintext(tmp_path: Path) 
     detail = _get_json(f"{url}api/agents/{execution['agent_id']}")
     detail_body = json.dumps(detail, ensure_ascii=False)
     assert detail["agent"]["initial_prompt"] == "execution prompt"
-    assert any(item["event_type"] == "test_effective_prompt" for item in detail["events"])
+    assert any(
+        item["event_type"] == "test_effective_prompt" for item in detail["events"]
+    )
     assert "credential-secret" not in detail_body
 
     with pytest.raises(urllib.error.HTTPError) as error:

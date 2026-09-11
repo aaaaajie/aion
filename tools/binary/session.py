@@ -7,6 +7,7 @@ import base64
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 import os
+import signal
 import platform
 from pathlib import Path
 import ssl
@@ -57,17 +58,23 @@ class BinarySessionManager:
         root: str | os.PathLike[str],
         *,
         sandbox: SandboxBackend | None = None,
+        on_process_started: Callable[[int], Awaitable[None]] | None = None,
         platform_name: str | None = None,
         machine_name: str | None = None,
-        process_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] =
-        asyncio.create_subprocess_exec,
-        connection_factory: Callable[..., Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]] =
-        asyncio.open_connection,
+        process_factory: Callable[
+            ..., Awaitable[asyncio.subprocess.Process]
+        ] = asyncio.create_subprocess_exec,
+        connection_factory: Callable[
+            ..., Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]
+        ] = asyncio.open_connection,
     ) -> None:
         self.root = Path(root).resolve()
+        self._on_process_started = on_process_started
         self.platform_name = platform_name or platform.system()
         self.machine_name = (machine_name or platform.machine()).lower()
-        self.sandbox = sandbox or SandboxBackend(self.root)
+        self.sandbox = sandbox or SandboxBackend(
+            self.root, read_only_paths=(self.root,)
+        )
         self._process_factory = process_factory
         self._connection_factory = connection_factory
         self._sessions: dict[str, LiveBinarySession] = {}
@@ -91,7 +98,6 @@ class BinarySessionManager:
             )
         header = self._validate_linux_elf(path)
         try:
-            self.sandbox.prepare()
             command = self.sandbox.command_argv([str(path), *arguments.argv], cwd=cwd)
         except SystemToolError as exc:
             raise BinarySessionError(exc.code, str(exc)) from exc
@@ -123,6 +129,12 @@ class BinarySessionManager:
                 "process_stream_unavailable",
                 "The target process did not expose stdin/stdout",
             )
+        if self._on_process_started:
+            try:
+                await self._on_process_started(process.pid)
+            except BaseException:
+                await self._terminate_process(process)
+                raise
         session = LiveBinarySession(
             session_id=f"pwn_{uuid4().hex}",
             kind="process",
@@ -161,9 +173,13 @@ class BinarySessionManager:
                 timeout=arguments.timeout,
             )
         except asyncio.TimeoutError as exc:
-            raise BinarySessionError("tcp_connect_timeout", "TCP connection timed out") from exc
+            raise BinarySessionError(
+                "tcp_connect_timeout", "TCP connection timed out"
+            ) from exc
         except OSError as exc:
-            raise BinarySessionError("tcp_connect_failed", f"TCP connection failed: {exc}") from exc
+            raise BinarySessionError(
+                "tcp_connect_failed", f"TCP connection failed: {exc}"
+            ) from exc
         session = LiveBinarySession(
             session_id=f"pwn_{uuid4().hex}",
             kind="tcp_tls" if arguments.tls else "tcp",
@@ -174,7 +190,11 @@ class BinarySessionManager:
         return {
             "session_id": session.session_id,
             "kind": session.kind,
-            "remote": {"host": arguments.host, "port": arguments.port, "tls": arguments.tls},
+            "remote": {
+                "host": arguments.host,
+                "port": arguments.port,
+                "tls": arguments.tls,
+            },
         }
 
     async def io(self, arguments: PwnSessionIoArguments) -> dict[str, Any]:
@@ -193,29 +213,48 @@ class BinarySessionManager:
             )
 
     async def close(self, session_id: str) -> dict[str, Any]:
-        session = self._sessions.pop(session_id, None)
+        session = self._sessions.get(session_id)
         if session is None:
-            raise BinarySessionError("session_not_found", "The binary session does not exist")
+            raise BinarySessionError(
+                "session_invalidated",
+                "This binary handle is invalid or belongs to a previous resource generation; reopen the session",
+            )
         await self._close_session(session)
+        self._sessions.pop(session_id, None)
         return {"session_id": session_id, "closed": True}
 
     async def close_all(self) -> None:
-        sessions = list(self._sessions.values())
-        self._sessions.clear()
-        if sessions:
-            await asyncio.gather(*(self._close_session(item) for item in sessions), return_exceptions=True)
         self._closed = True
+        sessions = list(self._sessions.values())
+        results = await asyncio.gather(
+            *(self._close_session(item) for item in sessions), return_exceptions=True
+        )
+        failures = []
+        for session, result in zip(sessions, results):
+            if isinstance(result, Exception):
+                failures.append(result)
+            else:
+                self._sessions.pop(session.session_id, None)
+        if failures:
+            raise ExceptionGroup("Binary resource cleanup failed", failures)
 
     def _ensure_open(self) -> None:
         if self._closed:
-            raise BinarySessionError("manager_closed", "The binary session manager is closed")
+            raise BinarySessionError(
+                "manager_closed", "The binary session manager is closed"
+            )
 
     def _session(self, session_id: str) -> LiveBinarySession:
         session = self._sessions.get(session_id)
         if session is None:
-            raise BinarySessionError("session_not_found", "The binary session does not exist")
+            raise BinarySessionError(
+                "session_invalidated",
+                "This binary handle is invalid or belongs to a previous resource generation; reopen the session",
+            )
         if session.writer.is_closing():
-            raise BinarySessionError("session_closed", "The binary session is already closed")
+            raise BinarySessionError(
+                "session_closed", "The binary session is already closed"
+            )
         return session
 
     def _resolve(self, value: str) -> Path:
@@ -223,7 +262,9 @@ class BinarySessionManager:
         try:
             path.relative_to(self.root)
         except ValueError as exc:
-            raise BinarySessionError("path_outside_workspace", "Path escapes the workspace") from exc
+            raise BinarySessionError(
+                "path_outside_workspace", "Path escapes the workspace"
+            ) from exc
         if is_runtime_control_plane_path(self.root, path):
             raise BinarySessionError(
                 "path_protected",
@@ -240,7 +281,9 @@ class BinarySessionManager:
         try:
             header = parse_elf_header(path)
         except (ElfError, OSError) as exc:
-            raise BinarySessionError("not_elf", f"The target is not a supported ELF: {exc}") from exc
+            raise BinarySessionError(
+                "not_elf", f"The target is not a supported ELF: {exc}"
+            ) from exc
         host = self.machine_name
         if host in {"x86_64", "amd64"}:
             allowed = {"amd64", "x86"}
@@ -262,7 +305,9 @@ class BinarySessionManager:
             try:
                 payload = base64.b64decode(arguments.send_base64, validate=True)
             except ValueError as exc:
-                raise BinarySessionError("invalid_base64", "send_base64 is not valid base64") from exc
+                raise BinarySessionError(
+                    "invalid_base64", "send_base64 is not valid base64"
+                ) from exc
         elif arguments.send_text is not None:
             payload = arguments.send_text.encode("utf-8")
         else:
@@ -275,7 +320,9 @@ class BinarySessionManager:
             try:
                 return base64.b64decode(arguments.recv_until_base64, validate=True)
             except ValueError as exc:
-                raise BinarySessionError("invalid_base64", "recv_until_base64 is not valid base64") from exc
+                raise BinarySessionError(
+                    "invalid_base64", "recv_until_base64 is not valid base64"
+                ) from exc
         if arguments.recv_until_text is not None:
             return arguments.recv_until_text.encode("utf-8")
         return None
@@ -299,7 +346,9 @@ class BinarySessionManager:
                 data.extend(session.buffer[:take])
                 del session.buffer[:take]
                 if until is not None and until in data:
-                    return self._finish_receive(session, data, until, eof, timed_out, truncated)
+                    return self._finish_receive(
+                        session, data, until, eof, timed_out, truncated
+                    )
                 if len(data) >= max_bytes:
                     truncated = bool(session.buffer)
                     break
@@ -307,7 +356,9 @@ class BinarySessionManager:
             if remaining <= 0:
                 timed_out = until is not None or not data
                 break
-            read_timeout = remaining if not data or until is not None else min(remaining, 0.03)
+            read_timeout = (
+                remaining if not data or until is not None else min(remaining, 0.03)
+            )
             try:
                 chunk = await asyncio.wait_for(
                     session.reader.read(min(16_384, max_bytes - len(data))),
@@ -321,10 +372,14 @@ class BinarySessionManager:
                 break
             data.extend(chunk)
             if until is not None and until in data:
-                return self._finish_receive(session, data, until, eof, timed_out, truncated)
+                return self._finish_receive(
+                    session, data, until, eof, timed_out, truncated
+                )
         if len(data) >= max_bytes:
             truncated = True
-        return self._receive_result(data, eof=eof, timed_out=timed_out, truncated=truncated)
+        return self._receive_result(
+            data, eof=eof, timed_out=timed_out, truncated=truncated
+        )
 
     @staticmethod
     def _finish_receive(
@@ -360,22 +415,28 @@ class BinarySessionManager:
         }
 
     async def _close_session(self, session: LiveBinarySession) -> None:
+        if session.process is not None:
+            await self._terminate_process(session.process)
         if not session.writer.is_closing():
             session.writer.close()
             try:
                 await asyncio.wait_for(session.writer.wait_closed(), timeout=1.0)
             except (asyncio.TimeoutError, OSError):
                 pass
-        if session.process is not None:
-            await self._terminate_process(session.process)
 
     @staticmethod
     async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
             return
-        process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=1.0)
         except asyncio.TimeoutError:
-            process.kill()
-            await asyncio.gather(process.wait(), return_exceptions=True)
+            pass
+        # A child can ignore TERM even when its group leader has exited.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await asyncio.gather(process.wait(), return_exceptions=True)

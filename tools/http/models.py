@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -70,9 +69,9 @@ class HttpRequestInput(HttpModel):
     method: str = Field(default="GET", min_length=1, description="HTTP method for this request.")
     url: str = Field(
         min_length=1,
-        description="An explicit http:// or https:// target URL. Template placeholders are allowed only when variables are supplied by system_http_probe.",
+        description="Explicit http:// or https:// URL; placeholders require probe variables.",
     )
-    query: dict[str, Any] = Field(default_factory=dict)
+    query: dict[str, Any] = Field(default_factory=dict, description="Merge into URL query; lists repeat keys. Empty query preserves the URL.")
     headers: dict[str, str] = Field(default_factory=dict)
     cookies: dict[str, str] = Field(default_factory=dict)
     auth: HttpAuth | None = None
@@ -187,7 +186,7 @@ class HttpVariableSource(HttpModel):
     )
     file_path: str | None = Field(
         default=None,
-        description="Workspace-relative UTF-8 file with one variable value per line.",
+        description="Workspace file or packaged:<name>; one UTF-8 value per line.",
     )
     encoding: Literal["path", "query", "form", "none"] = Field(
         default="none",
@@ -211,7 +210,7 @@ class HttpProbeCase(HttpModel):
     variables: dict[str, HttpVariableSource] = Field(default_factory=dict)
     combine: Literal["product", "zip"] = Field(
         default="product",
-        description="product tests every value combination; zip pairs values by ordinal and requires equal source lengths.",
+        description="product uses all combinations; zip pairs by order and requires equal lengths.",
     )
 
 
@@ -219,7 +218,7 @@ class HttpProbeInputCase(HttpRequestInput):
     variables: dict[str, HttpVariableSource] = Field(default_factory=dict)
     combine: Literal["product", "zip"] = Field(
         default="product",
-        description="product tests every value combination; zip pairs values by ordinal and requires equal source lengths.",
+        description="product uses all combinations; zip pairs by order and requires equal lengths.",
     )
 
     def to_case(self) -> HttpProbeCase:
@@ -264,60 +263,12 @@ class HttpRequestArguments(HttpRequestInput):
 
 
 class HttpProbeArguments(HttpModel):
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_unambiguous_shapes(cls, value: Any) -> Any:
-        """Accept only mechanical rewrites of the current Probe contract."""
-
-        if not isinstance(value, Mapping):
-            return value
-        raw = dict(value)
-        if set(raw) == {"arguments"} and isinstance(raw["arguments"], Mapping):
-            raw = dict(raw["arguments"])
-
-        cases_value = raw.get("cases")
-        if isinstance(cases_value, Mapping):
-            cases_value = [dict(cases_value)]
-            raw["cases"] = cases_value
-
-        shared_fields = (
-            "concurrency",
-            "rate_limit_per_second",
-            "wait_seconds",
-        )
-        if isinstance(cases_value, list):
-            case_controls = [
-                key
-                for case in cases_value
-                if isinstance(case, Mapping)
-                for key in shared_fields
-                if key in case
-            ]
-            if case_controls:
-                if len(cases_value) != 1:
-                    raise ValueError(
-                        "Probe shared controls must be top-level; moving case-level "
-                        "controls is ambiguous when cases contains multiple items"
-                    )
-                case = dict(cases_value[0])
-                conflicts = [key for key in shared_fields if key in case and key in raw]
-                if conflicts:
-                    raise ValueError(
-                        "Probe shared controls cannot appear in both a case and the top level: "
-                        + ", ".join(conflicts)
-                    )
-                moved = {key: case.pop(key) for key in shared_fields if key in case}
-                raw["cases"] = [case]
-                raw.update(moved)
-        return raw
-
     cases: list[HttpProbeInputCase] = Field(
         min_length=1,
         max_length=32,
         description=(
-            "A JSON array of flat request cases. Each case owns variables and "
-            "combine; shared controls stay at the top level. Use exact {{name}} "
-            "placeholders. Do not pass a string, request wrapper, or session_id."
+            "Flat request cases as a JSON array; each case owns variables and "
+            "combine. Use {{name}} placeholders. No wrapper, string, or session_id."
         ),
     )
     concurrency: int = Field(
@@ -339,6 +290,13 @@ class HttpProbeArguments(HttpModel):
         ge=0,
         le=20,
         description="Wait at most 20 seconds; 0 returns immediately.",
+    )
+
+
+class HttpPlanArguments(HttpModel):
+    tool_name: Literal["system_http_request", "system_http_probe"]
+    arguments: dict[str, Any] = Field(
+        description="The exact arguments object for the selected HTTP tool; validated without executing it."
     )
 
 
@@ -371,8 +329,17 @@ class HttpOutputArguments(HttpModel):
         min_length=1,
         description="Interaction ID returned by system_http_request or system_http_probe. Use this to poll; do not resend the request.",
     )
-    cursor: int = Field(default=0, ge=0)
-    limit: int = Field(default=100, ge=1, le=200)
+    cursor: int = Field(
+        default=0,
+        ge=0,
+        description="Result cursor returned by the previous page; use cursor/limit for pagination.",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=200,
+        description="Number of result rows to return; this is limit, not offset or limit_chars.",
+    )
     wait_seconds: float = Field(
         default=0.0,
         ge=0,
@@ -388,8 +355,17 @@ class HttpResponseArguments(HttpModel):
         min_length=1,
         description="Request ID from the structured output. Use this only when the full response Body is needed as evidence.",
     )
-    offset_bytes: int = Field(default=0, ge=0)
-    length_bytes: int = Field(default=30_000, ge=1, le=100_000)
+    offset_bytes: int = Field(
+        default=0,
+        ge=0,
+        description="Byte offset within the stored response body; use bytes, not characters.",
+    )
+    length_bytes: int = Field(
+        default=30_000,
+        ge=1,
+        le=100_000,
+        description="Maximum response-body bytes to read; this is length_bytes, not limit_chars.",
+    )
 
 
 class HttpAnalyzeArguments(HttpModel):
@@ -448,6 +424,13 @@ class PathProbeArguments(HttpModel):
     wordlist_paths: list[str] = Field(
         default_factory=list,
         description="Optional workspace files with one path per line, used instead of built-in profiles.",
+    )
+    packaged_wordlists: list[str] = Field(default_factory=list)
+    max_candidates: int = Field(
+        default=256,
+        ge=1,
+        le=1000,
+        description="Candidate cap for custom or page-derived wordlists.",
     )
     exclude_paths: list[str] = Field(
         default_factory=list,

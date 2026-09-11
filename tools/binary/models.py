@@ -10,7 +10,10 @@ class ToolArguments(BaseModel):
 
 
 class FilePathArguments(ToolArguments):
-    file_path: str = Field(min_length=1)
+    file_path: str = Field(
+        min_length=1,
+        description="Logical workspace path such as agent/bin/app or shared/bin/app; absolute paths and $TMPDIR belong in Shell only.",
+    )
 
 
 class StringsArguments(FilePathArguments):
@@ -63,9 +66,18 @@ class GdbArguments(ToolArguments):
 
 
 class PwnProcessOpenArguments(ToolArguments):
-    file_path: str = Field(min_length=1, max_length=4_096)
+    file_path: str = Field(
+        min_length=1,
+        max_length=4_096,
+        description="Logical workspace path such as agent/bin/app or shared/bin/app; absolute paths and $TMPDIR belong in Shell only.",
+    )
     argv: list[str] = Field(default_factory=list, max_length=32)
-    cwd: str = Field(default=".", min_length=1, max_length=4_096)
+    cwd: str = Field(
+        default=".",
+        min_length=1,
+        max_length=4_096,
+        description="Logical workspace directory; use . or agent/.../shared/... and use $TMPDIR only through Shell.",
+    )
     env: dict[str, str] = Field(default_factory=dict, max_length=64)
     startup_wait_seconds: float = Field(default=0.25, ge=0, le=10.0)
     max_startup_bytes: int = Field(default=8_192, ge=0, le=65_536)
