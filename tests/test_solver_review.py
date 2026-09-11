@@ -36,8 +36,13 @@ def record(ref=None, *, conclusion_sequences=None, calibration_basis="Known loca
 
 
 async def evidence(service, context):
-    return (await service.persist_evidence("run", context, evidence_type="text", source="fixture",
+    ref = (await service.persist_evidence("run", context, evidence_type="text", source="fixture",
         content="Known fixture returned expected bytes under session A"))["evidence_ref"]
+    await service.append_agent_event("run", context.agent_id, "tool_result", {
+        "tool_name": "system_shell", "result": {"ok": True, "data": {
+            "status": "completed", "exit_code": 0, "output": "expected fixture bytes",
+            "evidence_refs": [ref]}}})
+    return ref
 
 
 @pytest.mark.parametrize("summary", ["not run", "timeout", "unread", "control failed", "conditions unknown"])

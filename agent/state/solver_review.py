@@ -18,7 +18,7 @@ def project_reviews(rows, *, revoked_sequences=()):
         for row in rows:
             validation = row["payload"]["review"]["validation"] or {}
             conclusions = validation.get("conclusion_sequences", [])
-            dependencies = conclusions + validation.get("calibration_sequences", [])
+            dependencies = conclusions + validation.get("calibration_sequences", []) + row["payload"].get("control_sequences", [])
             if row["sequence"] in revoked or set(dependencies) & revoked:
                 expanded.add(row["sequence"])
                 expanded.update(conclusions)
@@ -194,6 +194,7 @@ class SolverReviewState:
                     ))).all())
                     if refs != available:
                         raise StatePermission("review_source_invalid", "Review sources must belong to this Solver")
+                control_sequences = []
                 if validation:
                     await self._validate_context_refs(session, run_id, agent.unique_code, validation.control_evidence_refs)
                     state = await self.solver_review_state(run_id, agent.agent_id)
@@ -221,6 +222,34 @@ class SolverReviewState:
                         raise StatePermission("review_result_invalid", "Validated conclusions need fresh, current tool-result sequences")
                     for result in results:
                         validate_execution(result, state["execution"])
+                    receipts = (await session.scalars(select(StateEventRecord).where(
+                        StateEventRecord.run_id == run_id,
+                        StateEventRecord.agent_id == agent.agent_id,
+                        StateEventRecord.event_type == "tool_result",
+                    ).order_by(StateEventRecord.sequence))).all()
+                    for ref in validation.control_evidence_refs:
+                        matches = []
+                        for receipt in receipts:
+                            output = receipt.payload.get("result")
+                            if not isinstance(output, dict):
+                                continue
+                            data = output.get("data")
+                            evidence_refs = output.get("evidence_refs", [])
+                            if isinstance(data, dict):
+                                evidence_refs = evidence_refs + data.get("evidence_refs", [])
+                            if ref in evidence_refs:
+                                matches.append(receipt)
+                        if not matches:
+                            raise StatePermission("review_control_invalid", "Control needs an owned execution receipt")
+                        receipt = matches[0]
+                        fact = receipt.payload.get("execution_fact") or execution_fact(
+                            receipt.payload.get("tool_name"), receipt.payload.get("result"))
+                        if (receipt.sequence in revoked or receipt.payload.get("replayed")
+                            or receipt.sequence < state["execution"]["generation"]
+                            or not fact or not (fact.get("execution") or fact.get("task_id") or fact.get("interaction_id"))):
+                            raise StatePermission("review_control_invalid", "Control must be current, executed and not revoked")
+                        validate_execution(receipt, state["execution"])
+                        control_sequences.append(receipt.sequence)
                 if review.observation_revision is not None:
                     snapshot = await session.scalar(select(StateEventRecord).where(
                         StateEventRecord.run_id == run_id, StateEventRecord.agent_id == agent.agent_id,
@@ -247,7 +276,7 @@ class SolverReviewState:
                     )
                 }
                 sequence = await self._event(session, run_id, "solver_review_record", {
-                    "review": review.model_dump(),
+                    "review": review.model_dump(), "control_sequences": control_sequences,
                 }, agent_id=agent.agent_id)
                 eligible_refs = set(
                     review.covered_sequences

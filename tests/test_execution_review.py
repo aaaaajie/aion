@@ -291,3 +291,50 @@ async def test_deferred_result_without_task_requires_delivery(tmp_path):
         await service.record_solver_review('run', solver, record(ref, conclusion_sequences=[source]))
     finally:
         await service.close()
+
+
+@pytest.mark.parametrize('failure', ['unlinked', 'timeout', 'truncated', 'revoked', 'generation', 'not_run'])
+async def test_control_requires_current_complete_execution_receipt(tmp_path, failure):
+    service, _, solver = await build_state(tmp_path)
+    try:
+        control = (await service.persist_evidence('run', solver, evidence_type='text',
+            source='fixture', content='candidate read under changed conditions'))['evidence_ref']
+        payload = {'tool_name': 'system_shell', 'result': {'ok': True, 'data': {
+            'status': 'completed', 'exit_code': 0, 'output': 'fixture', 'evidence_refs': [control]}}}
+        if failure == 'timeout':
+            payload['result']['data']['timed_out'] = True
+        if failure == 'truncated':
+            payload['result']['data']['truncated'] = True
+        if failure == 'not_run':
+            payload['result'].update(ok=False, error={'stage': 'schema', 'code': 'invalid_arguments'})
+        if failure != 'unlinked':
+            seq = await service.append_agent_event('run', 'solver', 'tool_result', payload)
+        if failure == 'revoked':
+            await service.record_solver_review('run', solver, record(revoked_sequences=[seq]))
+        if failure == 'generation':
+            await service.invalidate_agent_resources('run', 'solver', reason='session changed')
+        source = await service.append_agent_event('run', 'solver', 'tool_result', {'result': 'candidate absent'})
+        with pytest.raises(StatePermission):
+            await service.record_solver_review('run', solver, record(control, conclusion_sequences=[source],
+                assessment='new_information', direction_status='dead'))
+        # Corrected control permits re-evaluating the original candidate, not a new one.
+        corrected = await evidence(service, solver)
+        await service.record_solver_review('run', solver, record(corrected, conclusion_sequences=[source],
+            assessment='new_information', direction_status='dead'))
+    finally:
+        await service.close()
+
+
+async def test_revoking_control_withdraws_dependent_conclusion(tmp_path):
+    service, _, solver = await build_state(tmp_path)
+    try:
+        control = await evidence(service, solver)
+        events = await service.list_agent_events('run', 'solver')
+        control_seq = next(e['sequence'] for e in events if e['event_type'] == 'tool_result')
+        source = await service.append_agent_event('run', 'solver', 'tool_result', {'result': 'fixture absent'})
+        review = await service.record_solver_review('run', solver, record(control, conclusion_sequences=[source]))
+        await service.record_solver_review('run', solver, record(revoked_sequences=[control_seq]))
+        state = await service.solver_review_state('run', 'solver')
+        assert {control_seq, source, review} <= set(state['revoked_sequences'])
+    finally:
+        await service.close()
