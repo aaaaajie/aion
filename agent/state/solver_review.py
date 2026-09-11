@@ -247,7 +247,10 @@ class SolverReviewState:
                             receipt.payload.get("tool_name"), receipt.payload.get("result"))
                         if (receipt.sequence in revoked or receipt.payload.get("replayed")
                             or receipt.sequence < state["execution"]["invalidated_at_sequence"]
-                            or not fact or not (fact.get("execution") or fact.get("task_id") or fact.get("interaction_id"))):
+                            or not fact or fact.get("status") == "failed"
+                            or fact.get("exit_code") not in (None, 0)
+                            or receipt.payload.get("result", {}).get("ok") is False
+                            or not (fact.get("execution") or fact.get("task_id") or fact.get("interaction_id"))):
                             raise StatePermission("review_control_invalid", "Control must be current, executed and not revoked")
                         validate_execution(receipt, state["execution"])
                         control_sequences.append(receipt.sequence)

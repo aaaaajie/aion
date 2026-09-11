@@ -337,3 +337,44 @@ async def test_revoking_control_withdraws_dependent_conclusion(tmp_path):
         assert {control_seq, source, review} <= set(state['revoked_sequences'])
     finally:
         await service.close()
+
+
+async def test_changed_path_depth_invalidates_control_and_original_candidate_is_retested(tmp_path):
+    service, _, solver = await build_state(tmp_path)
+    root = tmp_path / 'target'
+    base = root / 'service' / 'www' / 'html' / 'contracts'
+    base.mkdir(parents=True)
+    (root / 'known.txt').write_text('known bytes')
+    (root / 'candidate.txt').write_text('candidate bytes')
+
+    async def read(name, depth):
+        path = base.joinpath(*(['..'] * depth), name)
+        try:
+            output, exit_code = path.read_text(), 0
+        except FileNotFoundError:
+            output, exit_code = 'not found', 1
+        ref = (await service.persist_evidence('run', solver, evidence_type='text',
+            source='synthetic_file_read', content=output))['evidence_ref']
+        seq = await service.append_agent_event('run', 'solver', 'tool_result', {
+            'tool_name': 'system_shell', 'result': {'ok': True, 'data': {
+                'status': 'completed' if exit_code == 0 else 'failed', 'exit_code': exit_code,
+                'output': output, 'evidence_refs': [ref]}}})
+        return ref, seq, output
+
+    try:
+        _, _, expected = await read('known.txt', 4)
+        assert expected == 'known bytes'
+        bad_control, _, _ = await read('known.txt', 3)
+        _, candidate, _ = await read('candidate.txt', 3)
+        with pytest.raises(StatePermission):
+            await service.record_solver_review('run', solver, record(bad_control,
+                conclusion_sequences=[candidate], assessment='new_information', direction_status='dead'))
+        control, _, _ = await read('known.txt', 4)
+        _, corrected, found = await read('candidate.txt', 4)
+        assert found == 'candidate bytes'
+        await service.record_solver_review('run', solver, record(control,
+            conclusion_sequences=[corrected], assessment='new_information'))
+        state = await service.solver_review_state('run', 'solver')
+        assert state['hypotheses']['fixture-path']['review']['direction_status'] == 'open'
+    finally:
+        await service.close()

@@ -84,6 +84,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
     model_rounds_to_dispatch: list[float] = []
     first_useful_round_by_agent: dict[str, float] = {}
     evidence_ref_count = 0
+    progress_kinds: dict[str, int] = {}
     request_reference_errors = 0
     context_budget_preflights = 0
     empty_response_recoveries = 0
@@ -315,6 +316,9 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             findings_received += int(value.get("findings_received") or 0)
             findings_persisted += int(value.get("findings_persisted") or 0)
             candidate_flags += int(bool(value.get("candidate_flag_present")))
+        elif event_type == "challenge_progress_recorded":
+            for kind in value.get("progress_kinds", []):
+                progress_kinds[kind] = progress_kinds.get(kind, 0) + 1
         elif event_type == "evidence_persisted":
             evidence_ref_count += 1
         elif event_type == "agent_resource_cleanup_failed":
@@ -640,6 +644,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             reasons = shell_execution["termination_reasons"]
             reasons[str(reason)] = reasons.get(str(reason), 0) + 1
     return {
+        "progress": {"recorded_by_kind": progress_kinds, "evidence_items": evidence_ref_count},
         "reviews": {**review_metrics, "covered_result_count": len(covered_results & execution_results)},
         "stagnation": stagnation_metrics,
         "parameter_errors": parameter_errors,
