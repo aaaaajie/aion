@@ -19,6 +19,23 @@ benchmark_lab/
 dist/
 claude-code-source-code/
 百度agent+解题过程/
+admin_enum/
+enum/
+evidence/
+evidence_a03/
+flea_dbg/
+imgscan/
+recon/
+sqli_probe/
+sqli_evidence/
+a03_probe/
+a03_idor/
+ws_rce/
+scan/
+work/
+ywgk_trav/
+artpic/
+recon_a03_evidence.md
 tsecbench_session_organizer.py
 scripts/recheck_liuyan.py
 scripts/build_platform.py
@@ -32,6 +49,7 @@ docs/analysis/*-comparison.md
 docs/poc-entry-acceptance.md
 docs/poc-runtime-acceptance.md
 docs/skill-awareness-acceptance.md
+docs/analysis/*-completion-review.md
 
 # VPS-specific operator credentials and host fingerprints
 deploy/vps_known_hosts
