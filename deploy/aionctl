@@ -203,6 +203,25 @@ def _start(
     print(f"Monitor: {MONITOR_URL}")
 
 
+def _cleanup(run_id: str) -> None:
+    if run_id == "latest" or run_id in {".", ".."}:
+        raise ControlError("cleanup requires an explicit run ID")
+    _run_record(run_id)
+    if _is_active():
+        raise ControlError("Cannot clean up while a Runtime is active")
+    token = _read_token_stdin()
+    token_path = RUNTIME_DIRECTORY / f"cleanup-token-{secrets.token_hex(8)}"
+    try:
+        _atomic_write(token_path, token)
+        token = ""
+        _run([str(APP_ROOT / "current-venv/bin/python"), str(APP_ROOT / "current/scripts/cleanup_run.py"),
+              "--run-id", run_id, "--benchmark-token-file", str(token_path),
+              "--run-root", str(RUN_ROOT), "--workspace-root", "/var/lib/aion/workspace",
+              "--env-file", "/etc/aion/aion.env"])
+    finally:
+        token_path.unlink(missing_ok=True)
+
+
 def _wait_until_inactive(timeout_seconds: float = 50.0) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -548,6 +567,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("pause")
     subparsers.add_parser("stop")
+    cleanup = subparsers.add_parser("cleanup")
+    cleanup.add_argument("--run-id", required=True)
+    cleanup.add_argument("--benchmark-token-stdin", action="store_true", required=True)
 
     status = subparsers.add_parser("status")
     status.add_argument("--json", action="store_true")
@@ -577,6 +599,8 @@ def main() -> None:
             _pause()
         elif args.command == "stop":
             _stop()
+        elif args.command == "cleanup":
+            _cleanup(args.run_id)
         elif args.command == "status":
             _status(args.json)
         elif args.command == "logs":

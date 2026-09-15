@@ -14,6 +14,9 @@ import psutil
 
 from agent.config import AgentSettings, PROJECT_ROOT
 from agent.runtime_cleanup import cleanup_fresh_run_artifacts
+from agent.run_ownership import RunOwnership
+from agent.container_cleanup import cleanup_offline
+from agent.deadline import before, cancel_before
 from agent.state import (
     AgentReportInput,
     CapabilityContext,
@@ -98,6 +101,7 @@ class AgentRuntime:
         self._loop_diagnostics: dict[str, float] = {}
         self._shutdown_event = asyncio.Event()
         self._closed = False
+        self._platform_ownership = None
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "AgentRuntime":
@@ -123,20 +127,23 @@ class AgentRuntime:
         database_path = run_dir / "state.sqlite3"
         if resume and not database_path.exists():
             raise SubagentError("run state database was not found")
-        if not resume:
-            cleanup_fresh_run_artifacts(
-                workspace_root=self.project_root,
-                run_root=self.run_root,
-                run_id=run_id,
-            )
-
-        service = StateService(
-            database_path,
-            run_root=self.run_root,
-            workspace_root=self.project_root,
-            clock=self.clock,
-        )
-        await service.initialize()
+        self.run_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._platform_ownership = RunOwnership(self.run_root / "platform.sqlite3")
+        try:
+            cleanup_deadline = asyncio.get_running_loop().time() + 30
+            cleanup = await before(cleanup_offline(self.benchmark, self.run_root, self.project_root,
+                                                   deadline=cleanup_deadline), cleanup_deadline)
+            if cleanup["unreleased"]:
+                codes = [f"{t['run_id']}:{t['unique_code']}:{t.get('error_code')}" for t in cleanup["unreleased"]]
+                raise SubagentError("Startup blocked by unconfirmed container releases: " + ", ".join(codes))
+            if not resume:
+                cleanup_fresh_run_artifacts(workspace_root=self.project_root, run_root=self.run_root, run_id=run_id)
+            service = StateService(database_path, run_root=self.run_root, workspace_root=self.project_root, clock=self.clock)
+            await service.initialize()
+        except BaseException:
+            self._platform_ownership.close()
+            self._platform_ownership = None
+            raise
         self.state_service = service
         self.run_id = run_id
         try:
@@ -410,30 +417,28 @@ class AgentRuntime:
         if self._closed:
             return
         self._closed = True
+        try:
+            await self._shutdown_resources(preserve_run=preserve_run)
+        finally:
+            if self._platform_ownership is not None:
+                self._platform_ownership.close()
+                self._platform_ownership = None
+
+    async def _shutdown_resources(self, *, preserve_run: bool) -> None:
+        deadline = asyncio.get_running_loop().time() + 30
         self._shutdown_event.set()
-        if self._network_watch_task is not None:
-            self._network_watch_task.cancel()
-            await asyncio.gather(self._network_watch_task, return_exceptions=True)
-            self._network_watch_task = None
-        for task in self._background_tasks:
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await cancel_before([self._network_watch_task, *self._background_tasks, *self._worker_watchers.values()],
+                            min(deadline - 20, asyncio.get_running_loop().time() + 1))
+        self._network_watch_task = None
         self._background_tasks.clear()
-        for task in self._worker_watchers.values():
-            task.cancel()
-        if self._worker_watchers:
-            await asyncio.gather(
-                *self._worker_watchers.values(), return_exceptions=True
-            )
         self._worker_watchers.clear()
         supervisor_error: Exception | None = None
         if self.supervisor is not None:
             try:
                 if preserve_run:
-                    await self.supervisor.pause()
+                    await self.supervisor.pause(deadline=deadline)
                 else:
-                    await self.supervisor.close()
+                    await self.supervisor.close(deadline=deadline)
             except Exception as exc:
                 supervisor_error = exc
                 LOGGER.exception(
@@ -444,31 +449,27 @@ class AgentRuntime:
             self.supervisor = None
         if self.benchmark is not None:
             try:
-                await self.benchmark.close()
+                await before(self.benchmark.close(), deadline)
             except Exception:
                 pass
         if self.state_service is not None:
             try:
-                while await self.state_service.project_pending_events(
-                    self._run_id(), run_dir=self.run_root / self._run_id(), limit=500
-                ):
-                    pass
-                await self.state_service.project_pending_events(
+                await before(self.state_service.project_pending_events(
                     self._run_id(),
                     run_dir=self.run_root / self._run_id(),
                     limit=500,
                     force_checkpoint=True,
-                )
+                ), deadline)
             except Exception:
                 pass
             try:
-                await self.state_service.close()
+                await before(self.state_service.close(), deadline)
             except Exception:
                 pass
             self.state_service = None
         if self.network_manager is not None:
             try:
-                await self.network_manager.close()
+                await before(self.network_manager.close(), deadline)
             except Exception:
                 pass
         if supervisor_error is not None:

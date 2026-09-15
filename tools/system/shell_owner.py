@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -23,6 +24,64 @@ import psutil
 TERM_SECONDS = 2.0
 KILL_SECONDS = 2.0
 DRAIN_SECONDS = 1.0
+MAX_HTTP_STATUS_FRAMES = 512
+HTTP_STATUS_LINE = re.compile(r"^HTTP/\d(?:\.\d)?\s+([1-5]\d{2})(?:\s|$)")
+
+
+def _http_summary() -> dict[str, object]:
+    return {
+        "measurement": "shell_output_lower_bound",
+        "observed_response_count": 0,
+        "status_classes": {},
+        "redirect_count": 0,
+        "error_count": 0,
+        "incomplete": False,
+        "capped": False,
+    }
+
+
+def _consume_http_output(
+    summary: dict[str, object], pending: str, text: str
+) -> str:
+    """Count only complete, line-anchored HTTP status frames in captured output."""
+
+    combined = pending + text
+    lines = combined.splitlines(keepends=True)
+    pending = ""
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        pending = lines.pop()
+    for line in lines:
+        if summary["capped"]:
+            break
+        match = HTTP_STATUS_LINE.match(line.rstrip("\r\n"))
+        if match is None:
+            continue
+        count = int(summary["observed_response_count"]) + 1
+        if count > MAX_HTTP_STATUS_FRAMES:
+            summary["capped"] = True
+            break
+        status = match.group(1)
+        classes = summary["status_classes"]
+        assert isinstance(classes, dict)
+        bucket = f"{status[0]}xx"
+        classes[bucket] = int(classes.get(bucket, 0)) + 1
+        summary["observed_response_count"] = count
+        if status[0] == "3":
+            summary["redirect_count"] = int(summary["redirect_count"]) + 1
+        elif status[0] in {"4", "5"}:
+            summary["error_count"] = int(summary["error_count"]) + 1
+    return pending
+
+
+def _finalize_http_summary(
+    summary: dict[str, object], pending: str, *, incomplete: bool
+) -> dict[str, object] | None:
+    if pending:
+        summary["incomplete"] = True
+    summary["incomplete"] = bool(summary["incomplete"] or incomplete)
+    if int(summary["observed_response_count"]) == 0:
+        return None
+    return summary
 
 
 def main() -> None:
@@ -74,6 +133,8 @@ def main() -> None:
     timed_out = False
     termination_reason = None
     known: dict[int, psutil.Process] = {}
+    http_summary = _http_summary()
+    http_line_buffer = ""
 
     def descendants() -> list[psutil.Process]:
         # Keep identities, not just PIDs, across reparenting and leader exit.
@@ -104,6 +165,7 @@ def main() -> None:
 
         def pump(wait: float) -> None:
             nonlocal stopped, captured, truncated, failure, output_incomplete
+            nonlocal http_line_buffer
             for key, _ in selector.select(wait):
                 try:
                     data = os.read(key.fd, 65536)
@@ -131,6 +193,9 @@ def main() -> None:
                         output.write(kept)
                         output.flush()
                         captured += len(kept)
+                        http_line_buffer = _consume_http_output(
+                            http_summary, http_line_buffer, kept
+                        )
                     except OSError as exc:
                         failure = {"stage": "output", "error": type(exc).__name__}
                         output_incomplete = True
@@ -213,21 +278,29 @@ def main() -> None:
                 resource_usage["memory_peak_bytes"] = int(memory_peak.read_text())
             if pids_peak.exists():
                 resource_usage["pids_peak"] = int(pids_peak.read_text())
-        print(
-            json.dumps(
-                {
-                    "termination_reason": termination_reason,
-                    "resource_usage": resource_usage,
-                    "exit_code": exit_code,
-                    "timed_out": timed_out,
-                    "stopped": stopped,
-                    "output_chars": captured,
-                    "truncated": truncated,
-                    "output_incomplete": output_incomplete,
-                    "failure": failure,
-                    "cleanup_ms": round((time.monotonic() - cleanup_started) * 1000),
-                }
+        observed_http = _finalize_http_summary(
+            http_summary,
+            http_line_buffer,
+            incomplete=bool(
+                truncated or output_incomplete or timed_out or stopped or failure
             ),
+        )
+        completion = {
+            "termination_reason": termination_reason,
+            "resource_usage": resource_usage,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stopped": stopped,
+            "output_chars": captured,
+            "truncated": truncated,
+            "output_incomplete": output_incomplete,
+            "failure": failure,
+            "cleanup_ms": round((time.monotonic() - cleanup_started) * 1000),
+        }
+        if observed_http is not None:
+            completion["http_summary"] = observed_http
+        print(
+            json.dumps(completion),
             flush=True,
         )
         # A failed cleanup must retain its verifiable owner for the Runtime's

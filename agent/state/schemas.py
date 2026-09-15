@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator
+from .references import ContextRef, EvidenceRef
 
 FindingCategory = Literal[
     "service",
@@ -70,7 +71,7 @@ class ReportFindingInput(StrictModel):
     detail: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=0.5, ge=0, le=1)
     verification_status: VerificationStatus = "candidate"
-    evidence_refs: list[str] = Field(default_factory=list, max_length=50)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=50)
 
     @field_validator("evidence_refs")
     @classmethod
@@ -85,7 +86,7 @@ class WorkerTaskInput(StrictModel):
     task_key: str = Field(min_length=1, max_length=128)
     mode: Literal["execute", "review"] = "execute"
     success_criteria: list[str] = Field(default_factory=list, max_length=20)
-    context_refs: list[str] = Field(
+    context_refs: list[ContextRef] = Field(
         default_factory=list,
         max_length=50,
         description="Exact evidence_ref/report_ref values supplied by the parent. Required when a review targets a specific artifact; never invent references.",
@@ -102,11 +103,31 @@ class WorkerTaskInput(StrictModel):
 
 class WorkerUpdateInput(StrictModel):
     summary: str = Field(min_length=1, max_length=4_000)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=50)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=50)
     tested: list[str] = Field(default_factory=list, max_length=50)
     untested: list[str] = Field(default_factory=list, max_length=50)
     next_steps: list[str] = Field(default_factory=list, max_length=20)
     candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
+    verification_status: Literal["confirmed", "uncertain", "rejected"] | None = None
+    error_code: str | None = Field(default=None, max_length=96)
+    error_stage: str | None = Field(default=None, max_length=64)
+    rounds_used: int | None = Field(default=None, ge=0)
+    tool_calls: int | None = Field(default=None, ge=0)
+    blocked_by: str | None = Field(default=None, max_length=96)
+    new_evidence: bool | None = None
+    owned_resources_closed: bool | None = None
+
+
+class WorkerProgressInput(StrictModel):
+    """Model-facing progress fields; lifecycle metadata is never model-owned."""
+
+    summary: str = Field(min_length=1, max_length=4_000)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=50)
+    tested: list[str] = Field(default_factory=list, max_length=50)
+    untested: list[str] = Field(default_factory=list, max_length=50)
+    next_steps: list[str] = Field(default_factory=list, max_length=20)
+    candidate_flag: str | None = Field(default=None, min_length=1, max_length=4_096)
+    new_evidence: bool | None = None
 
 
 class AgentReportInput(WorkerUpdateInput):
@@ -115,10 +136,46 @@ class AgentReportInput(WorkerUpdateInput):
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 
+class CapabilityVerifierReportInput(StrictModel):
+    """Terminal contract exposed to capability-verifier model calls.
+
+    Runtime facts such as error codes, budgets and cleanup state are owned by
+    the lifecycle.  Keeping them out of this model prevents a verifier from
+    accidentally submitting fields that the state service must derive.
+    """
+
+    summary: str = Field(min_length=1, max_length=4_000)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=50)
+    tested: list[str] = Field(default_factory=list, max_length=50)
+    untested: list[str] = Field(default_factory=list, max_length=50)
+    next_steps: list[str] = Field(default_factory=list, max_length=20)
+    verification_status: Literal["confirmed", "uncertain", "rejected"] | None = None
+    status: Literal["completed", "blocked"] = "completed"
+
+
 class ReviewAgentReportInput(WorkerUpdateInput):
-    """Terminal report contract for read-only review Workers."""
+    """Internal terminal report shape retained for state-service callers."""
 
     status: Literal["completed", "blocked", "failed", "cancelled", "interrupted"]
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class ReviewWorkerReportInput(StrictModel):
+    """Model-facing terminal contract for read-only review Workers."""
+
+    summary: str = Field(min_length=1, max_length=4_000)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=50)
+    tested: list[str] = Field(default_factory=list, max_length=50)
+    untested: list[str] = Field(default_factory=list, max_length=50)
+    next_steps: list[str] = Field(default_factory=list, max_length=20)
+    status: Literal["completed", "blocked"] = "completed"
+
+
+class NormalWorkerReportInput(WorkerProgressInput):
+    """Model-facing terminal contract for ordinary Workers."""
+
+    status: Literal["completed", "blocked"] = "completed"
+    findings: list[ReportFindingInput] = Field(default_factory=list, max_length=50)
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 

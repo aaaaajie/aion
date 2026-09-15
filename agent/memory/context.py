@@ -189,6 +189,7 @@ def build_runtime_messages(
     recent_messages: Sequence[Mapping[str, Any]],
     max_tokens: int,
     recent_message_tokens: int,
+    protected_delivery_keys: frozenset[str] | set[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Rebuild a bounded message list after compaction or recovery."""
 
@@ -210,13 +211,18 @@ def build_runtime_messages(
         dict(initial_user_message),
     ]
     messages.extend(
-        _safe_recent_messages(recent_messages, max_tokens=recent_message_tokens)
+        _safe_recent_messages(recent_messages, max_tokens=recent_message_tokens, protected_delivery_keys=protected_delivery_keys)
     )
     while len(messages) > 4 and message_token_count(messages) > max_tokens:
         # Discard the oldest recovered interaction first.  Removing the tail
         # would preserve stale history while dropping the newest model/tool
         # exchange, which is the opposite of the role budget contract.
-        messages.pop(4)
+        groups = _message_groups(messages[4:])
+        removable = next((g for g in groups if not _protected(g, protected_delivery_keys)), None)
+        if removable is None:
+            break
+        for item in removable:
+            messages.remove(item)
     # Trim reconstructable projections only.  The fixed system contract and
     # current goal/Assignment are not historical context; silently clipping
     # either would turn a capacity problem into an incorrect model request.
@@ -258,31 +264,60 @@ def _restore_required_headings(content: str) -> str:
 
 
 def _safe_recent_messages(
-    messages: Sequence[Mapping[str, Any]], *, max_tokens: int
+    messages: Sequence[Mapping[str, Any]], *, max_tokens: int,
+    protected_delivery_keys: frozenset[str] | set[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     if not messages:
         return []
     tail: list[dict[str, Any]] = []
     tokens = 0
-    for message in reversed(messages):
-        value = dict(message)
-        message_tokens = message_token_count([value])
-        if tokens + message_tokens > max_tokens:
-            break
-        tail.append(value)
-        tokens += message_tokens
-    tail.reverse()
-    while tail and tail[0].get("role") == "tool":
-        tail.pop(0)
-    return tail
+    for group in reversed(_message_groups(messages)):
+        group_tokens = message_token_count(group)
+        if tokens + group_tokens <= max_tokens or _protected(group, protected_delivery_keys):
+            tail.insert(0, group)
+            tokens += group_tokens
+    return [dict(m) for group in tail for m in group]
+
+
+def _protected(group, delivery_keys):
+    for message in group:
+        if message.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(message.get("content") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("delivery_key") in delivery_keys:
+            return True
+    return False
+
+
+def _message_groups(messages):
+    groups, pending, expected = [], [], set()
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            pending = [m]
+            expected = {c["id"] for c in m["tool_calls"]}
+        elif m.get("role") == "tool":
+            if pending and m.get("tool_call_id") in expected:
+                pending.append(m)
+                expected.remove(m["tool_call_id"])
+                if not expected:
+                    groups.append(pending)
+                    pending = []
+        else:
+            pending, expected = [], set()
+            groups.append([m])
+    return groups
 
 
 def bounded_recent_messages(
-    messages: Sequence[Mapping[str, Any]], *, max_tokens: int
+    messages: Sequence[Mapping[str, Any]], *, max_tokens: int,
+    protected_delivery_keys: frozenset[str] | set[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Return the most recent complete interaction within a role budget."""
 
-    return _safe_recent_messages(messages, max_tokens=max_tokens)
+    return _safe_recent_messages(messages, max_tokens=max_tokens, protected_delivery_keys=protected_delivery_keys)
 
 
 def role_summary_threshold(profile: RoleContextProfile) -> int:

@@ -85,7 +85,7 @@ EXAMPLES = {
         {"hypothesis_id": "local-fixture", "covered_sequences": [1], "assessment": "new_information",
          "summary": "A known fixture produced its expected result.",
          "next_test": "Check whether the same conditions apply to the next result.",
-         "validation": {"conclusion_sequences": [1], "control_evidence_refs": ["evidence:replace-with-owned-evidence"],
+         "validation": {"conclusion_sequences": [1], "control_evidence_refs": ["evidence:evidence_" + "0" * 32],
                         "calibration_basis": "Replace with the observed implementation-validation basis."}},
     ],
     "worker_update": [

@@ -21,6 +21,15 @@ Separate initial response, redirect, Cookie changes and the later authenticated
 business control from page rendering. A stable 500 proves neither SQL execution
 nor its absence. A Cookie or redirect alone is not proof of a valid identity.
 
+For login or other authentication SQL hypotheses, keep the authentication branch
+separate from the page-rendering branch. After a complete input differential shows
+that the application reaches a different authentication state, reuse that exact
+request and session on one observed protected control before pursuing UNION output,
+database enumeration or sqlmap extraction. If the protected control confirms the
+new capability, stop detection and check the shortest evidence-supported goal first;
+use enumeration or sqlmap only as a bounded fallback when that target check fails
+to distinguish the remaining possibilities.
+
 ## Select a distinguishing check
 
 State the specific input-to-query hypothesis and expected observable difference.

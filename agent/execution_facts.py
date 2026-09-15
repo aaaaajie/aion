@@ -8,7 +8,7 @@ EXECUTION_TOOLS = frozenset({
     "pentest_service_probe", "pentest_ssh_exec", "pentest_jwt", "pentest_arjun",
 })
 HTTP_TASK_TOOLS = frozenset({"system_http_output", "system_http_stop", "system_http_response", "system_http_analyze"})
-TASK_TOOLS = frozenset({"system_shell", "system_task_start", "system_task_output", "system_task_stop"})
+TASK_TOOLS = frozenset({"system_shell", "system_task_start", "system_task_output", "system_task_stop", "system_network_discovery", "system_network_output", "system_network_stop"})
 TERMINAL = frozenset({"completed", "failed", "timeout", "stopped", "interrupted", "cancelled"})
 
 
@@ -38,6 +38,8 @@ def execution_fact(name, result, *, result_ref=None, result_chars=None):
         and not data.get("truncated") and not data.get("output_incomplete")
         and data.get("status") in TERMINAL
     )
+    if name == "system_network_output" and "page_end_cursor" in data:
+        fact["network_read"] = {key: data[key] for key in ("cursor", "next_cursor", "page_end_cursor", "read_scope", "is_terminal")}
     if fact.get("interaction_id"):
         fact["output_read"] = False
         if "page_end_cursor" in data and isinstance(data.get("results"), list):
@@ -124,6 +126,11 @@ def project_execution(rows, covered):
                 # Only task tools/native events can update these facts. Shell stdout is never parsed.
                 previous_status = task.get("status")
                 task.update(fact, sequence=seq)
+                page = fact.get("network_read")
+                if page and page["read_scope"]["default"] and delivered:
+                    task["ranges"] = merge_ranges(task.get("ranges", []), page["cursor"], page["next_cursor"])
+                    task["output_read"] = page["is_terminal"] and fully_read(task["ranges"], page["page_end_cursor"])
+                    task["output_read"] &= not fact.get("output_incomplete", False)
                 if not delivered:
                     task["output_read"] = False
                 if previous_status in TERMINAL and fact.get("status") in {"queued", "running"}:
@@ -186,6 +193,11 @@ def project_execution(rows, covered):
         "http_reads": [{"interaction_id": task["interaction_id"], "output_read": task["output_read"],
                         "list_coverage": list(task.get("list_coverage", {}).values())}
                        for task in tasks.values() if "interaction_id" in task],
+        # Keep completed/read tasks available to review validation.  The
+        # compact `tasks` view below intentionally omits them from the
+        # outstanding-work context, but a native completion receipt still
+        # needs to prove that its output was actually read.
+        "completed_tasks": list(tasks.values()),
         "tasks": [task for task in tasks.values()
                   if task.get("status") not in TERMINAL or not task.get("output_read")
                   or task.get("analysis_status") in {"queued", "running"}],

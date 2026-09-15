@@ -430,6 +430,8 @@ class HttpInteractionEngine:
         error_detail: str | None = None
         response_cookies: list[dict[str, Any]] = []
         last_body_byte: int | None = None
+        executed_request = {"availability": "unknown"}
+        set_cookie_count = 0
         try:
             client = await self._client_for(spec, agent_id)
             http_request = httpx.Request(
@@ -447,6 +449,19 @@ class HttpInteractionEngine:
                 follow_redirects=spec.follow_redirects,
                 cookies=cookies,
             )
+            from agent.experiment_records import request_snapshot, digest as input_digest
+            actual = (response.history[0] if response.history else response).request
+            try:
+                raw_body = actual.content
+            except httpx.RequestNotRead:
+                raw_body = None
+            actual_spec = {"method": actual.method, "url": str(actual.url), "headers": dict(actual.headers),
+                           "body": {"encoding": "utf-8", "value": raw_body.decode("utf-8", errors="replace"),
+                                    "text_lossless": raw_body.decode("utf-8", errors="replace").encode("utf-8") == raw_body,
+                                    "byte_length": len(raw_body), "sha256": hashlib.sha256(raw_body).hexdigest()}
+                           if raw_body is not None else {"availability": "unknown_streamed_body"}}
+            executed_request = {"availability": "captured", "request": request_snapshot(actual_spec),
+                                "input_digest": input_digest(actual_spec)}
             try:
                 status_code = response.status_code
                 initial_status_code = (response.history[0] if response.history else response).status_code
@@ -455,6 +470,7 @@ class HttpInteractionEngine:
                                   for hop in response.history]
                 final_url = str(response.url)
                 response_headers = dict(response.headers)
+                set_cookie_count = len(response.headers.get_list("set-cookie"))
                 set_cookie_headers = response.headers.get_list("set-cookie")
                 with partial_path.open("wb") as output:
                     async for chunk in response.aiter_bytes():
@@ -529,6 +545,9 @@ class HttpInteractionEngine:
         )
         result = {
             "type": "response",
+            "executed_request": executed_request,
+            "tool_version": f"httpx/{httpx.__version__}",
+            "set_cookie_count": set_cookie_count,
             "request_id": request.request_id,
             "ordinal": request.ordinal,
             "request_intent": spec.request_intent,
@@ -548,6 +567,7 @@ class HttpInteractionEngine:
             "redirect_chain": redirect_chain,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
             "body_bytes": body_bytes,
+            "body_preview": bytes(preview).decode("utf-8", errors="replace"),
             "content_length": self._int_header(response_headers.get("content-length")),
             "body_sha256": digest.hexdigest(),
             "line_count": line_count,

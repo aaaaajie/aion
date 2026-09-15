@@ -1,6 +1,11 @@
 """Small, explicit role tools; strategy lives with Chief and Solver."""
 
-from agent.state.schemas import AgentReportInput, ReviewAgentReportInput, WorkerUpdateInput
+from agent.state.schemas import (
+    CapabilityVerifierReportInput,
+    NormalWorkerReportInput,
+    ReviewWorkerReportInput,
+    WorkerProgressInput,
+)
 from agent.tooling import ToolSpec, ToolDispatchOutcome, AccessClaim
 from .models import (
     ReportQueryArguments,
@@ -23,10 +28,19 @@ from .policy import AgentPolicy
 
 
 class AgentControlTools:
-    def __init__(self, supervisor, *, agent_id: str, role: str, mode: str = "execute"):
+    def __init__(
+        self,
+        supervisor,
+        *,
+        agent_id: str,
+        role: str,
+        mode: str = "execute",
+        worker_profile: str | None = None,
+    ):
         self.supervisor = supervisor
         self.agent_id = agent_id
         self.mode = mode
+        self.worker_profile = worker_profile
         self.policy = AgentPolicy(role, mode)
 
     def tool_specs(self):
@@ -51,6 +65,7 @@ class AgentControlTools:
                 a.unique_codes,
                 reason=a.reason,
                 release_container=a.release_container,
+                reason_code=a.reason_code,
             )
 
         async def close(a):
@@ -171,15 +186,21 @@ class AgentControlTools:
             ),
             (
                 "worker_update",
-                WorkerUpdateInput,
+                WorkerProgressInput,
                 update,
                 "Publish evidence, tested and untested scope, and suggestions; continue the same task.",
             ),
             (
                 "worker_report",
-                ReviewAgentReportInput if self.mode == "review" else AgentReportInput,
+                (
+                    CapabilityVerifierReportInput
+                    if self.worker_profile == "capability_verifier"
+                    else ReviewWorkerReportInput
+                    if self.worker_profile == "stagnation" or self.mode == "review"
+                    else NormalWorkerReportInput
+                ),
                 report,
-                "Finish this explicit task with a terminal report. Review Workers report summary, evidence_refs, tested, untested and next_steps only; findings are not accepted in review mode.",
+                "Finish this explicit task with a terminal report. Capability verifier Workers report summary, evidence_refs, tested, untested, next_steps, verification_status and status only. Stagnation and review Workers report summary, evidence_refs, tested, untested, next_steps and status only; findings and candidate flags are not accepted.",
             ),
             (
                 "evidence_read",

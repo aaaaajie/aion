@@ -116,7 +116,7 @@ class AgentPolicy:
             raise ValueError("unknown Agent role or mode")
         self.role = role
         self.allowed_tools = (
-            READ_TOOL_NAMES | frozenset({"worker_update", "worker_report"})
+            READ_TOOL_NAMES | frozenset({"worker_report"})
             if role == "worker" and mode == "review"
             else ROLE_TOOL_NAMES[role]
         )

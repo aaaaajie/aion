@@ -18,12 +18,16 @@ from .resources import (
 )
 from .schemas import (
     AgentReportInput,
+    CapabilityVerifierReportInput,
+    NormalWorkerReportInput,
     ReviewAgentReportInput,
+    ReviewWorkerReportInput,
     CHALLENGE_DIRECTION_VALUES,
     CapabilityContext,
     ChallengeImport,
     ChallengeSyncResult,
     WorkerTaskInput,
+    WorkerProgressInput,
     WorkerUpdateInput,
     FindingInput,
 )

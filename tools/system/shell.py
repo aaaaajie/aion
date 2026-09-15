@@ -377,6 +377,9 @@ class LiveShellTask:
     cgroup_path: str | None = None
     recovery_task: asyncio.Task[None] | None = None
     stop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    experiment_input: dict[str, Any] = field(default_factory=dict)
+    experiment_scope: dict[str, Any] = field(default_factory=dict)
+    experiment_saved: bool = False
 
 
 class AgentShellClient:
@@ -770,6 +773,20 @@ class ShellTaskManager:
                 capture_limit=config["capture_limit"],
             )
             self._live[task_id] = live
+            from agent.experiment_records import shell_snapshot, digest
+            live.experiment_input = await asyncio.to_thread(shell_snapshot, command, working_directory)
+            live.experiment_scope = await self.service.capture_experiment_scope(self.run_id, agent_id)
+            try:
+                await self.service.record_experiment(self.run_id, agent_id, {
+                    "tool": "shell_command", "input_digest": digest(live.experiment_input),
+                    **live.experiment_scope,
+                    "batch_digest": digest(task_id), "requested_input": live.experiment_input,
+                    "executed_input": {"availability": "not_yet_executed"},
+                    "output": {"status": "queued"},
+                })
+            except Exception as exc:
+                await self.service.append_agent_event(self.run_id, agent_id, "experiment_persistence_failed",
+                    {"tool": "shell_command", "error": type(exc).__name__})
             live.monitor_task = asyncio.create_task(
                 self._monitor(live, timeout), name=f"aion-shell-{task_id}"
             )
@@ -965,7 +982,8 @@ class ShellTaskManager:
             task.truncated = bool(result["truncated"] or result["output_incomplete"])
             task.cleanup = {
                 key: result[key]
-                for key in ("output_incomplete", "failure", "cleanup_ms")
+                for key in ("output_incomplete", "failure", "cleanup_ms", "http_summary")
+                if key in result
             }
             task.cleanup["resources_released"] = (
                 result.get("failure", {}).get("stage") != "terminate"
@@ -1062,6 +1080,31 @@ class ShellTaskManager:
             task.persistence_error = exc
             raise
         task.persistence_error = None
+        if not task.experiment_saved:
+            from agent.experiment_records import digest, observation
+            from agent.state import CapabilityContext
+            try:
+                runtime = await self.service.get_agent_runtime(self.run_id, task.agent_id)
+                agent = runtime["agent"]
+                raw = task.output_path.read_text(errors="replace") if task.output_path.exists() else ""
+                artifact = await self.service.persist_evidence(self.run_id, CapabilityContext(
+                    run_id=self.run_id, agent_id=task.agent_id, role=agent["role"], unique_code=agent["unique_code"]),
+                    evidence_type="shell_output", source="shell_runtime", content=raw,
+                    metadata={"interpretation": "unstructured_tool_output_not_a_verified_claim"})
+                await self.service.record_experiment(self.run_id, task.agent_id, {
+                    "tool": "shell_command", "input_digest": digest(task.experiment_input),
+                    "execution_key": digest([task.agent_id, "task", task.task_id]),
+                    **task.experiment_scope,
+                    "batch_digest": digest(task.task_id),
+                    "requested_input": task.experiment_input,
+                    "executed_input": {"availability": "process_started", "command": task.experiment_input},
+                    "raw_evidence_ref": artifact["evidence_ref"],
+                    "output": observation({**task.terminal_result, "output": raw}),
+                })
+                task.experiment_saved = True
+            except Exception as exc:
+                await self.service.append_agent_event(self.run_id, task.agent_id, "experiment_persistence_failed",
+                    {"tool": "shell_command", "error": type(exc).__name__})
 
     async def _drain_pending_starts(self) -> None:
         if self._pending_starts:

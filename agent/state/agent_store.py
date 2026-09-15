@@ -137,17 +137,15 @@ class AgentStateStore:
             authoritative_view = {
                 "challenge": context["challenge"],
                 "tasks": context["tasks"],
-                "findings": context["findings"],
+                "experiments": context["experiments"],
                 "hints": context["hints"],
                 "assignment": {
                     key: agent.get(key)
                     for key in (
                         "agent_id",
                         "mode",
-                        "mission",
                         "task_key",
                         "context_refs",
-                        "success_criteria",
                     )
                 },
                 "resource_generation": agent["resource_generation"],
@@ -267,8 +265,6 @@ class AgentStateStore:
                 item.model_dump(mode="json")
                 for item in self.checkpoint.indeterminate_operations
             ]
-        if self.experiment_reviews.get("hypotheses"):
-            value["experiment_reviews"] = self.experiment_reviews
         if role == "chief":
             value.update(
                 {

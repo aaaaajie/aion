@@ -336,6 +336,8 @@ class _ReadOnlyStore:
         self.database_path = database_path.resolve()
         self.workspace_root = workspace_root
         self.run_id = run_id
+        from scripts.run_chain_metrics import ChainMetrics
+        self._chains = ChainMetrics()
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"file:{self.database_path.as_posix()}?mode=ro"
@@ -355,6 +357,9 @@ class _ReadOnlyStore:
                 raise LookupError("run_not_found")
 
             run = _run(run_row)
+            self._chains.worker_keys = {r[0]: r[1] or "" for r in connection.execute("SELECT agent_id,task_key FROM agents WHERE run_id=?", (self.run_id,))}
+            for event in connection.execute("SELECT sequence,event_type,payload,agent_id,created_at FROM state_events WHERE run_id=? AND sequence>? ORDER BY sequence", (self.run_id, self._chains.sequence)):
+                self._chains.record(event["event_type"], _json_load(event["payload"], {}), event["agent_id"], event["sequence"], event["created_at"])
             challenges = [
                 _challenge(row, run_row)
                 for row in connection.execute(
@@ -394,7 +399,7 @@ class _ReadOnlyStore:
             reports = [
                 _report(row)
                 for row in connection.execute(
-                    "SELECT * FROM reports WHERE run_id = ? ORDER BY sequence DESC LIMIT 500",
+                    "SELECT * FROM reports WHERE run_id = ? AND (report_type != 'worker' OR status = 'working' OR json_extract(payload,'$.system_finalized') = 1) ORDER BY sequence DESC LIMIT 500",
                     (self.run_id,),
                 )
             ][::-1]
@@ -471,6 +476,7 @@ class _ReadOnlyStore:
                 "container_capacity": container_capacity_summary(challenges),
                 "agents": agents,
                 "background_tasks": _redact(task_summaries(connection, self.run_id)),
+                "chain_metrics": _redact(self._chains.result()),
                 "token_usage": token_usage,
                 "findings": findings,
                 "credentials": credentials,

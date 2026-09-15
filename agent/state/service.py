@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +86,26 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def shared_tool_output(content: str, *, raw_text: bool = False) -> str:
+    """Project technical output, then paginate it; never slice JSON into fake EOF."""
+    from agent.experiment_records import observation, portable, safe_text
+    if not raw_text:
+        try:
+            value = json.loads(content)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, dict):
+            data = value.get("data", value)
+            data = data if isinstance(data, dict) else {}
+            artifacts = {k: portable(data[k]) for k in ("output", "stdout", "stderr", "raw_response", "body", "content")
+                         if isinstance(data.get(k), (str, dict, list))}
+            return json.dumps({"output": observation(value),
+                "raw_artifacts": artifacts,
+                "interpretation": "Raw tool/target text is not an Agent-validated conclusion.",
+                "input_availability": "Use the linked experiment; no actual request inferred from tool summaries."}, ensure_ascii=False)
+    return safe_text(content)
+
+
 def _fingerprint(category: str, summary: str, detail: Mapping[str, Any]) -> str:
     normalized = json.dumps(
         {
@@ -104,11 +123,13 @@ def _fingerprint(category: str, summary: str, detail: Mapping[str, Any]) -> str:
 
 from .agents import AgentStateMixin
 from .observation import SolverObservationState
+from .experiments import ExperimentState
 from .solver_review import SolverReviewState
+from .adoption import ProgressAdoptionState
 from .stagnation import StagnationState
 
 
-class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, StagnationState):
+class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, StagnationState, ExperimentState, ProgressAdoptionState):
     """All domain mutations for a run go through this service."""
 
     def __init__(
@@ -256,22 +277,10 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
         *,
         offset: int = 0,
         limit_chars: int = 8_000,
+        portable: bool = False,
     ) -> dict[str, Any]:
-        prefix = "evidence:evidence_"
-        suffix = evidence_ref.removeprefix(prefix)
-        if (
-            not evidence_ref.startswith(prefix)
-            or len(suffix) != 32
-            or any(c not in "0123456789abcdef" for c in suffix)
-        ):
-            raise StateError(
-                "invalid_evidence_ref",
-                "Use the exact evidence_ref returned by the tool: "
-                "evidence:evidence_<32 lowercase hexadecimal characters>. "
-                "A bare evidence ID is not a reference.",
-                status_code=422,
-            )
-        evidence_id = evidence_ref.removeprefix("evidence:")
+        from .references import parse_reference
+        _, evidence_id = parse_reference(evidence_ref, expected="evidence")
         async with self.db.sessions() as session:
             caller = await self._authorize(
                 session,
@@ -285,7 +294,9 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
             allowed = (
                 allowed and row is not None and row.unique_code == caller.unique_code
             )
-            if not allowed or row is None:
+            if row is None:
+                raise StateError("evidence_not_found", "The referenced Evidence does not exist", status_code=404)
+            if not allowed:
                 raise StatePermission(
                     "evidence_not_accessible",
                     "Evidence is not accessible in this Agent scope",
@@ -295,7 +306,7 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                 "evidence_type": row.evidence_type,
                 "source": row.source,
                 "sha256": row.content_sha256,
-                "size_chars": row.size_chars,
+            "size_chars": row.size_chars,
             }
             owner_id = row.agent_id
         path = self._evidence_directory(run_id, owner_id) / storage_name
@@ -307,10 +318,17 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                 "Evidence content is unavailable",
                 status_code=500,
             ) from exc
+        portable = portable or (context.role == "worker" and owner_id != context.agent_id)
+        if portable:
+            if row.evidence_type != "experiment":
+                content = shared_tool_output(content, raw_text=row.evidence_type == "shell_output")
         end = min(len(content), offset + limit_chars)
         return {
             "evidence_ref": evidence_ref,
             **metadata,
+            "portable": portable,
+            "view_size_chars": len(content),
+            "interpretation": "Runtime experiment" if row.evidence_type == "experiment" else "Raw tool output; not a verified claim",
             "offset": offset,
             "content": content[offset:end],
             "next_offset": end if end < len(content) else None,
@@ -2579,6 +2597,8 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                         ReportRecord.run_id == run_id,
                         ReportRecord.sequence > after_sequence,
                         ReportRecord.parent_id == agent.agent_id,
+                        or_(ReportRecord.report_type != "worker", ReportRecord.status == "working",
+                            ReportRecord.payload["system_finalized"].as_boolean() == True),
                     )
                     .order_by(ReportRecord.sequence)
                     .limit(max_reports)
@@ -3412,6 +3432,11 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
                     "skill_discovery_failed",
                     "skill_discovery_fallback",
                     "skill_candidate_presented",
+                    "capability_decision_missed",
+                    "capability_verifier_dispatched",
+                    "capability_verifier_dispatch_failed",
+                    "capability_verifier_finished",
+                    "agent_resource_cleanup_idempotent",
                 }
                 dirty_agent_ids = {
                     item.agent_id
@@ -4255,6 +4280,17 @@ class StateService(AgentStateMixin, SolverObservationState, SolverReviewState, S
             "resource_generation",
         )
         data = {field: _json_value(getattr(item, field)) for field in fields}
+        if item.role == "worker":
+            task_key = str(item.task_key or "")
+            data["worker_profile"] = (
+                "capability_verifier"
+                if task_key.startswith("capability-verifier:")
+                else "stagnation"
+                if task_key.startswith("stagnation:")
+                else "review"
+                if item.mode == "review"
+                else "normal"
+            )
         if include_runtime:
             data.update(
                 initial_prompt=item.initial_prompt,

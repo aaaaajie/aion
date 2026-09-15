@@ -1,10 +1,85 @@
 """Evidence-scoped reviews projected from the event journal."""
 
+from typing import Any
+
 from sqlalchemy import select, text
 
-from agent.execution_facts import project_execution, execution_fact, TASK_TOOLS
+from agent.execution_facts import (
+    project_execution,
+    execution_fact,
+    TASK_TOOLS,
+)
 from agent.state.errors import StatePermission
-from agent.state.models import ChallengeRecord, StateEventRecord
+from agent.state.models import ChallengeRecord, StateEventRecord, EvidenceRecord
+
+
+REVIEW_EXECUTION_EVENTS = frozenset(
+    {
+        "tool_result",
+        "shell_task_finished",
+        "network_task_status_changed",
+        "http_interaction_status_changed",
+    }
+)
+
+
+def _native_receipt_is_valid(
+    row: StateEventRecord, execution: dict[str, Any]
+) -> bool:
+    """Validate a durable task completion without inventing model output."""
+
+    payload = row.payload or {}
+    status = payload.get("status") or payload.get("execution_status")
+    if status != "completed" or payload.get("timed_out") or payload.get("truncated"):
+        return False
+    if payload.get("output_incomplete") or payload.get("outcome_unknown"):
+        return False
+    execution_tasks = execution.get("completed_tasks") or execution.get("tasks", [])
+    task_id = payload.get("task_id")
+    interaction_id = payload.get("interaction_id")
+    if task_id is not None:
+        task = next(
+            (item for item in execution_tasks if item.get("task_id") == task_id),
+            None,
+        )
+        if task is None or task.get("output_read") is not True:
+            return False
+    elif interaction_id is not None:
+        task = next(
+            (
+                item
+                for item in execution_tasks
+                if item.get("interaction_id") == interaction_id
+            ),
+            None,
+        )
+        if task is None or task.get("output_read") is not True:
+            return False
+    else:
+        return False
+    if row.event_type == "shell_task_finished":
+        return payload.get("exit_code") in (None, 0)
+    if row.event_type == "network_task_status_changed":
+        return payload.get("error_code") in (None, "")
+    if row.event_type == "http_interaction_status_changed":
+        return payload.get("analysis_status") not in {"failed", "timeout"}
+    return False
+
+
+def _review_receipt_is_valid(row: StateEventRecord, execution: dict[str, Any]) -> None:
+    if row.event_type == "tool_result":
+        if row.payload.get("replayed"):
+            raise StatePermission(
+                "review_result_invalid",
+                "Validated conclusions need fresh, current tool-result sequences",
+            )
+        validate_execution(row, execution)
+        return
+    if not _native_receipt_is_valid(row, execution):
+        raise StatePermission(
+            "review_execution_inconclusive",
+            "Incomplete execution cannot be validated",
+        )
 
 
 def project_reviews(rows, *, revoked_sequences=()):
@@ -93,7 +168,7 @@ def validate_execution(result, execution):
         result.payload.get("tool_name"), output)
     if not fact:
         return
-    incomplete = {"running", "queued", "timeout", "stopped", "interrupted", "cancelled"}
+    incomplete = {"running", "queued", "failed", "timeout", "stopped", "interrupted", "cancelled"}
     invalid = (fact.get("outcome_unknown") or fact.get("complete") is False
                or fact.get("timed_out") or fact.get("output_incomplete") or fact.get("truncated")
                or fact.get("status") in incomplete or fact.get("execution_status") in incomplete)
@@ -115,7 +190,10 @@ def validate_execution(result, execution):
         invalid |= any(item.get("interaction_id") == interaction and item.get("status") in incomplete
                        for item in execution["tasks"])
     elif result.payload.get("tool_name") in TASK_TOOLS:
-        invalid |= not fact.get("output_read")
+        if fact.get("network_read"):
+            invalid |= not any(item.get("task_id") == fact.get("task_id") and item.get("output_read") for item in execution.get("completed_tasks", []))
+        else:
+            invalid |= not fact.get("output_read")
         invalid |= any(fact.get("task_id") and item.get("task_id") == fact.get("task_id") and not item.get("output_read")
                        for item in execution["tasks"])
     if invalid:
@@ -214,21 +292,29 @@ class SolverReviewState:
                            or not calibrations[seq]["validation"] for seq in calibration_sequences):
                         raise StatePermission("review_calibration_invalid", "Calibration must be validated, current and owned by this Solver")
                     results = (await session.scalars(select(StateEventRecord).where(
-                        StateEventRecord.run_id == run_id, StateEventRecord.agent_id == agent.agent_id,
-                        StateEventRecord.sequence.in_(conclusions), StateEventRecord.event_type == "tool_result",
+                        StateEventRecord.run_id == run_id,
+                        StateEventRecord.agent_id == agent.agent_id,
+                        StateEventRecord.sequence.in_(conclusions),
+                        StateEventRecord.event_type.in_(REVIEW_EXECUTION_EVENTS),
                     ))).all()
                     if (len(results) != len(set(conclusions)) or set(conclusions) & revoked
-                        or any(row.payload.get("replayed") for row in results)
                         or (review.environment_dependent and any(row.sequence < state["execution"]["invalidated_at_sequence"] for row in results))):
-                        raise StatePermission("review_result_invalid", "Validated conclusions need fresh, current tool-result sequences")
+                        raise StatePermission("review_result_invalid", "Validated conclusions need fresh, current execution sequences")
                     for result in results:
-                        validate_execution(result, state["execution"])
+                        _review_receipt_is_valid(result, state["execution"])
                     receipts = (await session.scalars(select(StateEventRecord).where(
                         StateEventRecord.run_id == run_id,
                         StateEventRecord.agent_id == agent.agent_id,
                         StateEventRecord.event_type == "tool_result",
                     ).order_by(StateEventRecord.sequence))).all()
                     for ref in validation.control_evidence_refs:
+                        from agent.experiment_records import execution_keys
+                        evidence_row = await session.get(EvidenceRecord, ref.removeprefix("evidence:"))
+                        execution_key = None
+                        if (evidence_row is not None and evidence_row.agent_id == agent.agent_id
+                            and evidence_row.evidence_type == "experiment"
+                            and evidence_row.metadata_json.get("resource_generation") == agent.resource_generation):
+                            execution_key = evidence_row.metadata_json.get("execution_key")
                         matches = []
                         for receipt in receipts:
                             output = receipt.payload.get("result")
@@ -238,11 +324,11 @@ class SolverReviewState:
                             evidence_refs = output.get("evidence_refs", [])
                             if isinstance(data, dict):
                                 evidence_refs = evidence_refs + data.get("evidence_refs", [])
-                            if ref in evidence_refs:
+                            if ref in evidence_refs or (execution_key and execution_key in execution_keys(agent.agent_id, output)):
                                 matches.append(receipt)
                         if not matches:
                             raise StatePermission("review_control_invalid", "Control needs an owned execution receipt")
-                        receipt = matches[0]
+                        receipt = matches[-1] if execution_key else matches[0]
                         fact = receipt.payload.get("execution_fact") or execution_fact(
                             receipt.payload.get("tool_name"), receipt.payload.get("result"))
                         if (receipt.sequence in revoked or receipt.payload.get("replayed")
@@ -261,6 +347,9 @@ class SolverReviewState:
                         StateEventRecord.event_type == "solver_observation_snapshot"))
                     if snapshot is None:
                         raise StatePermission("review_observation_invalid", "Assessment must reference an owned observation snapshot")
+                    if (snapshot.payload.get("generation") != agent.resource_generation
+                        or snapshot.payload.get("strategy_revision") != challenge.strategy_revision):
+                        raise StatePermission("review_observation_stale", "Observation belongs to an expired execution scope")
                 prior = (await session.scalars(select(StateEventRecord).where(
                     StateEventRecord.run_id == run_id,
                     StateEventRecord.agent_id == agent.agent_id,

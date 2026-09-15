@@ -105,6 +105,11 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+@dataclass
+class CapturedProbeResponse(ProbeResponse):
+    executed_request: dict[str, Any] = field(default_factory=lambda: {"availability": "unknown"})
+
+
 @dataclass(frozen=True)
 class PathProbeOptions:
     profile: str
@@ -403,6 +408,7 @@ class PathProbeEngine:
         body_dir: Path,
         session_cookies: list[dict[str, Any]],
         on_match: Callable[[PathProbeMatch], Awaitable[None]],
+        on_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_progress: Callable[[int, int, int, int], Awaitable[None]] | None = None,
         on_estimate: Callable[[int], Awaitable[None]] | None = None,
         stop_requested: Callable[[], bool] | None = None,
@@ -431,6 +437,7 @@ class PathProbeEngine:
                 root_count=root_count,
                 body_dir=body_dir,
                 on_match=on_match,
+                on_response=on_response,
                 on_progress=on_progress,
                 on_estimate=on_estimate,
                 stop_requested=stop_requested,
@@ -463,6 +470,7 @@ class PathProbeEngine:
         root_count: int,
         body_dir: Path,
         on_match: Callable[[PathProbeMatch], Awaitable[None]],
+        on_response: Callable[[dict[str, Any]], Awaitable[None]] | None,
         on_progress: Callable[[int, int, int, int], Awaitable[None]] | None,
         on_estimate: Callable[[int], Awaitable[None]] | None,
         stop_requested: Callable[[], bool] | None,
@@ -499,6 +507,8 @@ class PathProbeEngine:
 
             async def requester(path: str) -> ProbeResponse:
                 response = await self._request(client, path)
+                if on_response:
+                    await on_response(self._experiment_response(response, path, ordinal=None, phase="calibration"))
                 if response.outcome != "response":
                     raise PathProbeCalibrationError(
                         response.error or "calibration_request_failed"
@@ -556,8 +566,20 @@ class PathProbeEngine:
                 if is_stopped():
                     return
                 full_path = f"{directory}{job.path}" if directory else job.path
-                response = await self._request(client, full_path)
                 counters.started += 1
+                try:
+                    response = await self._request(client, full_path)
+                except asyncio.CancelledError:
+                    if on_response:
+                        await on_response({"type": "experiment_response", "ordinal": job.ordinal,
+                            "request_id": job.request_id, "phase": "candidate", "path": full_path,
+                            "initial_url": self._join_url(full_path), "outcome": "cancelled",
+                            "body_complete": False, "outcome_unknown": True,
+                            "requested_input": {**self.options.to_plan(), "url": self._join_url(full_path)},
+                            "executed_request": {"availability": "unknown"}})
+                    raise
+                if on_response:
+                    await on_response(self._experiment_response(response, full_path, ordinal=job.ordinal, phase="candidate", request_id=job.request_id))
                 if response.outcome != "response":
                     counters.errors[response.outcome] += 1
                     counters.consecutive_errors += 1
@@ -601,6 +623,11 @@ class PathProbeEngine:
                 return
             passed_directories.add(subdirectory)
             total_requests += root_count
+            if on_response:
+                with plan_path.open(encoding="utf-8") as source:
+                    members = [{"path": subdirectory + json.loads(line)["path"]} for line in source]
+                await on_response({"type": "experiment_expansion", "members": members,
+                                   "prefix": subdirectory, "estimated_requests": root_count})
             if on_estimate is not None:
                 await on_estimate(
                     total_requests
@@ -724,6 +751,12 @@ class PathProbeEngine:
                 auth=auth,
             ) as response:
                 status = response.status_code
+                from agent.experiment_records import digest, request_snapshot
+                actual = (response.history[0] if response.history else response).request
+                actual_spec = {"method": actual.method, "url": str(actual.url),
+                               "headers": dict(actual.headers), "body": None}
+                executed_request = {"availability": "captured", "request": request_snapshot(actual_spec),
+                                    "input_digest": digest(actual_spec)}
                 final_url = str(response.url)
                 response_headers = dict(response.headers)
                 body = bytearray()
@@ -764,7 +797,7 @@ class PathProbeEngine:
         line_count = body_bytes.count(b"\n")
         if body_bytes and body_bytes[-1:] != b"\n":
             line_count += 1
-        return ProbeResponse(
+        return CapturedProbeResponse(
             url=url,
             path=full_path,
             status=status,
@@ -778,10 +811,21 @@ class PathProbeEngine:
             final_url=final_url,
             body_complete=body_complete,
             line_count=line_count,
+            executed_request=executed_request,
         )
 
+    @staticmethod
+    def _experiment_response(response, path, *, ordinal, phase, request_id=None):
+        return {"type": "experiment_response", "ordinal": ordinal, "path": path, "phase": phase, "request_id": request_id,
+                "outcome": response.outcome, "status_code": response.status,
+                "initial_url": response.url, "final_url": response.final_url,
+                "body_bytes": len(response.body), "body_sha256": hashlib.sha256(response.body).hexdigest(),
+                "body_complete": response.body_complete, "body_preview": response.body[:2000].decode("utf-8", errors="replace"),
+                "elapsed_ms": int(response.elapsed * 1000), "executed_request": response.executed_request,
+                "headers": response.headers}
+
     def _error_response(self, url: str, full_path: str, outcome: str, error: str) -> ProbeResponse:
-        return ProbeResponse(
+        return CapturedProbeResponse(
             url=url,
             path=full_path,
             status=None,

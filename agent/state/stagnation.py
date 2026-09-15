@@ -14,7 +14,7 @@ from agent.config import StagnationPolicy
 from .agents import payload_digest
 from .clock import aware
 from .errors import StateConflict, StatePermission
-from .models import AdmissionRecord, AgentRecord, ChallengeRecord, EvidenceRecord
+from .models import AdmissionRecord, AgentRecord, ChallengeRecord, ReportRecord, StateEventRecord, OperationRecord
 from .resources import container_slot_occupied
 from .schemas import WorkerTaskInput
 
@@ -30,7 +30,9 @@ class StagnationState:
         async with self._lock:
             async with self.db.sessions.begin() as session:
                 await session.execute(text("BEGIN IMMEDIATE"))
-                await self._require_run(session, run_id)
+                run = await self._require_run(session, run_id)
+                if run.status != "active":
+                    return []
                 challenges = (
                     await session.scalars(
                         select(ChallengeRecord).where(
@@ -78,6 +80,19 @@ class StagnationState:
                         "challenge_version": challenge.version,
                         "stalled_seconds": int(elapsed),
                     }
+                    if elapsed >= policy.rotate_after_seconds or challenge.stagnation_stage == "rotation_due":
+                        if challenge.stagnation_stage != "rotation_due":
+                            challenge.stagnation_stage = "rotation_due"
+                            challenge.last_intervention_at = now
+                            challenge.intervention_count += 1
+                            challenge.version += 1
+                            await self._event(
+                                session, run_id, "solver_stagnation_rotation_requested",
+                                {**common, "threshold_seconds": policy.rotate_after_seconds},
+                                agent_id=solver.agent_id,
+                            )
+                        actions.append({"kind": "rotate", **common, "challenge_version": challenge.version})
+                        continue
                     if (
                         challenge.stagnation_stage == "normal"
                         and elapsed >= policy.review_after_seconds
@@ -116,6 +131,11 @@ class StagnationState:
                                 "event_sequence": sequence,
                             }
                         )
+                        if elapsed >= policy.alternate_after_seconds:
+                            actions.append({"kind": "alternate_worker", **common,
+                                            "strategy_revision": challenge.strategy_revision,
+                                            "challenge_version": challenge.version,
+                                            "threshold_seconds": policy.alternate_after_seconds})
                     elif (
                         challenge.stagnation_stage == "review_due"
                         and elapsed >= policy.alternate_after_seconds
@@ -125,61 +145,6 @@ class StagnationState:
                                 "kind": "alternate_worker",
                                 **common,
                                 "threshold_seconds": policy.alternate_after_seconds,
-                            }
-                        )
-                    elif (
-                        challenge.stagnation_stage == "alternate_worker"
-                        and elapsed >= policy.rotate_after_seconds
-                    ):
-                        challenge.stagnation_stage = "rotation_due"
-                        challenge.last_intervention_at = now
-                        challenge.intervention_count += 1
-                        challenge.version += 1
-                        await self._event(
-                            session,
-                            run_id,
-                            "solver_stagnation_rotation_requested",
-                            {**common, "threshold_seconds": policy.rotate_after_seconds},
-                            agent_id=solver.agent_id,
-                        )
-                        actions.append(
-                            {
-                                "kind": "rotate",
-                                **common,
-                                "challenge_version": challenge.version,
-                            }
-                        )
-                    elif (
-                        challenge.stagnation_stage == "review_due"
-                        and elapsed >= policy.rotate_after_seconds
-                    ):
-                        challenge.stagnation_stage = "rotation_due"
-                        challenge.last_intervention_at = now
-                        challenge.intervention_count += 1
-                        challenge.version += 1
-                        await self._event(
-                            session,
-                            run_id,
-                            "solver_stagnation_rotation_requested",
-                            {**common, "threshold_seconds": policy.rotate_after_seconds},
-                            agent_id=solver.agent_id,
-                        )
-                        actions.append(
-                            {
-                                "kind": "rotate",
-                                **common,
-                                "challenge_version": challenge.version,
-                            }
-                        )
-                    elif challenge.stagnation_stage == "rotation_due":
-                        # The durable marker is intentionally retryable: a
-                        # process may stop after recording the request and
-                        # before cleanup/release completes.
-                        actions.append(
-                            {
-                                "kind": "rotate",
-                                **common,
-                                "challenge_version": challenge.version,
                             }
                         )
         if actions:
@@ -198,64 +163,36 @@ class StagnationState:
 
         challenge = (await self.get_overview(run_id, unique_code=unique_code))["challenges"][0]
         async with self.db.sessions() as session:
-            rows = (
-                await session.scalars(
-                    select(EvidenceRecord)
-                    .where(
-                        EvidenceRecord.run_id == run_id,
-                        EvidenceRecord.unique_code == unique_code,
-                    )
-                    .order_by(EvidenceRecord.created_at.desc())
-                    .limit(30)
-                )
-            ).all()
-        solver = await self._find_solver_for_challenge(run_id, unique_code)
-        review_state = (
-            await self.solver_review_state(run_id, solver["agent_id"])
-            if solver
-            else {"hypotheses": {}, "revoked_sequences": []}
-        )
-        directions = []
-        for hypothesis_id, value in review_state.get("hypotheses", {}).items():
-            review = value.get("review", {})
-            directions.append(
-                {
-                    "hypothesis_id": hypothesis_id,
-                    "status": review.get("direction_status", "open"),
-                    "assessment": review.get("assessment"),
-                    "summary": str(review.get("summary") or ""),
-                    "next_test": str(review.get("next_test") or ""),
-                    "validation": review.get("validation"),
-                    "review_sequence": value.get("sequence"),
-                    "strategy_revision": review.get("strategy_revision", 1),
-                    "revoked": value.get("revoked", False),
-                }
-            )
+            hint_reports = (await session.scalars(select(ReportRecord).where(
+                ReportRecord.run_id == run_id, ReportRecord.unique_code == unique_code,
+                ReportRecord.report_type == "hint",
+            ).order_by(ReportRecord.sequence))).all()
+            hints = [{"report_ref": f"report:{row.report_id}", "sequence": row.sequence,
+                      "hint": row.payload.get("hint")} for row in hint_reports]
+            # A crash after the remote operation commits may precede report delivery.
+            if not hints:
+                operations = (await session.scalars(select(OperationRecord).where(
+                    OperationRecord.run_id == run_id, OperationRecord.unique_code == unique_code,
+                    OperationRecord.operation_type == "benchmark_get_hint",
+                    OperationRecord.status == "completed",
+                ))).all()
+                hints = [{"operation_id": row.operation_id, "hint": row.result_payload["data"]["hint"]}
+                         for row in operations if isinstance(row.result_payload, dict)
+                         and isinstance(row.result_payload.get("data"), dict)
+                         and row.result_payload["data"].get("hint") is not None]
+        from agent.experiment_records import challenge_facts
+        facts = await self.experiment_context(run_id, unique_code)
         return {
-            "challenge": challenge,
+            "challenge": challenge_facts(challenge),
             "strategy_revision": challenge["strategy_revision"],
-            "evidence_refs": [f"evidence:{row.evidence_id}" for row in rows],
-            "directions": directions[-12:],
-            "acquired_capabilities": review_state.get("acquired_capabilities", []),
-            "weakly_rejected": [
-                item["hypothesis_id"] for item in directions
-                if item["status"] == "weakly_rejected" and not item["revoked"]
-            ],
-            "dead": [
-                item["hypothesis_id"] for item in directions
-                if item["status"] == "dead" and not item["revoked"]
-            ],
-            "facts": [
-                "Only cited evidence and completed task results are authoritative.",
-                "A weakly rejected direction may be rechecked with a changed assumption.",
-                "A dead direction requires new evidence before it may be reopened.",
-            ],
+            "hints": hints,
+            **facts,
         }
 
     async def reset_strategy_for_resume(
-        self, run_id: str, unique_code: str, solver_id: str
+        self, run_id: str, unique_code: str, solver_id: str, *, recovery: bool = False
     ) -> dict[str, Any]:
-        """Resume a paused challenge with the same Solver identity and revision."""
+        """Create one fresh strategy per pause while retaining the Solver identity."""
 
         async with self._lock:
             async with self.db.sessions.begin() as session:
@@ -268,7 +205,33 @@ class StagnationState:
                     or solver.unique_code != unique_code
                 ):
                     raise StatePermission("solver_required", "Challenge Solver was not found")
+                pause = await session.scalar(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id,
+                    StateEventRecord.event_type == "challenge_paused",
+                    StateEventRecord.payload["unique_code"].as_string() == unique_code,
+                ).order_by(StateEventRecord.sequence.desc()).limit(1))
+                reset = await session.scalar(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id, StateEventRecord.agent_id == solver_id,
+                    StateEventRecord.event_type == "solver_strategy_reset",
+                    StateEventRecord.payload["trigger"].as_string() == "challenge_resumed",
+                ).order_by(StateEventRecord.sequence.desc()).limit(1))
+                pause_reason_code = (
+                    pause.payload.get("reason_code")
+                    if pause
+                    else None
+                )
+                is_stagnation_pause = pause_reason_code in {
+                    "stagnation_manual",
+                    "stagnation_timeout",
+                } or (pause and pause.payload.get("reason") == "stagnation_timeout")
+                if recovery and (not pause or not is_stagnation_pause):
+                    return self._challenge_dict(challenge)
+                if pause and reset and reset.payload.get("pause_sequence") == pause.sequence:
+                    return self._challenge_dict(challenge)
                 challenge.strategy_revision += 1
+                # Container start may already have populated active_since before
+                # start_challenge runs. Grant the resumed strategy a fresh clock once.
+                challenge.last_progress_at = self.clock()
                 challenge.stagnation_stage = "normal"
                 challenge.alternate_worker_id = None
                 challenge.last_intervention_at = self.clock()
@@ -283,11 +246,82 @@ class StagnationState:
                         "solver_id": solver_id,
                         "strategy_revision": challenge.strategy_revision,
                         "trigger": "challenge_resumed",
+                        "pause_sequence": pause.sequence if pause else None,
+                        "pause_reason": pause.payload.get("reason") if pause else None,
+                        "pause_reason_code": pause_reason_code,
                     },
                     agent_id=solver_id,
                 )
         await self.signal_challenge_changes(run_id, [unique_code], sequence)
         return self._challenge_dict(challenge)
+
+    async def claim_resume_hint(self, run_id: str, unique_code: str, solver_id: str) -> dict[str, Any] | None:
+        """Persist the attempt before crossing the remote Hint boundary."""
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                challenge = await self._require_challenge(session, run_id, unique_code)
+                if challenge.is_completed or challenge.work_status != "active":
+                    return None
+                reset = await session.scalar(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id, StateEventRecord.agent_id == solver_id,
+                    StateEventRecord.event_type == "solver_strategy_reset",
+                    StateEventRecord.payload["trigger"].as_string() == "challenge_resumed",
+                ).order_by(StateEventRecord.sequence.desc()).limit(1))
+                if not reset or (
+                    reset.payload.get("pause_reason_code") not in {
+                        "stagnation_manual",
+                        "stagnation_timeout",
+                    }
+                    and reset.payload.get("pause_reason") != "stagnation_timeout"
+                ):
+                    return None
+                revision = challenge.strategy_revision
+                if reset.payload.get("strategy_revision") != revision:
+                    return None
+                events = (await session.scalars(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id, StateEventRecord.agent_id == solver_id,
+                    StateEventRecord.event_type.in_(["solver_resume_hint_decision", "solver_resume_hint_result"]),
+                    StateEventRecord.payload["strategy_revision"].as_integer() == revision,
+                ))).all()
+                if any(row.event_type == "solver_resume_hint_result" for row in events):
+                    return None
+                operations = (await session.scalars(select(OperationRecord).where(
+                    OperationRecord.run_id == run_id, OperationRecord.unique_code == unique_code,
+                    OperationRecord.operation_type == "benchmark_get_hint",
+                ))).all()
+                prior_hint_events = (await session.scalars(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id, StateEventRecord.agent_id == solver_id,
+                    StateEventRecord.event_type.in_(["solver_resume_hint_decision", "solver_resume_hint_result"]),
+                ))).all()
+                resolved = {row.payload["strategy_revision"] for row in prior_hint_events
+                            if row.event_type == "solver_resume_hint_result"
+                            and row.payload.get("status") in {"failed", "succeeded", "reused"}}
+                pending = any(row.payload.get("decision") == "request"
+                              and row.payload["strategy_revision"] not in resolved for row in prior_hint_events)
+                uncertain = any(row.status in {"started", "indeterminate"} or
+                                row.result_code == "hint_response_unavailable" for row in operations)
+                failed_attempt = bool(events) and any(
+                    row.status == "failed" and row.started_sequence > min(event.sequence for event in events)
+                    for row in operations
+                )
+                if uncertain:
+                    decision = "uncertain"
+                elif challenge.hint_requested:
+                    decision = "reused"
+                elif failed_attempt:
+                    decision = "failed"
+                elif pending or events:
+                    decision = "uncertain"
+                else:
+                    decision = "request"
+                payload = {"unique_code": unique_code, "strategy_revision": revision,
+                           "reason": reset.payload.get("pause_reason") or "stagnation_timeout",
+                           "reason_code": reset.payload.get("pause_reason_code") or "stagnation_timeout",
+                           "decision": decision}
+                if not events:
+                    await self._event(session, run_id, "solver_resume_hint_decision", payload, agent_id=solver_id)
+                return payload
 
     async def _find_solver_for_challenge(
         self, run_id: str, unique_code: str
@@ -329,7 +363,6 @@ class StagnationState:
                     "strategy_revision",
                 )
             },
-            "directions": packet["directions"][-4:],
             "evidence_refs": packet["evidence_refs"][:20],
         }
         worker_packet["challenge"]["description"] = str(
@@ -339,9 +372,11 @@ class StagnationState:
             "Independently re-evaluate this challenge from a different direction. "
             "Do not assume the Solver's conclusions are correct and do not repeat "
             "listed requests. Prefer a different entry point, parameter source, or "
-            "trust boundary. Return tested, evidence_refs, untested and next_steps "
+            "trust boundary. Do not reuse handles copied from another Agent; read "
+            "the cited evidence and create only Worker-owned sessions. Return tested, "
+            "evidence_refs, untested and next_steps "
             "within the time limit, even when nothing can be verified.\n\n"
-            + json.dumps(worker_packet, ensure_ascii=False, default=str)
+            + json.dumps({"evidence_refs": worker_packet["evidence_refs"]}, ensure_ascii=False)
         )
         objective = objective[:3950]
         async with self._lock:

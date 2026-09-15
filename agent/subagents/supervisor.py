@@ -164,6 +164,7 @@ class AgentSupervisor(AgentLifecycle):
         # These are live process views only. SQLite remains authoritative.
         self.nodes: dict[str, AgentNode] = {}
         self._runners: dict[str, AgentRunner] = {}
+        self._runner_metrics: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
         self._catalog: dict[str, dict[str, Any]] = {}
@@ -171,6 +172,8 @@ class AgentSupervisor(AgentLifecycle):
         self._stagnation_task: asyncio.Task[None] | None = None
         self._challenge_completion_tasks: dict[str, asyncio.Task[Any]] = {}
         self._container_operation_lock = asyncio.Lock()
+        self._container_locks: dict[str, asyncio.Lock] = {}
+        self._closing = False
         self._hint_locks: dict[str, asyncio.Lock] = {}
         self._benchmark_unavailable: set[str] = set()
         # Keep this in the Supervisor so the requirement survives Runner and
@@ -469,7 +472,9 @@ class AgentSupervisor(AgentLifecycle):
     async def _ensure_challenge_container(
         self, caller_id: str, unique_code: str
     ) -> dict[str, Any]:
-        async with self._container_operation_lock:
+        async with self._container_operation_lock, self._container_locks.setdefault(unique_code, asyncio.Lock()):
+            if self._closing:
+                return self._error("runtime_stopping", "New containers are disabled during shutdown", error_type="conflict")
             gate = await self._service().challenge_start_gate(
                 self._run_id(),
                 unique_code,
@@ -667,7 +672,7 @@ class AgentSupervisor(AgentLifecycle):
         *,
         reason: str,
     ) -> dict[str, Any]:
-        async with self._container_operation_lock:
+        async with self._container_locks.setdefault(unique_code, asyncio.Lock()):
             challenge = await self._challenge_record(unique_code)
             if not challenge["is_completed"] and challenge["work_status"] != "closed":
                 return {
@@ -705,7 +710,7 @@ class AgentSupervisor(AgentLifecycle):
     ) -> dict[str, Any]:
         """Close a paused target and count a slot free only after confirmation."""
 
-        async with self._container_operation_lock:
+        async with self._container_locks.setdefault(unique_code, asyncio.Lock()):
             challenge = await self._challenge_record(unique_code)
             if challenge["work_status"] != "paused" or challenge["is_completed"]:
                 return {
@@ -821,6 +826,33 @@ class AgentSupervisor(AgentLifecycle):
             }
         )
 
+    async def _resume_with_hint(self, caller_id: str, unique_code: str, solver_id: str) -> None:
+        claim = await self._service().claim_resume_hint(self._run_id(), unique_code, solver_id)
+        if claim is None:
+            return
+        status = claim["decision"]
+        error_code = None
+        if status == "request":
+            try:
+                result = await self.request_hint_light(caller_id, unique_code, "stagnation_resume")
+                error_code = self._error_code(result)
+                if result.get("ok"):
+                    status = "succeeded"
+                elif error_code in {"hint_response_unavailable", "operation_indeterminate"}:
+                    status = "uncertain"
+                elif error_code == "hint_already_requested":
+                    status = "reused"
+                else:
+                    status = "failed"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status, error_code = "uncertain", type(exc).__name__
+        await self._service().append_agent_event(
+            self._run_id(), solver_id, "solver_resume_hint_result",
+            {**claim, "status": status, "error_code": error_code},
+        )
+
     async def request_hint_light(
         self,
         caller_id: str,
@@ -858,6 +890,12 @@ class AgentSupervisor(AgentLifecycle):
                     "Only one hint may be requested for a challenge",
                     error_type="conflict",
                 )
+            operations = await self._service().list_operations(self._run_id(), unique_code=unique_code)
+            if any(op["operation_type"] == "benchmark_get_hint" and
+                   (op["status"] in {"started", "indeterminate"} or
+                    op.get("result_code") == "hint_response_unavailable") for op in operations):
+                return self._error("hint_response_unavailable", "Previous Hint outcome is uncertain; do not retry",
+                                   error_type="conflict")
             result = await self._execute_operation(
                 caller_id=caller_id,
                 tool_name="benchmark_get_hint",
@@ -1048,37 +1086,12 @@ class AgentSupervisor(AgentLifecycle):
             self._run_ownership.close()
             self._run_ownership = None
 
-    async def close(self) -> None:
-        if self._ownership_conflict:
-            await self._close_model_http_client()
-            return
-        self._pausing = False
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            await self._ignore_cancel(self._poll_task)
-            self._poll_task = None
-        if self._stagnation_task is not None:
-            self._stagnation_task.cancel()
-            await self._ignore_cancel(self._stagnation_task)
-            self._stagnation_task = None
-        completion_tasks = list(self._challenge_completion_tasks.values())
-        self._challenge_completion_tasks.clear()
-        if completion_tasks:
-            await asyncio.gather(*completion_tasks, return_exceptions=True)
-        await self._stop_all()
-        await self.release_targets(reason="runtime_closed", permanent=True)
-        await self._finish_run_managers("finish_run")
-        for runner in list(self._runners.values()):
-            try:
-                await runner.close()
-            except Exception:
-                pass
-        self._runners.clear()
-        await self._close_model_http_client()
-        await self._project()
-        self._release_run_ownership()
+    async def close(self, *, deadline: float | None = None) -> None:
+        from .shutdown import shutdown_supervisor
+        await shutdown_supervisor(self, preserve_run=False,
+                                  deadline=deadline or asyncio.get_running_loop().time() + 30)
 
-    async def _finish_run_managers(self, operation: str) -> None:
+    async def _finish_run_managers(self, operation: str, *, deadline: float | None = None) -> None:
         from .lifecycle import AGENT_CLEANUP_SECONDS
 
         tasks = {}
@@ -1095,7 +1108,7 @@ class AgentSupervisor(AgentLifecycle):
                 self._manager_cleanup_tasks[key] = task
             tasks[attribute] = task
         if tasks:
-            await asyncio.wait(list(tasks.values()), timeout=AGENT_CLEANUP_SECONDS)
+            await asyncio.wait(list(tasks.values()), timeout=max(0, deadline - asyncio.get_running_loop().time()) if deadline is not None else AGENT_CLEANUP_SECONDS)
         failures = []
         for attribute, task in tasks.items():
             if not task.done():
@@ -1124,32 +1137,12 @@ class AgentSupervisor(AgentLifecycle):
                 {"failures": failures},
             )
 
-    async def pause(self) -> None:
+    async def pause(self, *, deadline: float | None = None) -> None:
         """Cancel live work while preserving resumable orchestration state."""
 
-        self._pausing = True
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            await self._ignore_cancel(self._poll_task)
-            self._poll_task = None
-        if self._stagnation_task is not None:
-            self._stagnation_task.cancel()
-            await self._ignore_cancel(self._stagnation_task)
-            self._stagnation_task = None
-        await self._pause_all()
-        await self.release_targets(reason="runtime_pause")
-        await self._service().interrupt_workers(self._run_id())
-        await self._finish_run_managers("pause_run")
-        for runner in list(self._runners.values()):
-            try:
-                await runner.close()
-            except Exception:
-                pass
-        self._runners.clear()
-        await self._close_model_http_client()
-        await self._sync_nodes()
-        await self._project()
-        self._release_run_ownership()
+        from .shutdown import shutdown_supervisor
+        await shutdown_supervisor(self, preserve_run=True,
+                                  deadline=deadline or asyncio.get_running_loop().time() + 30)
 
     def _shared_model_http_client(self) -> httpx.AsyncClient:
         client = self._model_http_client
@@ -1363,7 +1356,7 @@ class AgentSupervisor(AgentLifecycle):
                 tool_name, arguments, caller_id=caller_id
             )
         except Exception:
-            if tool_name == "benchmark_submit_flag":
+            if tool_name in {"benchmark_submit_flag", "benchmark_get_hint"}:
                 await self._service().mark_operation_indeterminate(
                     self._run_id(),
                     operation_id,
@@ -1371,7 +1364,7 @@ class AgentSupervisor(AgentLifecycle):
                 )
                 return self._error(
                     "operation_indeterminate",
-                    "Submission outcome is unknown; synchronize before further action",
+                    "Remote operation outcome is unknown; synchronize before further action",
                     error_type="conflict",
                 )
             await self._service().fail_operation(
@@ -1387,7 +1380,7 @@ class AgentSupervisor(AgentLifecycle):
             )
         await self._record_benchmark_events(result)
         transport_uncertain = (
-            tool_name == "benchmark_submit_flag"
+            tool_name in {"benchmark_submit_flag", "benchmark_get_hint"}
             and not result.get("ok")
             and (
                 self._error_code(result)
@@ -1775,6 +1768,10 @@ class AgentSupervisor(AgentLifecycle):
                 )
                 continue
 
+            await self._service().reset_strategy_for_resume(
+                self._run_id(), unique_code, agent["agent_id"], recovery=True
+            )
+            await self._resume_with_hint(caller_id, unique_code, agent["agent_id"])
             await self._launch_agent(agent["agent_id"], resume=True)
             await self._service().append_agent_event(
                 self._run_id(),
@@ -1827,7 +1824,7 @@ class AgentSupervisor(AgentLifecycle):
                     actions = await self._service().scan_stagnation(
                         self._run_id(), policy
                     )
-                    for action in actions:
+                    for action in sorted(actions, key=lambda item: item["kind"] != "rotate"):
                         code = action["unique_code"]
                         if action["kind"] == "strategy_reset":
                             runner = self._runners.get(action["solver_id"])
@@ -1848,14 +1845,16 @@ class AgentSupervisor(AgentLifecycle):
                             try:
                                 await self._launch_agent(worker["agent_id"])
                             except Exception as exc:
-                                await self._service().finalize_worker(
+                                cleanup = await self._finish_agent_resources(worker["agent_id"])
+                                await self._service().append_agent_event(self._run_id(), worker["agent_id"], "worker_resource_cleanup", {
+                                    "resource_cleanup_status": "closed" if cleanup["ok"] else "release_pending", "failures": cleanup.get("failures", [])})
+                                await self._service().finalize_worker_runtime(
                                     self._run_id(),
                                     worker["agent_id"],
                                     self._state_context(worker["agent_id"]),
-                                    AgentReportInput(
-                                        status="failed",
-                                        summary=f"automatic worker launch failed: {type(exc).__name__}",
-                                    ),
+                                    status="failed", summary="Worker 启动失败", error_code="worker_start_failed", error_stage="launch",
+                                    termination_reason="worker_start_failed", owned_resources_closed=cleanup["ok"],
+                                    resource_cleanup_status="closed" if cleanup["ok"] else "release_pending",
                                     allow_inactive=True,
                                 )
                             continue
@@ -1871,6 +1870,7 @@ class AgentSupervisor(AgentLifecycle):
                                 [code],
                                 reason="stagnation_timeout",
                                 release_container=True,
+                                reason_code="stagnation_timeout",
                             )
                             await self._service().append_agent_event(
                                 self._run_id(),

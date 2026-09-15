@@ -2,6 +2,7 @@
 
 from typing import Literal
 from pydantic import Field, model_validator
+from agent.state.references import EvidenceRef, ReportRef
 from agent.state.schemas import (
     StrictModel,
     WorkerTaskInput,
@@ -36,6 +37,7 @@ class SimpleHintArguments(StrictModel):
 class PauseChallengesArguments(LaunchChallengesArguments):
     reason: str = Field(min_length=1, max_length=2000)
     release_container: bool = True
+    reason_code: Literal["manual", "stagnation_manual", "stagnation_timeout"] = "manual"
 
 
 class CloseChallengesArguments(LaunchChallengesArguments):
@@ -57,7 +59,7 @@ class CancelWorkerArguments(StrictModel):
 
 class ReviewValidation(StrictModel):
     conclusion_sequences: list[int] = Field(min_length=1, max_length=20)
-    control_evidence_refs: list[str] = Field(min_length=1, max_length=20)
+    control_evidence_refs: list[EvidenceRef] = Field(min_length=1, max_length=20)
     calibration_basis: str | None = Field(default=None, min_length=1, max_length=1000)
     calibration_sequences: list[int] = Field(default_factory=list, max_length=20)
 
@@ -65,8 +67,6 @@ class ReviewValidation(StrictModel):
     def evidence_contract(self):
         if not (self.calibration_basis or "").strip() and not self.calibration_sequences:
             raise ValueError("Validation requires an implementation calibration basis or calibration sequences")
-        if any(not ref.startswith("evidence:") for ref in self.control_evidence_refs):
-            raise ValueError("Controls must use evidence references")
         if any(seq <= 0 for seq in self.conclusion_sequences + self.calibration_sequences):
             raise ValueError("Source sequences must be positive")
         return self
@@ -155,7 +155,7 @@ class SubmitFlagArguments(StrictModel):
 
 
 class EvidenceReadArguments(StrictModel):
-    evidence_ref: str = Field(
+    evidence_ref: EvidenceRef = Field(
         min_length=1,
         description=(
             "Copy the exact returned evidence_ref: "
@@ -168,7 +168,7 @@ class EvidenceReadArguments(StrictModel):
 
 
 class ReportReadArguments(StrictModel):
-    report_ref: str = Field(min_length=1, description="Exact report_ref returned by a control or Worker report; never synthesize a reference.")
+    report_ref: ReportRef = Field(description="Copy the exact report:report_<32 lowercase hexadecimal characters> reference. Never use a bare report_id or a tool_result reference.")
     offset: int = Field(default=0, ge=0, description="Character offset returned by the prior read.")
     limit_chars: int = Field(default=8000, ge=1, le=30000, description="Maximum characters to return per page.")
 
@@ -177,6 +177,11 @@ class EvidenceSearchArguments(StrictModel):
     query: str = Field(default="", max_length=1000, description="Search source, evidence type, or an exact/partial system task_id.")
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
+    experiment_type: str | None = Field(default=None, max_length=128)
+    target: str | None = Field(default=None, max_length=2048)
+    input_digest: str | None = Field(default=None, max_length=64)
+    resource_generation: int | None = Field(default=None, ge=0)
+    batch_digest: str | None = Field(default=None, max_length=64)
 
 
 class SolverObserveArguments(ReportQueryArguments):

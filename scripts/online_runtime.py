@@ -154,7 +154,8 @@ async def _bounded_shutdown(operation: Awaitable[Any], label: str, timeout: floa
     """Keep systemd shutdown below its stop window while preserving best effort cleanup."""
 
     try:
-        await asyncio.wait_for(operation, timeout=timeout)
+        from agent.deadline import before
+        await before(operation, asyncio.get_running_loop().time() + timeout)
     except asyncio.TimeoutError:
         print(f"[online] shutdown: {label} exceeded {timeout:g}s", flush=True)
     except Exception as exc:

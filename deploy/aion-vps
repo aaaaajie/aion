@@ -46,6 +46,7 @@ SOURCE_NAMES = (
     "pyproject.toml",
     "requirements.lock",
 )
+WEB_SOURCE = PROJECT_ROOT / "scripts" / "runtime_web"
 EXCLUDED_NAMES = {"__pycache__", ".DS_Store"}
 RELEASE_PATTERN = re.compile(r"^[0-9]{14}-[a-f0-9]{12}$")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -158,6 +159,23 @@ def _source_digest() -> str:
         with path.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _web_source_digest() -> str:
+    if not WEB_SOURCE.is_dir():
+        raise OperatorError("required deployment source is missing: scripts/runtime_web")
+    digest = hashlib.sha256()
+    for path in sorted(WEB_SOURCE.rglob("*")):
+        relative_parts = path.relative_to(PROJECT_ROOT).parts
+        if any(part in EXCLUDED_NAMES for part in relative_parts):
+            continue
+        if not path.is_file() or path.suffix == ".pyc":
+            continue
+        relative = path.relative_to(PROJECT_ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -318,6 +336,27 @@ def _rsync_command(destination: str, *, base_release_id: str | None = None) -> l
     return command
 
 
+def _web_rsync_command(destination: str) -> list[str]:
+    return [
+        "rsync",
+        "--recursive",
+        "--links",
+        "--checksum",
+        "--executability",
+        "--delete",
+        "--exclude",
+        "__pycache__/",
+        "--exclude",
+        "*.pyc",
+        "--exclude",
+        ".DS_Store",
+        "-e",
+        _rsync_shell(),
+        f"{WEB_SOURCE}/",
+        destination,
+    ]
+
+
 def _print_rsync_preview(output: str) -> None:
     changed: list[str] = []
     stats: list[str] = []
@@ -369,6 +408,52 @@ def _stage_release(
         preview = _run(dry_run, capture_output=True, cwd=PROJECT_ROOT)
         _print_rsync_preview(_decode(preview))
         _run(command, cwd=PROJECT_ROOT)
+        manager = f"{incoming}/deploy/release_manager.py"
+        _ssh(
+            [
+                "python3",
+                manager,
+                "prepare",
+                "--release-id",
+                release_id,
+                "--incoming",
+                incoming,
+                "--venv-id",
+                venv_id,
+                "--base-release-id",
+                base_release_id,
+            ]
+        )
+    except Exception:
+        _ssh(["rm", "-rf", incoming], check=False)
+        raise
+
+
+def _stage_web_release(release_id: str, venv_id: str, base_release_id: str) -> None:
+    incoming = f"/opt/aion/releases/.incoming-{release_id}"
+    if RELEASE_PATTERN.fullmatch(base_release_id) is None:
+        raise OperatorError("remote current release id was invalid")
+    _ssh(["install", "-d", "-m", "0755", incoming])
+    try:
+        _ssh(["cp", "-al", f"/opt/aion/releases/{base_release_id}/.", incoming])
+        # Do not let prepare's marker write mutate the hard-linked base release.
+        _ssh(["rm", "-f", f"{incoming}/.venv-id"])
+        preview_command = _web_rsync_command(
+            f"{SSH_TARGET}:/opt/aion/current/scripts/runtime_web/"
+        )
+        dry_run = [
+            *preview_command[:1],
+            "--dry-run",
+            "--itemize-changes",
+            "--stats",
+            *preview_command[1:],
+        ]
+        preview = _run(dry_run, capture_output=True, cwd=PROJECT_ROOT)
+        _print_rsync_preview(_decode(preview))
+        _run(
+            _web_rsync_command(f"{SSH_TARGET}:{incoming}/scripts/runtime_web/"),
+            cwd=PROJECT_ROOT,
+        )
         manager = f"{incoming}/deploy/release_manager.py"
         _ssh(
             [
@@ -568,7 +653,10 @@ def _rollback_pending(release_id: str) -> None:
 
 
 def _deploy(
-    token: str, vpn: Path | None, test_paths: Iterable[str] | None = None
+    token: str,
+    vpn: Path | None,
+    test_paths: Iterable[str] | None = None,
+    web_only: bool = False,
 ) -> None:
     _local_verify(test_paths)
     _remote_doctor()
@@ -576,18 +664,24 @@ def _deploy(
     package_hash = _package_hash()
     run = before.get("run") or {}
     was_active = bool(before.get("active"))
+    if web_only and was_active:
+        raise OperatorError("web-only deployment requires Runtime to be stopped")
     run_id = run.get("run_id")
     if was_active and not run_id:
         raise OperatorError("active service has no discoverable persistent run")
 
-    source_digest = _source_digest()
+    source_digest = _web_source_digest() if web_only else _source_digest()
     release_id = _release_id(source_digest)
     venv_id = _requirements_digest()
     base_release_id = before.get("release")
     if not isinstance(base_release_id, str) or RELEASE_PATTERN.fullmatch(base_release_id) is None:
         raise OperatorError("remote current release is required for incremental deployment")
-    print(f"[deploy] staging release {release_id}", flush=True)
-    _stage_release(release_id, venv_id, base_release_id)
+    scope = "web-only" if web_only else "full"
+    print(f"[deploy] staging {scope} release {release_id}", flush=True)
+    if web_only:
+        _stage_web_release(release_id, venv_id, base_release_id)
+    else:
+        _stage_release(release_id, venv_id, base_release_id)
     staged_vpn = _stage_vpn(vpn, release_id) if vpn else None
     activated = False
     try:
@@ -890,6 +984,11 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--benchmark-token", required=True)
     deploy.add_argument("--vpn", type=Path)
     deploy.add_argument(
+        "--web-only",
+        action="store_true",
+        help="publish only scripts/runtime_web from the current release baseline",
+    )
+    deploy.add_argument(
         "--test-path",
         action="append",
         dest="test_paths",
@@ -913,6 +1012,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status")
     subparsers.add_parser("stop")
+    cleanup = subparsers.add_parser("cleanup", help="confirm release of an explicit Run; starts no Agents")
+    cleanup.add_argument("--run-id", required=True)
+    cleanup.add_argument("--benchmark-token", default=os.environ.get("BENCHMARK_TOKEN"))
 
     logs = subparsers.add_parser("logs")
     logs_subparsers = logs.add_subparsers(dest="logs_command", required=True)
@@ -953,7 +1055,7 @@ def main() -> None:
         if args.command == "deploy":
             token = _validate_token(args.benchmark_token)
             args.benchmark_token = ""
-            _deploy(token, args.vpn, args.test_paths)
+            _deploy(token, args.vpn, args.test_paths, args.web_only)
             token = ""
         elif args.command == "start":
             token = _validate_token(args.benchmark_token)
@@ -974,6 +1076,13 @@ def main() -> None:
             _ssh(["aionctl", "status"])
         elif args.command == "stop":
             _ssh(["aionctl", "stop"])
+        elif args.command == "cleanup":
+            if args.run_id == "latest" or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", args.run_id):
+                raise OperatorError("cleanup requires an explicit run ID")
+            token = _validate_token(args.benchmark_token)
+            args.benchmark_token = ""
+            _ssh(["aionctl", "cleanup", "--run-id", args.run_id, "--benchmark-token-stdin"], input_data=(token + "\n").encode())
+            token = ""
         elif args.command == "logs" and args.logs_command == "tail":
             command = ["aionctl", "logs"]
             if args.follow:

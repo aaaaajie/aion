@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from agent.memory.redaction import redact_value
 from .completion_delivery import pending_completions
@@ -321,15 +321,17 @@ class AgentStateMixin:
     async def _validate_context_refs(
         self, session: Any, run_id: str, code: str, refs: list[str]
     ) -> None:
+        from .references import parse_reference
         for ref in refs:
-            prefix, _, ident = ref.partition(":")
+            prefix, ident = parse_reference(ref)
             model = {
                 "evidence": EvidenceRecord,
                 "report": ReportRecord,
-                "finding": FindingRecord,
-            }.get(prefix)
-            row = await session.get(model, ident) if model else None
-            if row is None or row.run_id != run_id or row.unique_code != code:
+            }[prefix]
+            row = await session.get(model, ident)
+            if row is None:
+                raise StateError(f"{prefix}_not_found", "The referenced record does not exist", status_code=404)
+            if row.run_id != run_id or row.unique_code != code:
                 raise StatePermission(
                     "context_not_accessible",
                     "Reference is outside this challenge and Run",
@@ -345,6 +347,8 @@ class AgentStateMixin:
         task_offset: int = 0,
         task_limit: int = 20,
     ) -> dict[str, Any]:
+        from agent.experiment_records import challenge_facts
+        facts = await self.experiment_context(run_id, unique_code)
         async with self.db.sessions() as session:
             if context:
                 await self._authorize(
@@ -369,27 +373,17 @@ class AgentStateMixin:
                     .limit(task_limit + 1)
                 )
             ).all()
-            findings = (
-                await session.scalars(
-                    select(FindingRecord)
-                    .where(
-                        FindingRecord.run_id == run_id,
-                        FindingRecord.unique_code == unique_code,
-                    )
-                    .order_by(FindingRecord.first_seen_at.desc())
-                    .limit(24 if compact else 100)
-                )
-            ).all()
             return {
                 "run": self._run_dict(run),
-                "challenge": self._challenge_dict(challenge),
-                "tasks": [self._agent_dict(a) for a in agents[:task_limit]],
+                "challenge": challenge_facts(self._challenge_dict(challenge)),
+                "tasks": [{**{k: getattr(a, k) for k in ("agent_id", "role", "mode", "status")},
+                           "report_ref": f"report:{a.terminal_report_id}" if a.terminal_report_id and (a.final_report or {}).get("system_finalized") else None} for a in agents[:task_limit]],
                 "next_task_offset": (
                     task_offset + task_limit if len(agents) > task_limit else None
                 ),
-                "findings": [self._controller_finding_dict(f) for f in findings],
+                "experiments": facts,
                 "hints": [
-                    {**r.payload, "report_id": r.report_id, "sequence": r.sequence}
+                    {**r.payload, "report_ref": f"report:{r.report_id}", "sequence": r.sequence}
                     for r in (
                         await session.scalars(
                             select(ReportRecord)
@@ -413,7 +407,9 @@ class AgentStateMixin:
             agent = await self._authorize(
                 session, context, roles={"worker"}, agent_id=agent_id, run_id=run_id
             )
-            assignment = self._agent_dict(agent, include_runtime=True)
+            assignment = {k: getattr(agent, k) for k in ("agent_id", "role", "mode", "task_key", "context_refs", "status", "timeout_seconds")}
+            if agent.mode != "review" and not (agent.task_key or "").startswith(("stagnation:", "capability-verifier:")):
+                assignment["task_scope"] = agent.mission
         return {
             "assignment": assignment,
             "challenge": await self.get_challenge_context(
@@ -448,6 +444,8 @@ class AgentStateMixin:
             task_limit=task_limit,
         )
         reports = await self.consume_reports(run_id, context, max_reports=max_reports)
+        from agent.experiment_records import report_receipt
+        reports["reports"] = [report_receipt(r) for r in reports["reports"]]
         snapshot.update(reports)
         return snapshot
 
@@ -532,6 +530,8 @@ class AgentStateMixin:
                         ReportRecord.run_id == run_id,
                         ReportRecord.parent_id == agent_id,
                         ReportRecord.sequence > agent.report_cursor,
+                        or_(ReportRecord.report_type != "worker", ReportRecord.status == "working",
+                            ReportRecord.payload["system_finalized"].as_boolean().is_(True)),
                     )
                     .order_by(ReportRecord.sequence)
                     .limit(max(1, min(max_reports, 100)))
@@ -624,6 +624,8 @@ class AgentStateMixin:
                         ReportRecord.run_id == run_id,
                         ReportRecord.parent_id == agent_id,
                         ReportRecord.sequence > agent.report_cursor,
+                        or_(ReportRecord.report_type != "worker", ReportRecord.status == "working",
+                            ReportRecord.payload["system_finalized"].as_boolean().is_(True)),
                     )
                     .limit(1)
                 )
@@ -710,6 +712,8 @@ class AgentStateMixin:
                     session, context, roles={"worker"}, agent_id=agent_id, run_id=run_id
                 )
                 value = payload.model_dump(mode="python")
+                if (agent.task_key or "").startswith("capability-verifier:"):
+                    value["task_key"] = agent.task_key
                 digest = payload_digest(value)
                 if agent.terminal_report_id:
                     existing = await session.get(ReportRecord, agent.terminal_report_id)
@@ -791,6 +795,13 @@ class AgentStateMixin:
                         "stagnation_worker_contract",
                         "Automatic stagnation Workers return tested, evidence_refs, untested and next_steps only",
                     )
+                if (agent.task_key or "").startswith("capability-verifier:") and (
+                    value.get("findings") or value.get("candidate_flag") is not None
+                ):
+                    raise StatePermission(
+                        "capability_verifier_contract",
+                        "Capability verifier Workers return tested, evidence_refs, untested, next_steps and status only",
+                    )
                 if value.get("findings"):
                     findings = await self.record_worker_findings(
                         session, run_id, agent, value["findings"]
@@ -824,69 +835,38 @@ class AgentStateMixin:
                     ),
                 )
                 session.add(report)
-                agent.last_report_sequence = sequence
+                if not terminal:
+                    agent.last_report_sequence = sequence
                 if terminal:
-                    agent.status = status
                     agent.terminal_report_id = report.report_id
-                    agent.ended_at = self.clock()
                     agent.final_report = report.payload
-                    admission = await session.scalar(
-                        select(AdmissionRecord).where(
-                            AdmissionRecord.run_id == run_id,
-                            AdmissionRecord.agent_id == agent_id,
-                        )
-                    )
-                    if admission:
-                        admission.status = (
-                            "completed"
-                            if status == "completed"
-                            else (
-                                "cancelled"
-                                if status in {"cancelled", "stopped", "interrupted"}
-                                else "failed"
-                            )
-                        )
                 await self._event_with_sequence(
                     session,
                     run_id,
                     sequence,
-                    "worker_reported" if terminal else "worker_updated",
+                    "worker_report_submitted" if terminal else "worker_updated",
                     {
                         "report_id": report.report_id,
                         "status": status,
                         "terminal": terminal,
                         "summary": report.payload.get("summary"),
+                        "verification_status": value.get("verification_status"),
+                        "error_code": value.get("error_code"),
+                        "error_stage": value.get("error_stage"),
+                        "rounds_used": value.get("rounds_used"),
+                        "tool_calls": value.get("tool_calls"),
+                        "blocked_by": value.get("blocked_by"),
+                        "new_evidence": value.get("new_evidence"),
+                        "owned_resources_closed": value.get("owned_resources_closed"),
                         "candidate_flag_present": candidate is not None,
                         "findings_received": len(value.get("findings", [])),
                         "findings_persisted": len(value.get("findings", [])),
                     },
                     agent_id=agent_id,
                 )
-                if terminal and (agent.task_key or "").startswith("stagnation:"):
-                    await self._event(
-                        session,
-                        run_id,
-                        "solver_stagnation_worker_finished",
-                        {
-                            "unique_code": agent.unique_code,
-                            "worker_id": agent_id,
-                            "solver_id": agent.parent_id,
-                            "strategy_revision": (
-                                (agent.task_key or "").rsplit(":", 1)[-1]
-                            ),
-                            "status": status,
-                            "report_id": report.report_id,
-                            "evidence_refs": value.get("evidence_refs", []),
-                            "tested": value.get("tested", []),
-                            "untested": value.get("untested", []),
-                            "next_steps": value.get("next_steps", []),
-                        },
-                        agent_id=agent_id,
-                    )
-        await self.notifier.notify(
-            self.agent_signal_key(run_id, agent.parent_id), sequence
-        )
-        await self.notifier.notify(self.run_signal_key(run_id), sequence)
+        if not terminal:
+            await self.notifier.notify(self.agent_signal_key(run_id, agent.parent_id), sequence)
+            await self.notifier.notify(self.run_signal_key(run_id), sequence)
         return {
             **self._report_dict(report),
             "idempotent": False,
@@ -914,6 +894,309 @@ class AgentStateMixin:
             allow_inactive=allow_inactive,
         )
 
+    async def record_worker_termination(
+        self, run_id: str, agent_id: str, context: CapabilityContext, outcome: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist the first system stop cause before cleanup can time out."""
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await self._authorize(session, context, roles={"worker"}, agent_id=agent_id, run_id=run_id)
+                existing = await session.scalar(select(StateEventRecord).where(
+                    StateEventRecord.run_id == run_id,
+                    StateEventRecord.agent_id == agent_id,
+                    StateEventRecord.event_type == "worker_termination_requested",
+                ).order_by(StateEventRecord.sequence).limit(1))
+                if existing is not None:
+                    return existing.payload
+                safe = redact_value(outcome)
+                await self._event(session, run_id, "worker_termination_requested", safe, agent_id=agent_id)
+                return safe
+
+    async def finalize_worker_runtime(
+        self,
+        run_id: str,
+        agent_id: str,
+        context: CapabilityContext,
+        *,
+        status: str,
+        summary: str,
+        owned_resources_closed: bool,
+        resource_cleanup_status: str,
+        termination_reason: str,
+        error_code: str | None = None,
+        error_stage: str | None = None,
+        blocked_by: str | None = None,
+        verification_status: str | None = None,
+        allow_inactive: bool = True,
+    ) -> dict[str, Any]:
+        """Finalize or enrich exactly one Worker report with system facts.
+
+        Model supplied counters and cleanup flags are deliberately ignored.
+        The lifecycle calls this only after technical resources have reached a
+        terminal cleanup result, so the report and the cleanup event agree.
+        """
+
+        if status == "stopped":
+            status = "cancelled"
+        if status not in TERMINAL:
+            raise StateError("invalid_terminal_status", "Invalid Worker terminal status")
+        if "AgentRunnerError" in summary:
+            summary = (
+                "验证未完整完成"
+                if verification_status == "uncertain"
+                else "Worker 运行失败"
+            )
+        outcome = await self.record_worker_termination(run_id, agent_id, context, {
+            "status": status, "summary": summary, "termination_reason": termination_reason,
+            "verification_status": verification_status, "error_code": error_code,
+            "error_stage": error_stage, "blocked_by": blocked_by,
+        })
+        status = outcome["status"]
+        if termination_reason != outcome["termination_reason"]:
+            summary = outcome["summary"]
+        termination_reason = outcome["termination_reason"]
+        verification_status, error_code = outcome.get("verification_status"), outcome.get("error_code")
+        error_stage, blocked_by = outcome.get("error_stage"), outcome.get("blocked_by")
+        if "AgentRunnerError" in summary:
+            summary = "验证未完整完成" if verification_status == "uncertain" else "Worker 运行失败"
+        # Only the event journal is authoritative, including the zero-call case.
+        async with self.db.sessions() as metrics_session:
+            metric_rows = (
+                await metrics_session.scalars(
+                    select(StateEventRecord).where(
+                        StateEventRecord.run_id == run_id,
+                        StateEventRecord.agent_id == agent_id,
+                        StateEventRecord.event_type.in_({
+                            "model_call_started",
+                            "tool_call",
+                        }),
+                    )
+                )
+            ).all()
+        event_rounds = sum(
+            1
+            for row in metric_rows
+            if row.event_type == "model_call_started"
+        )
+        event_tool_calls = sum(
+            1 for row in metric_rows if row.event_type == "tool_call"
+        )
+        runtime = {
+            "rounds_used": event_rounds,
+            "tool_calls": event_tool_calls,
+            "owned_resources_closed": bool(owned_resources_closed),
+            "resource_cleanup_status": resource_cleanup_status,
+            "termination_reason": termination_reason,
+        }
+        base = AgentReportInput(
+            status=status,
+            summary=summary,
+            verification_status=verification_status,
+            error_code=error_code,
+            error_stage=error_stage,
+            blocked_by=blocked_by,
+            rounds_used=runtime["rounds_used"],
+            tool_calls=runtime["tool_calls"],
+            owned_resources_closed=runtime["owned_resources_closed"],
+        )
+        sequence: int | None = None
+        async with self._lock:
+            async with self.db.sessions.begin() as session:
+                await session.execute(text("BEGIN IMMEDIATE"))
+                agent = await self._authorize(
+                    session, context, roles={"worker"}, agent_id=agent_id, run_id=run_id
+                )
+                report = (
+                    await session.get(ReportRecord, agent.terminal_report_id)
+                    if agent.terminal_report_id
+                    else None
+                )
+                if report is None:
+                    # Preserve the latest non-terminal Worker update when the
+                    # lifecycle has to synthesize the terminal report.
+                    latest = await session.scalar(
+                        select(ReportRecord)
+                        .where(
+                            ReportRecord.run_id == run_id,
+                            ReportRecord.agent_id == agent_id,
+                            ReportRecord.report_type == "worker",
+                            ReportRecord.status == "working",
+                        )
+                        .order_by(ReportRecord.sequence.desc())
+                        .limit(1)
+                    )
+                    if latest is not None:
+                        payload = latest.payload or {}
+                        base = AgentReportInput(
+                            status=status,
+                            summary=str(payload.get("summary") or summary),
+                            evidence_refs=list(payload.get("evidence_refs") or []),
+                            tested=list(payload.get("tested") or []),
+                            untested=list(payload.get("untested") or []),
+                            next_steps=list(payload.get("next_steps") or []),
+                            candidate_flag=payload.get("candidate_flag"),
+                            verification_status=verification_status,
+                            error_code=error_code,
+                            error_stage=error_stage,
+                            rounds_used=runtime["rounds_used"],
+                            tool_calls=runtime["tool_calls"],
+                            blocked_by=blocked_by,
+                            owned_resources_closed=runtime["owned_resources_closed"],
+                        )
+                    # Leave creation to the normal report path after this
+                    # transaction. This branch is used for crashes before the
+                    # model could submit a terminal report.
+                    report_id = None
+                else:
+                    value = dict(report.payload or {})
+                    if bool(value.get("system_finalized")):
+                        report_id = report.report_id
+                        continue_update = False
+                        if (
+                            value.get("owned_resources_closed") is not True
+                            and runtime["owned_resources_closed"] is True
+                        ):
+                            value.update(
+                                {
+                                    "owned_resources_closed": True,
+                                    "resource_cleanup_status": runtime[
+                                        "resource_cleanup_status"
+                                    ],
+                                }
+                            )
+                            report.payload = redact_value(value)
+                            report.content_digest = payload_digest(report.payload)
+                            agent.final_report = report.payload
+                            sequence = await self._event(
+                                session,
+                                run_id,
+                                "worker_cleanup_reconciled",
+                                {
+                                    "report_id": report.report_id,
+                                    "owned_resources_closed": True,
+                                    "resource_cleanup_status": runtime[
+                                        "resource_cleanup_status"
+                                    ],
+                                },
+                                agent_id=agent_id,
+                            )
+                    else:
+                        continue_update = True
+                    if continue_update:
+                        value.update(
+                            {
+                                "status": status,
+                                "summary": summary,
+                                **runtime,
+                                **{
+                                    key: item
+                                    for key, item in {
+                                        "verification_status": verification_status,
+                                        "error_code": error_code,
+                                        "error_stage": error_stage,
+                                        "blocked_by": blocked_by,
+                                    }.items()
+                                    if item is not None
+                                },
+                            },
+                        )
+                        value.update(
+                            {
+                                "type": "worker_report",
+                                "terminal": True,
+                                "system_finalized": True,
+                            }
+                        )
+                        safe_value = redact_value(value)
+                        report.payload = safe_value
+                        report.status = status
+                        report.content_digest = payload_digest(safe_value)
+                        agent.status = status
+                        agent.final_report = safe_value
+                        agent.ended_at = agent.ended_at or self.clock()
+                        sequence = await self._event(
+                            session,
+                            run_id,
+                            "worker_terminal_finalized",
+                            {
+                                "report_id": report.report_id,
+                                "status": status,
+                                "summary": summary,
+                                "error_code": error_code,
+                                "error_stage": error_stage,
+                                "blocked_by": blocked_by,
+                                "verification_status": verification_status,
+                                **runtime,
+                            },
+                            agent_id=agent_id,
+                        )
+                        report.sequence = sequence
+                        agent.last_report_sequence = sequence
+                        terminal_event = {
+                            **safe_value, "report_id": report.report_id,
+                            "report_ref": f"report:{report.report_id}",
+                            "worker_id": agent_id, "solver_id": agent.parent_id,
+                            "unique_code": agent.unique_code, "task_key": agent.task_key,
+                            "status": status, **runtime,
+                        }
+                        terminal_event.pop("candidate_flag", None)
+                        await self._event(session, run_id, "worker_reported", terminal_event, agent_id=agent_id)
+                        if (agent.task_key or "").startswith("capability-verifier:"):
+                            await self._event(session, run_id, "capability_verifier_finished", terminal_event, agent_id=agent.parent_id)
+                        elif (agent.task_key or "").startswith("stagnation:"):
+                            terminal_event["strategy_revision"] = int(agent.task_key.rsplit(":", 1)[-1])
+                            await self._event(session, run_id, "solver_stagnation_worker_finished", terminal_event, agent_id=agent_id)
+                        admission = await session.scalar(
+                            select(AdmissionRecord).where(
+                                AdmissionRecord.run_id == run_id,
+                                AdmissionRecord.agent_id == agent_id,
+                            )
+                        )
+                        if admission:
+                            admission.status = (
+                                "completed"
+                                if status == "completed"
+                                else "cancelled"
+                                if status in {"cancelled", "stopped", "interrupted"}
+                                else "failed"
+                            )
+                        report_id = report.report_id
+        if report_id is None:
+            await self.finalize_worker(
+                run_id,
+                agent_id,
+                context,
+                base,
+                allow_inactive=allow_inactive,
+            )
+            # A report created after cleanup still needs the system-only
+            # fields. Use the same path once more; the existing report branch
+            # is idempotent and updates it without creating a second report.
+            return await self.finalize_worker_runtime(
+                run_id,
+                agent_id,
+                context,
+                status=status,
+                summary=base.summary,
+                owned_resources_closed=runtime["owned_resources_closed"],
+                resource_cleanup_status=resource_cleanup_status,
+                termination_reason=termination_reason,
+                error_code=error_code,
+                error_stage=error_stage,
+                blocked_by=blocked_by,
+                verification_status=verification_status,
+                allow_inactive=allow_inactive,
+            )
+        if sequence is not None:
+            await self.notifier.notify(self.run_signal_key(run_id), sequence)
+            await self.notifier.notify(self.agent_signal_key(run_id, agent.parent_id), sequence)
+        return {
+            "report_id": report_id,
+            "report_ref": f"report:{report_id}",
+            "status": report.status,
+            "runtime": {key: report.payload[key] for key in runtime},
+        }
+
     async def interrupt_workers(
         self, run_id: str, *, reason: str = "Runtime process interrupted"
     ) -> int:
@@ -928,7 +1211,7 @@ class AgentStateMixin:
                 )
             ).all()
         for a in rows:
-            await self.finalize_worker(
+            await self.finalize_worker_runtime(
                 run_id,
                 a.agent_id,
                 CapabilityContext(
@@ -937,7 +1220,13 @@ class AgentStateMixin:
                     role="worker",
                     unique_code=a.unique_code,
                 ),
-                AgentReportInput(status="interrupted", summary=reason),
+                status="interrupted",
+                summary="Worker 超时" if "timeout" in reason.casefold() else "Worker 已停止",
+                owned_resources_closed=False,
+                resource_cleanup_status="release_pending",
+                termination_reason="runtime_interrupted",
+                error_code="runtime_interrupted",
+                error_stage="lifecycle",
                 allow_inactive=True,
             )
         return len(rows)
@@ -980,6 +1269,8 @@ class AgentStateMixin:
         offset: int = 0,
         limit_chars: int = 8000,
     ) -> dict[str, Any]:
+        from .references import parse_reference
+        _, report_id = parse_reference(report_ref, "report")
         async with self.db.sessions() as session:
             agent = await self._authorize(
                 session,
@@ -991,17 +1282,32 @@ class AgentStateMixin:
             await self._validate_context_refs(
                 session, run_id, agent.unique_code, [report_ref]
             )
-            if not report_ref.startswith("report:"):
-                raise StatePermission("report_required", "Expected a report reference")
-            row = await session.get(ReportRecord, report_ref.removeprefix("report:"))
-            content = json.dumps(
-                self._report_dict(row), ensure_ascii=False, default=str
-            )
+            row = await session.get(ReportRecord, report_id)
+            if row.report_type == "worker" and row.status != "working" and not row.payload.get("system_finalized"):
+                raise StateError("report_pending", "Worker report is awaiting resource cleanup and system finalization", status_code=409)
+            report = self._report_dict(row)
+            from agent.experiment_records import report_receipt
+            report = report_receipt(report)
+            portable = context.role == "worker" and row.agent_id != context.agent_id
+            if portable:
+                # A report is shared evidence too.  Do not let a Worker turn
+                # another Agent's report payload into a handle transport.
+                from .service import portable_evidence_projection
+
+                content = portable_evidence_projection(
+                    json.dumps(report, ensure_ascii=False, default=str),
+                    max_preview=max(8_000, limit_chars),
+                )
+            else:
+                content = json.dumps(report, ensure_ascii=False, default=str)
         end = min(len(content), offset + limit_chars)
         return {
             "report_ref": report_ref,
+            "portable": portable,
+            "offset": offset,
             "content": content[offset:end],
             "next_offset": end if end < len(content) else None,
+            "eof": end >= len(content),
         }
 
     async def track_agent_process(self, run_id: str, agent_id: str, pid: int) -> None:
@@ -1093,16 +1399,16 @@ class AgentStateMixin:
             )
             record = None
             if item.finding_ref:
-                await self._validate_context_refs(
-                    session, run_id, agent.unique_code, [item.finding_ref]
-                )
-                if not item.finding_ref.startswith("finding:"):
-                    raise StatePermission(
-                        "finding_required", "Expected a Finding reference"
-                    )
+                import re
+                if not re.fullmatch(r"finding:finding_[0-9a-f]{32}", item.finding_ref):
+                    raise StateError("invalid_reference", "Expected an exact Finding business-record reference", status_code=422)
                 record = await session.get(
                     FindingRecord, item.finding_ref.removeprefix("finding:")
                 )
+                if record is None:
+                    raise StateError("finding_not_found", "Finding does not exist", status_code=404)
+                if record.run_id != run_id or record.unique_code != agent.unique_code:
+                    raise StatePermission("context_not_accessible", "Finding is outside this challenge and Run")
             fingerprint = payload_digest(
                 {
                     "category": item.category,

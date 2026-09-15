@@ -4,7 +4,15 @@
   const TERMINAL = new Set(["completed", "failed", "stopped", "cancelled", "interrupted", "blocked"]);
   const ACTIVE = new Set(["pending", "queued", "starting", "running", "waiting", "working", "stopping"]);
   const ACTIVE_CHALLENGE_WORK = new Set(["active"]);
-  const CONVERSATION_EVENTS = new Set(["assistant_response", "tool_call", "tool_result", "worker_reported", "worker_updated"]);
+  const CONVERSATION_EVENTS = new Set([
+    "assistant_response",
+    "tool_call",
+    "tool_result",
+    "worker_reported",
+    "worker_updated",
+    "capability_skill_auto_activated",
+    "capability_skill_auto_activation_failed",
+  ]);
   const ROLE_NAMES = { chief: "Chief", solver: "Solver", worker: "Worker" };
   const STATUS_NAMES = {
     active: "活跃",
@@ -35,13 +43,23 @@
     system_read_file: "读取文件",
     system_write_file: "写入文件",
     system_edit_file: "编辑文件",
-    system_list_directory: "浏览目录",
-    system_glob: "查找文件",
-    system_grep: "搜索内容",
+    system_list_directory: "列出目录",
+    system_glob: "匹配文件",
+    system_grep: "搜索文本",
     system_create_directory: "创建目录",
     system_delete_path: "删除路径",
+    system_source_scan: "扫描源码",
+    system_cyberchef: "CyberChef 编解码",
+    system_fastcgi_request: "发起 FastCGI 请求",
+    system_task_start: "启动后台任务",
     system_task_output: "获取后台任务输出",
     system_task_stop: "停止后台任务",
+    system_http_plan: "规划 HTTP 请求",
+    system_browser_open: "打开浏览器页面",
+    system_browser_action: "执行浏览器操作",
+    system_browser_output: "读取浏览器输出",
+    system_browser_export_request: "导出浏览器请求",
+    system_browser_close: "关闭浏览器页面",
     benchmark_list_challenges: "刷新挑战目录",
     benchmark_start_challenge: "启动挑战",
     benchmark_get_hint: "获取提示",
@@ -64,21 +82,66 @@
     evidence_search: "检索同题证据",
     evidence_read: "分页读取证据",
     report_read: "分页读取报告",
-    skill_invoke: "调用技能",
+    skill_invoke: "启用技能",
     skill_list: "列出技能",
     skill_read: "读取技能说明",
     skill_resource_read: "读取技能资源",
     skill_search: "搜索技能",
+    system_network_discovery: "网络服务发现",
+    system_network_output: "读取网络发现结果",
+    system_network_stop: "停止网络发现",
     system_http_analyze: "分析 HTTP 响应",
     system_http_cleanup: "清理 HTTP 任务",
     system_http_output: "获取 HTTP 输出",
     system_http_probe: "探测 HTTP 服务",
     system_http_request: "发起 HTTP 请求",
     system_http_response: "读取 HTTP 响应",
+    system_http_compare: "对比 HTTP 响应",
     system_http_stop: "停止 HTTP 任务",
+    system_poc_search: "搜索 POC",
+    system_poc_inspect: "检查 POC",
+    system_poc_run: "运行 POC",
+    system_poc_output: "读取 POC 结果",
     system_web_fingerprint: "识别 Web 服务",
     system_web_path_probe: "探测 Web 路径",
+    artifact_abi_summary: "解析 ABI",
+    artifact_disassemble: "反汇编文件",
+    artifact_identify: "识别文件类型",
+    artifact_static_review: "静态审查文件",
+    bin_checksec: "检查二进制防护",
+    bin_debug: "调试二进制",
+    bin_disassemble: "反汇编二进制",
+    bin_identify: "识别二进制",
+    bin_patch_elf: "修补 ELF",
+    bin_seccomp: "分析 Seccomp",
+    bin_strings: "提取字符串",
+    bin_symbols: "读取符号",
+    cloud_enum: "枚举云环境",
+    evasion_payload_analyze: "分析规避载荷",
+    pentest_arjun: "枚举隐藏参数",
+    pentest_auth_brute: "测试认证口令",
+    pentest_channel_close: "关闭交互通道",
+    pentest_channel_io: "读写交互通道",
+    pentest_credential_lookup: "查询凭据",
+    pentest_dir_fuzz: "模糊探测目录",
+    pentest_jwt: "分析 JWT",
+    pentest_privesc_check: "检查权限提升",
+    pentest_service_probe: "探测服务",
+    pentest_sqlmap: "执行 SQL 注入检测",
+    pentest_ssh_close: "关闭 SSH 会话",
+    pentest_ssh_exec: "执行 SSH 命令",
+    pentest_ssh_open: "建立 SSH 会话",
+    pentest_ssh_pivot_open: "建立 SSH 跳板",
+    pentest_ssh_transfer: "传输 SSH 文件",
+    pwn_libc_offsets: "查询 libc 偏移",
+    pwn_pack: "构建利用载荷",
+    pwn_process_open: "启动本地进程",
+    pwn_rop_search: "搜索 ROP 链",
+    pwn_session_close: "关闭 Pwn 会话",
+    pwn_session_io: "读写 Pwn 会话",
+    pwn_tcp_open: "建立 TCP 会话",
     tool_result_read: "读取工具结果",
+    tool_search: "查找工具",
   };
 
   const state = {
@@ -1044,6 +1107,40 @@
     }
   }
 
+  function skillActivityToolEvents(event) {
+    const payload = event.payload || {};
+    const failed = event.event_type === "capability_skill_auto_activation_failed";
+    const callId = `skill-${event.sequence}`;
+    const skillId = typeof payload.skill_id === "string" ? payload.skill_id : "unknown";
+    const base = {
+      sequence: event.sequence,
+      agent_id: event.agent_id,
+      created_at: event.created_at,
+      payload: {
+        tool_call_id: callId,
+        tool_name: "skill_invoke",
+        arguments: {
+          skill_id: skillId,
+          activation_mode: "capability",
+          review_sequence: payload.review_sequence,
+        },
+      },
+    };
+    return [
+      { ...base, event_type: "tool_call", payload: { ...base.payload, stage: failed ? "rejected" : "validated" } },
+      {
+        ...base,
+        event_type: "tool_result",
+        payload: {
+          ...base.payload,
+          result: failed
+            ? { ok: false, error: { code: payload.error_code || "skill_activation_failed", message: "Skill 自动启用失败" } }
+            : { ok: true, data: { activation_status: payload.activation_status || "activated", skill: { skill_id: skillId } } },
+        },
+      },
+    ];
+  }
+
   function buildRawConversation(events) {
     const timeline = [];
     let toolEvents = [];
@@ -1060,6 +1157,10 @@
     };
     orderedEvents.forEach((event) => {
       const sequence = Number(event.sequence || 0);
+      if (event.event_type === "capability_skill_auto_activated" || event.event_type === "capability_skill_auto_activation_failed") {
+        toolEvents.push(...skillActivityToolEvents(event));
+        return;
+      }
       if (event.event_type === "tool_call" || event.event_type === "tool_result") {
         toolEvents.push(event);
         return;
@@ -1202,7 +1303,9 @@
   function renderToolGroup(events, sequenceStart, sequenceEnd) {
     const rows = toolRows(events);
     if (!rows.length) return null;
-    const groupId = `tool-group-${sequenceStart}-${sequenceEnd}`;
+    // sequenceEnd changes as late tool results arrive; use the first event as
+    // the identity so a live update cannot reset the user's expanded state.
+    const groupId = `tool-group-${sequenceStart}`;
     const expanded = state.expandedToolGroups.has(groupId);
     const callCount = rows.filter((row) => row.call).length;
     const outputCount = toolOutputCount(rows);
@@ -1296,6 +1399,17 @@
     if (name === "system_shell") {
       add("命令", args.command, "command");
       add("超时", args.timeout, "timeout");
+    } else if (name === "skill_invoke") {
+      add("技能", args.skill_id, "skill_id");
+      add("模式", args.activation_mode, "activation_mode");
+      add("来源序号", args.review_sequence, "review_sequence");
+    } else if (name === "skill_search") {
+      add("查询", args.query, "query");
+      add("数量", args.limit, "limit");
+    } else if (name === "skill_resource_read") {
+      add("技能", args.skill_id, "skill_id");
+      add("资源", args.resource, "resource");
+      add("偏移", args.offset, "offset");
     } else if (["system_read_file", "system_write_file", "system_edit_file"].includes(name)) {
       add("文件", args.file_path || args.filePath || args.path, "file");
       if (name === "system_write_file") add("内容", args.content === undefined ? undefined : `${copyText(args.content).length} 字符`, "content");
@@ -1456,6 +1570,7 @@
     if (typeof filePath === "string" && filePath.trim()) return basename(filePath);
     if (typeof request.pattern === "string" && request.pattern.trim()) return short(request.pattern.trim(), 56);
     if (typeof argumentsValue.unique_code === "string" && argumentsValue.unique_code.trim()) return argumentsValue.unique_code.trim();
+    if (typeof argumentsValue.skill_id === "string" && argumentsValue.skill_id.trim()) return argumentsValue.skill_id.trim();
     if (typeof argumentsValue.mission === "string" && argumentsValue.mission.trim()) return short(argumentsValue.mission.trim(), 56);
     const url = request.url || request.address;
     if (typeof url === "string" && url.trim()) {
@@ -1469,6 +1584,7 @@
   }
 
   function toolIconKind(name) {
+    if (name.startsWith("skill_")) return "read";
     if (name.includes("shell")) return "terminal";
     if (name.includes("read")) return "read";
     if (name.includes("write") || name.includes("edit")) return "edit";
@@ -2206,6 +2322,7 @@
         ? {protection: "开发环境：未提供 Linux 硬限制", ...limits}
         : Object.keys(limits).length ? limits : {protection: "此任务未记录资源预算"}));
       if (task.resource_usage?.memory_peak_bytes != null) target.append(detailBlock("资源使用", task.resource_usage));
+      if (task.http_summary) target.append(detailBlock("Shell HTTP（响应帧下界）", task.http_summary));
     }
     target.append(make("p", "muted-line", "执行完成不代表挑战已解出"));
     if (state.taskDetail?.cwd != null) target.append(detailBlock("工作目录", state.taskDetail.cwd));
@@ -2413,6 +2530,14 @@
   }
 
   function renderReports(target, agent) {
+    const terminal = agent.final_report || {};
+    if (agent.role === "worker" && terminal.system_finalized) {
+      target.append(detailGrid([
+        ["系统终态", statusLabel(terminal.status)], ["首次终止原因", terminal.termination_reason || "unavailable"],
+        ["模型请求数", String(terminal.rounds_used)], ["工具调用数", String(terminal.tool_calls)],
+        ["最终资源清理", terminal.resource_cleanup_status || "unavailable"],
+      ]));
+    }
     target.append(detailBlock("最终报告", pretty(agent.final_report || {})));
     const reports = (state.snapshot.reports || []).filter((report) => report.agent_id === agent.agent_id).slice(-12).reverse();
     if (!reports.length) target.append(make("p", "muted-line", "暂无已提交报告。"));
@@ -2431,6 +2556,17 @@
 
   function renderRuntime(target) {
     const snapshot = state.snapshot;
+    const chains = snapshot.chain_metrics || {};
+    if (chains.observer) {
+      const advice = chains.observer.valid_advice_rate;
+      target.append(runtimeStatGrid([
+        ["观察者有效意见率", advice == null ? "unavailable" : `${(advice * 100).toFixed(1)}%`],
+        ["采纳检查 / 有效采纳", `${chains.progress_adoption?.started || 0} / ${chains.progress_adoption?.validated_adoptions || 0}`],
+        ["待交付结果组", String(chains.result_delivery?.pending_exchanges || 0)],
+        ["未确认释放", String(chains.cleanup?.release_pending || 0)],
+      ]));
+      target.append(detailBlock("交付、采纳与回收诊断", pretty(chains)));
+    }
     const agents = snapshot.agents || [];
     const activeAgents = agents.filter(isActive).length;
     const verifiedFindings = (snapshot.findings || []).filter((item) => item.verification_status === "verified").length;

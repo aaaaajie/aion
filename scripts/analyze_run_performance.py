@@ -8,6 +8,7 @@ from agent.model_usage import aggregate_usage
 from agent.state.database import SCHEMA_VERSION
 from scripts.analyze_hint_delivery import hint_delivery_metrics
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -77,10 +78,20 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
     skill_discovery_fallback = 0
     skill_candidate_count = 0
     skill_candidate_agents: set[str] = set()
+    candidate_event_digests: set[str] = set()
     skill_model_activation_agents: set[str] = set()
     skill_discovery_sources: dict[str, int] = {}
     skill_discovery_failures: dict[str, int] = {}
     skill_discovery_cache_hits = 0
+    capability_decision_checkpoint_count = 0
+    capability_decision_processed_count = 0
+    capability_decision_missed_count = 0
+    capability_verifier_dispatch_count = 0
+    capability_verifier_dispatch_status: dict[str, int] = {}
+    capability_verifier_finish_status: dict[str, int] = {}
+    decision_window_by_agent: dict[str, dict[str, Any]] = {}
+    decision_capability_delays: list[float] = []
+    decision_target_check_delays: list[float] = []
     model_rounds_to_dispatch: list[float] = []
     first_useful_round_by_agent: dict[str, float] = {}
     evidence_ref_count = 0
@@ -103,21 +114,35 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
     first_delegation_result_by_agent: dict[str, bool] = {}
     cleanup_failure_events = 0
     cleanup_failures_by_manager: dict[str, int] = {}
+    worker_started_count = 0
+    worker_profiles: dict[str, int] = {}
+    worker_error_codes: dict[str, int] = {}
+    worker_diagnostic_codes: dict[str, int] = {}
+    worker_verification_status: dict[str, int] = {}
+    worker_terminal_status: dict[str, int] = {}
+    worker_termination_reasons: dict[str, int] = {}
+    worker_report_protocol_failures = 0
+    worker_foreign_handle_failures = 0
+    worker_scope_failures = 0
+    worker_agent_runner_errors = 0
+    worker_runtime_metrics: list[dict[str, Any]] = []
+    worker_cleanup_status: dict[str, int] = {}
+    worker_terminal_report_count = 0
+    worker_started_by_agent: set[str] = set()
+    worker_terminal_by_agent: dict[str, dict[str, Any]] = {}
+    worker_terminal_duplicate_count = 0
     llm_response_rejections: dict[str, int] = {}
     llm_reasoning_missing = 0
     llm_policy: dict[str, Any] | None = None
-    observer_outcomes: dict[str, int] = {}
-    observer_failures: dict[str, int] = {}
-    observer_trimmed = 0
-    observer_skipped = 0
-    observer_received: set[tuple[str, int]] = set()
-    observer_assessments: dict[str, int] = {}
-    observer_tensions = 0
-    observer_corrections: dict[str, int] = {}
-    correction_deliveries: set[str] = set()
+    from scripts.run_chain_metrics import ChainMetrics
+    chains = ChainMetrics()
     review_metrics = {"deliveries": 0, "automatic_triggers": 0, "task_snapshot_deliveries": 0,
                       "successful_records": 0, "rejected_calls": 0, "assessments": {}}
     stagnation_metrics = {
+        "resume_hint_attempt_count": 0,
+        "resume_hint_success_count": 0,
+        "resume_hint_results": {},
+        "completed_after_resume_count": 0,
         "review_due_count": 0,
         "strategy_reset_count": 0,
         "alternate_worker_started_count": 0,
@@ -127,6 +152,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         "max_stalled_seconds": 0,
     }
     covered_results: set[tuple[str, int]] = set()
+    stagnation_resumed: set[str] = set()
     execution_results: set[tuple[str, int]] = set()
     parameter_errors: dict[str, int] = {}
     preflight = {"calls": 0, "successes": 0, "failures": 0}
@@ -135,6 +161,12 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
     # errors.  Keep one terminal record per task so repeated cleanup events do
     # not inflate the report.
     shell_terminal_by_task: dict[tuple[str, str], dict[str, Any]] = {}
+    factual_metrics = {"record_count": 0, "persistence_failures": 0, "tools": {},
+                       "duplicate_completed_tests": 0, "reset_context_chars": [],
+                       "independent_observer_snapshots": 0, "stale_observer_results": 0,
+                       "first_new_experiment_after_reset_seconds": []}
+    factual_inputs = set()
+    reset_starts = {}
 
     def collect_event(
         event_type: str, value: dict[str, Any], agent_id: str | None, sequence: int = 0
@@ -150,19 +182,50 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         nonlocal runtime_fatal_errors
         nonlocal flag_submissions, flag_submissions_correct
         nonlocal cleanup_failure_events
+        nonlocal worker_started_count, worker_terminal_report_count
+        nonlocal worker_report_protocol_failures, worker_foreign_handle_failures
+        nonlocal worker_scope_failures
+        nonlocal worker_agent_runner_errors
+        nonlocal worker_terminal_duplicate_count
         nonlocal skill_discovery_started, skill_discovery_completed
         nonlocal skill_discovery_failed, skill_discovery_fallback
         nonlocal skill_candidate_count
         nonlocal skill_discovery_cache_hits
+        nonlocal capability_decision_checkpoint_count, capability_decision_processed_count
+        nonlocal capability_decision_missed_count
+        nonlocal capability_verifier_dispatch_count
         nonlocal llm_reasoning_missing, llm_policy
-        nonlocal observer_trimmed, observer_skipped, observer_tensions
 
-        if event_type.startswith("observer_correction_"):
-            kind = event_type.removeprefix("observer_correction_")
-            observer_corrections[kind] = observer_corrections.get(kind, 0) + 1
+        if event_type == "experiment_recorded":
+            factual_metrics["record_count"] += 1
+            tool = value.get("tool", "unknown")
+            factual_metrics["tools"][tool] = factual_metrics["tools"].get(tool, 0) + 1
+            out = value.get("output") or {}
+            if tool in {"http_request", "shell_command"} and (out.get("body_complete") is True or out.get("status") == "completed"):
+                key = (value.get("unique_code"), value.get("resource_generation"), tool, value.get("input_digest"))
+                if key in factual_inputs:
+                    factual_metrics["duplicate_completed_tests"] += 1
+                elif agent_id in reset_starts and value.get("recorded_at"):
+                    factual_metrics["first_new_experiment_after_reset_seconds"].append(
+                        max(0, (datetime.fromisoformat(value["recorded_at"]) - reset_starts.pop(agent_id)).total_seconds()))
+                factual_inputs.add(key)
+        elif event_type == "experiment_persistence_failed":
+            factual_metrics["persistence_failures"] += 1
+        elif event_type == "solver_strategy_context_rebuilt" and "context_chars" in value:
+            factual_metrics["reset_context_chars"].append(value["context_chars"])
+            if value.get("rebuilt_at"):
+                reset_starts[agent_id] = datetime.fromisoformat(value["rebuilt_at"])
+        elif event_type == "solver_observation_snapshot" and "advice" in value:
+            factual_metrics["independent_observer_snapshots"] += int(value.get("advice") is not None and not value.get("error"))
+        elif event_type == "solver_observation_discarded":
+            factual_metrics["stale_observer_results"] += int(value.get("error_code") == "observation_stale")
         if event_type == "run_finished":
             reason = str(value.get("reason") or "unrecorded")
             completion_reasons[reason] = completion_reasons.get(reason, 0) + 1
+        if event_type == "agent_execution_ended" and str(agent_roles.get(str(agent_id or ""), "")) == "worker":
+            worker_agent_runner_errors += int(
+                value.get("exception_type") == "AgentRunnerError"
+            )
         if event_type == "shell_task_finished":
             task_id = value.get("task_id")
             if isinstance(task_id, str):
@@ -198,18 +261,18 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             stagnation_metrics["strategy_reset_count"] += 1
         elif event_type == "solver_stagnation_worker_started":
             stagnation_metrics["alternate_worker_started_count"] += 1
-        elif event_type == "solver_stagnation_worker_finished":
-            stagnation_metrics["alternate_worker_finished_count"] += 1
-            status = str(value.get("status") or "unknown")
-            results = stagnation_metrics["worker_results"]
-            results[status] = results.get(status, 0) + 1
         elif event_type == "solver_stagnation_rotation_requested":
             stagnation_metrics["rotation_requested_count"] += 1
+        if event_type == "solver_strategy_reset" and value.get("pause_reason") == "stagnation_timeout":
+            stagnation_resumed.add(str(value.get("unique_code")))
+        if event_type == "solver_resume_hint_decision" and value.get("decision") == "request":
+            stagnation_metrics["resume_hint_attempt_count"] += 1
+        if event_type == "solver_resume_hint_result":
+            status = str(value.get("status"))
+            results = stagnation_metrics["resume_hint_results"]
+            results[status] = results.get(status, 0) + 1
+            stagnation_metrics["resume_hint_success_count"] += int(status == "succeeded")
 
-        if event_type == "assistant_response" and value.get("observation_correction_id"):
-            correction_deliveries.add(value['observation_correction_id'])
-        if event_type == "assistant_response" and value.get("observation_revision"):
-            observer_received.add((str(agent_id), value["observation_revision"]))
         if event_type == "solver_review_record":
             review_metrics["successful_records"] += 1
             review = value.get("review") or {}
@@ -217,19 +280,6 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             review_metrics["assessments"][outcome] = review_metrics["assessments"].get(outcome, 0) + 1
             covered_results.update((str(agent_id), seq) for seq in review.get("covered_sequences", []))
             covered_results.update((str(agent_id), seq) for seq in (review.get("validation") or {}).get("conclusion_sequences", []))
-            assessment = (value.get("review") or {}).get("observation_assessment")
-            if assessment:
-                observer_assessments[assessment] = observer_assessments.get(assessment, 0) + 1
-        if event_type == "solver_observation_snapshot":
-            observer_tensions += len((value.get("map") or {}).get("TENSION", []))
-            diagnostics = value.get("diagnostics") or {}
-            outcome = diagnostics.get("outcome") or value.get("status", "unknown")
-            observer_outcomes[outcome] = observer_outcomes.get(outcome, 0) + 1
-            stage = diagnostics.get("failure_stage")
-            if stage:
-                observer_failures[stage] = observer_failures.get(stage, 0) + 1
-            observer_trimmed += sum(diagnostics.get("trimmed_entries", {}).values())
-            observer_skipped += ((value.get("coverage") or {}).get("skipped") or {}).get("count", 0)
 
         role = agent_roles.get(str(agent_id or ""), "unknown")
         role_summary = summary_by_role.setdefault(
@@ -303,19 +353,155 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             source = str(value.get("source") or "local_fallback")
             skill_discovery_sources[source] = skill_discovery_sources.get(source, 0) + 1
         elif event_type == "skill_candidate_presented":
-            skill_candidate_count += int(value.get("candidate_count") or 0)
-            if agent_id:
-                skill_candidate_agents.add(str(agent_id))
+            candidates = value.get("candidates")
+            count = int(value.get("candidate_count") or 0)
+            if isinstance(candidates, list):
+                count = len(candidates)
+            digest = json.dumps(
+                {"agent": agent_id, "candidates": candidates or count},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if digest not in candidate_event_digests:
+                candidate_event_digests.add(digest)
+                skill_candidate_count += count
+                if count and agent_id:
+                    skill_candidate_agents.add(str(agent_id))
+        elif event_type == "capability_awareness_presented":
+            candidates = value.get("candidates")
+            count = len(candidates) if isinstance(candidates, list) else 0
+            digest = json.dumps(
+                {"agent": agent_id, "candidates": candidates or []},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if digest not in candidate_event_digests:
+                candidate_event_digests.add(digest)
+                skill_candidate_count += count
+                if count and agent_id:
+                    skill_candidate_agents.add(str(agent_id))
+            if value.get("decision_due") is True:
+                capability_decision_checkpoint_count += 1
+                if agent_id:
+                    decision_window_by_agent[str(agent_id)] = {
+                        "sequence": sequence,
+                        "processed": False,
+                        "capability_seen": False,
+                        "target_seen": False,
+                    }
+        elif event_type == "tool_result":
+            decision = decision_window_by_agent.get(str(agent_id))
+            if decision is not None:
+                tool_name = str(value.get("tool_name") or "")
+                result = value.get("result")
+                successful = isinstance(result, dict) and result.get("ok") is True
+                if (
+                    successful
+                    and tool_name in {"skill_search", "skill_invoke", "solver_review"}
+                    and not decision["processed"]
+                ):
+                    capability_decision_processed_count += 1
+                    decision["processed"] = True
+                elif successful and tool_name in {
+                    "system_http_request", "system_http_replay", "system_http_probe",
+                    "system_http_compare", "system_web_path_probe", "pentest_sqlmap",
+                } and not decision["target_seen"]:
+                    decision_target_check_delays.append(max(0, sequence - decision["sequence"]))
+                    decision["target_seen"] = True
+        elif event_type == "capability_decision_missed":
+            capability_decision_missed_count += 1
+        elif event_type == "capability_verifier_dispatched":
+            capability_verifier_dispatch_count += 1
+            status = str(value.get("status") or "unknown")
+            capability_verifier_dispatch_status[status] = capability_verifier_dispatch_status.get(status, 0) + 1
+        elif event_type == "capability_verifier_finished":
+            status = str(value.get("status") or "unknown")
+            capability_verifier_finish_status[status] = capability_verifier_finish_status.get(status, 0) + 1
+            decision = decision_window_by_agent.get(str(agent_id))
+            if decision is not None and status in {"confirmed", "completed"} and not decision["capability_seen"]:
+                decision_capability_delays.append(max(0, sequence - decision["sequence"]))
+                decision["capability_seen"] = True
+        elif event_type == "worker_started":
+            key = str(agent_id or value.get("worker_id") or sequence)
+            if key not in worker_started_by_agent:
+                worker_started_by_agent.add(key)
+                worker_started_count += 1
+                profile = str(value.get("worker_profile") or "unknown")
+                worker_profiles[profile] = worker_profiles.get(profile, 0) + 1
+        elif event_type == "worker_resource_cleanup":
+            status = str(value.get("resource_cleanup_status") or "unknown")
+            worker_cleanup_status[status] = worker_cleanup_status.get(status, 0) + 1
+        elif event_type == "worker_terminal_finalized":
+            key = str(agent_id or value.get("report_id") or sequence)
+            if key in worker_terminal_by_agent:
+                worker_terminal_duplicate_count += 1
+                return
+            worker_terminal_by_agent[key] = dict(value)
+            status = str(value.get("status") or "unknown")
+            worker_terminal_status[status] = worker_terminal_status.get(status, 0) + 1
+            worker_runtime_metrics.append(
+                {
+                    "agent_id": agent_id,
+                    "status": status,
+                    "termination_reason": value.get("termination_reason"),
+                    "rounds_used": value.get("rounds_used"),
+                    "tool_calls": value.get("tool_calls"),
+                    "owned_resources_closed": value.get("owned_resources_closed"),
+                    "resource_cleanup_status": value.get("resource_cleanup_status"),
+                }
+            )
+            termination_reason = value.get("termination_reason")
+            if isinstance(termination_reason, str) and termination_reason:
+                worker_termination_reasons[termination_reason] = (
+                    worker_termination_reasons.get(termination_reason, 0) + 1
+                )
+            error_code = value.get("error_code")
+            if isinstance(error_code, str) and error_code:
+                worker_diagnostic_codes[error_code] = (
+                    worker_diagnostic_codes.get(error_code, 0) + 1
+                )
+                worker_report_protocol_failures += int(
+                    error_code
+                    in {
+                        "invalid_json",
+                        "invalid_arguments",
+                        "capability_verifier_contract",
+                        "missing_structured_report",
+                    }
+                )
+                worker_foreign_handle_failures += int(
+                    error_code
+                    in {"capability_verifier_foreign_handle"}
+                )
+                worker_scope_failures += int(
+                    error_code in {"capability_verifier_scope", "capability_verifier_budget"}
+                )
         elif (
             event_type == "skill_activated"
             and value.get("activation_mode") == "model"
             and agent_id
         ):
             skill_model_activation_agents.add(str(agent_id))
+            decision = decision_window_by_agent.get(str(agent_id))
+            if decision is not None and not decision["capability_seen"]:
+                decision_capability_delays.append(max(0, sequence - decision["sequence"]))
+                decision["capability_seen"] = True
         elif event_type in {"worker_reported", "worker_updated"}:
             findings_received += int(value.get("findings_received") or 0)
             findings_persisted += int(value.get("findings_persisted") or 0)
             candidate_flags += int(bool(value.get("candidate_flag_present")))
+            if event_type == "worker_reported":
+                worker_terminal_report_count += 1
+                error_code = value.get("error_code")
+                if isinstance(error_code, str) and error_code:
+                    worker_error_codes[error_code] = worker_error_codes.get(error_code, 0) + 1
+                verification = value.get("verification_status")
+                if isinstance(verification, str) and verification:
+                    worker_verification_status[verification] = (
+                        worker_verification_status.get(verification, 0) + 1
+                    )
         elif event_type == "challenge_progress_recorded":
             for kind in value.get("progress_kinds", []):
                 progress_kinds[kind] = progress_kinds.get(kind, 0) + 1
@@ -520,8 +706,9 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                     )
                 }
             )
-        for sequence, event_type, payload, agent_id in connection.execute(
-            "SELECT sequence, event_type, payload, agent_id FROM state_events "
+        chains.worker_keys = dict(connection.execute("SELECT agent_id,coalesce(task_key,'') FROM agents WHERE run_id=?", (run_id,))) if "agents" in tables else {}
+        for sequence, event_type, payload, agent_id, created_at in connection.execute(
+            "SELECT sequence, event_type, payload, agent_id, created_at FROM state_events "
             "WHERE run_id = ? ORDER BY sequence",
             (run_id,),
         ):
@@ -535,6 +722,13 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
                 ):
                     execution_results.add((str(agent_id), sequence))
                 collect_event(str(event_type), value, agent_id, int(sequence))
+                chains.record(event_type, value, agent_id, sequence, created_at)
+        if "challenges" in tables:
+            stagnation_metrics["completed_after_resume_count"] = sum(
+                code in stagnation_resumed for (code,) in connection.execute(
+                    "SELECT unique_code FROM challenges WHERE run_id = ? AND is_completed = 1", (run_id,)
+                )
+            )
         if "http_interactions" in tables:
             http_interactions = int(
                 connection.execute(
@@ -643,22 +837,86 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         if reason:
             reasons = shell_execution["termination_reasons"]
             reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+    shell_http = {
+        "task_count": 0,
+        "observed_response_count": 0,
+        "status_classes": {},
+        "redirect_count": 0,
+        "error_count": 0,
+        "incomplete_task_count": 0,
+        "capped_task_count": 0,
+        "measurement": "shell_output_lower_bound",
+    }
+    for item in shell_terminal_by_task.values():
+        cleanup = item.get("cleanup") if isinstance(item.get("cleanup"), dict) else {}
+        summary = cleanup.get("http_summary")
+        if not isinstance(summary, dict):
+            continue
+        count = summary.get("observed_response_count")
+        if not isinstance(count, int) or count <= 0:
+            continue
+        shell_http["task_count"] += 1
+        shell_http["observed_response_count"] += count
+        for bucket, bucket_count in (summary.get("status_classes") or {}).items():
+            if isinstance(bucket, str) and isinstance(bucket_count, int) and bucket_count >= 0:
+                shell_http["status_classes"][bucket] = (
+                    shell_http["status_classes"].get(bucket, 0) + bucket_count
+                )
+        for key in ("redirect_count", "error_count"):
+            value = summary.get(key)
+            if isinstance(value, int) and value >= 0:
+                shell_http[key] += value
+        if summary.get("incomplete") is True:
+            shell_http["incomplete_task_count"] += 1
+        if summary.get("capped") is True:
+            shell_http["capped_task_count"] += 1
+    chain_values = chains.result()
+    worker_error_codes.clear()
+    worker_verification_status.clear()
+    worker_cleanup_status.clear()
+    for terminal in worker_terminal_by_agent.values():
+        if terminal.get("error_code"):
+            code = terminal["error_code"]
+            worker_error_codes[code] = worker_error_codes.get(code, 0) + 1
+        if terminal.get("verification_status"):
+            status = terminal["verification_status"]
+            worker_verification_status[status] = worker_verification_status.get(status, 0) + 1
+    for item in worker_runtime_metrics:
+        cleanup = chains.worker_cleanup.get(item["agent_id"], {})
+        if cleanup.get("resource_cleanup_status"):
+            item["resource_cleanup_status"] = cleanup["resource_cleanup_status"]
+            item["owned_resources_closed"] = cleanup["resource_cleanup_status"] == "closed"
+        status = item["resource_cleanup_status"] or "unavailable"
+        worker_cleanup_status[status] = worker_cleanup_status.get(status, 0) + 1
+    stagnation_metrics["worker_results"] = chain_values.pop("stagnation_final_results")
+    stagnation_metrics["alternate_worker_finished_count"] = sum(stagnation_metrics["worker_results"].values())
     return {
+        **chain_values,
         "progress": {"recorded_by_kind": progress_kinds, "evidence_items": evidence_ref_count},
         "reviews": {**review_metrics, "covered_result_count": len(covered_results & execution_results)},
         "stagnation": stagnation_metrics,
+        "factual_blackboard": factual_metrics,
+        "workers": {
+            "started_count": worker_started_count,
+            "terminal_report_count": len(worker_terminal_by_agent),
+            "terminal_duplicate_event_count": worker_terminal_duplicate_count,
+            "profiles": dict(sorted(worker_profiles.items())),
+            "error_codes": dict(sorted(worker_error_codes.items())),
+            "diagnostic_codes": dict(sorted(worker_diagnostic_codes.items())),
+            "terminal_status": dict(sorted(worker_terminal_status.items())),
+            "termination_reasons": dict(sorted(worker_termination_reasons.items())),
+            "report_protocol_failure_count": worker_report_protocol_failures,
+            "foreign_handle_failure_count": worker_foreign_handle_failures,
+            "scope_failure_count": worker_scope_failures,
+            "agent_runner_error_count": worker_agent_runner_errors,
+            "runtime_metrics": worker_runtime_metrics,
+            "verification_status": dict(sorted(worker_verification_status.items())),
+            "resource_cleanup_status": dict(sorted(worker_cleanup_status.items())),
+        },
         "parameter_errors": parameter_errors,
         "preflight": preflight,
         "completion_reasons": completion_reasons,
         "hint_delivery": hint_delivery,
-        "observer": {"outcomes": observer_outcomes, "failure_stages": observer_failures,
-                     "trimmed_entries": observer_trimmed, "skipped_events": observer_skipped,
-                     "received_revisions": len(observer_received), "tension_entries": observer_tensions,
-                     "solver_reported_assessments": observer_assessments,
-                     "verified_correction_count": observer_corrections.get("resolved", 0),
-                     "corrections": {**observer_corrections,
-                                     "delivered": len(correction_deliveries),
-                                     "feedback": sum(observer_assessments.values())}},
         "run_id": run_id,
         "token_usage": token_usage,
         "status": row[0],
@@ -699,6 +957,7 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
         "tool_result_persisted_count": persisted_results,
         "tool_failures": dict(sorted(tool_failures.items())),
         "shell_execution": shell_execution,
+        "shell_http": shell_http,
         "critical_tools": dict(sorted(critical_tool_results.items())),
         "competition_flow": {
             "model_rounds_to_dispatch": _summary(model_rounds_to_dispatch),
@@ -808,13 +1067,24 @@ def analyze_run(database: Path, run_id: str) -> dict[str, Any]:
             "discovery_cache_hit_count": skill_discovery_cache_hits,
             "candidate_presented_agent_count": len(skill_candidate_agents),
             "candidate_presented_count": skill_candidate_count,
+            "soft_decision_checkpoint_count": capability_decision_checkpoint_count,
+            "soft_decision_processed_count": capability_decision_processed_count,
+            "soft_decision_missed_count": capability_decision_missed_count,
+            "capability_verifier_dispatch_count": capability_verifier_dispatch_count,
+            "capability_verifier_dispatch_status": dict(sorted(capability_verifier_dispatch_status.items())),
+            "capability_verifier_finish_status": dict(sorted(capability_verifier_finish_status.items())),
+            "first_capability_delay_events": _summary(decision_capability_delays),
+            "first_target_check_delay_events": _summary(decision_target_check_delays),
             "candidate_presentation_rate": (
                 round(
-                    len(skill_candidate_agents)
-                    / sum(role == "worker" for role in agent_roles.values()),
+                    sum(
+                        agent_roles.get(agent_id) in {"solver", "worker"}
+                        for agent_id in skill_candidate_agents
+                    )
+                    / sum(role in {"solver", "worker"} for role in agent_roles.values()),
                     4,
                 )
-                if any(role == "worker" for role in agent_roles.values())
+                if any(role in {"solver", "worker"} for role in agent_roles.values())
                 else None
             ),
             "model_activation_agent_count": len(skill_model_activation_agents),

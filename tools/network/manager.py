@@ -69,6 +69,8 @@ class LiveNetworkTask:
     finished_received: bool = False
     counters: dict[str, Any] = field(default_factory=dict)
     last_db_update: float = 0.0
+    experiment_input: dict[str, Any] = field(default_factory=dict)
+    experiment_scope: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentNetworkClient:
@@ -314,7 +316,8 @@ class NetworkDiscoveryManager:
                 wait_seconds,
             )
             row = await self._owned(agent_id, task_id)
-        records, next_cursor = self._read_results(results_path, cursor, limit, filters)
+        records, next_cursor, parse_errors = self._read_results(results_path, cursor, limit, filters)
+        result_end = results_path.stat().st_size if results_path.exists() else 0
         summary = self._summary(task_id, task_dir)
         progress = self._read_json(task_dir / "progress.json")
         return {
@@ -337,6 +340,11 @@ class NetworkDiscoveryManager:
             "results": records,
             "cursor": cursor,
             "next_cursor": next_cursor,
+            "page_end_cursor": result_end,
+            "eof": next_cursor >= result_end,
+            "output_incomplete": bool(parse_errors),
+            "read_scope": {"default": not filters},
+            "is_terminal": row["status"] in TERMINAL,
             "read_result": {
                 "tool": "system_network_output",
                 "arguments": {"task_id": task_id, "cursor": cursor, "limit": limit,
@@ -541,6 +549,12 @@ class NetworkDiscoveryManager:
             "web_mark": params["web_mark"],
         }
         await self._write_command(live, start)
+        from agent.experiment_records import portable, digest
+        live.experiment_input = portable(start)
+        live.experiment_scope = await self.service.capture_experiment_scope(self.run_id, live.agent_id)
+        await self._experiment(live, {"tool": "network_discovery", "input_digest": digest(start),
+            "requested_input": live.experiment_input, "executed_input": {"availability": "submitted_to_scanner"},
+            "output": {"status": "running"}})
         ready_wait = asyncio.create_task(live.ready.wait())
         done_wait = asyncio.create_task(live.done.wait())
         done, pending = await asyncio.wait(
@@ -626,6 +640,12 @@ class NetworkDiscoveryManager:
                 error_code=error_code,
             )
         finally:
+            from agent.experiment_records import digest
+            await self._experiment(live, {"tool": "network_terminal", "input_digest": digest(live.experiment_input),
+                "executed_input": {"availability": "scanner_reported"},
+                "output": {"status": status, "exit_code": live.process.returncode,
+                    "planned": int(live.counters["tasks_total"]), "completed": int(live.counters["tasks_completed"]),
+                    "incomplete": status != "completed", "errors": live.counters["errors"]}})
             await self._finish_work(live.task_id, status, error_code)
             live.changed.set()
             live.done.set()
@@ -711,6 +731,15 @@ class NetworkDiscoveryManager:
             await self._send_control(live, "stop")
             return
         counters = live.counters
+        from agent.experiment_records import portable, digest
+        await self._experiment(live, {"tool": "network_result", "tool_version": live.scanner_version,
+            "target": target, "input_digest": digest({"input": live.experiment_input, "target": target}),
+            "requested_input": live.experiment_input,
+            "executed_input": {"availability": "scanner_reported", "target": target},
+            "output": {"status": record["status"], "host": host, "port": record["port"],
+                       "protocol": record["protocol"], "banner": portable(record["banner"]),
+                       "scanner_report_type": result_type,
+                       "interpretation": "Scanner observation; service names and vulnerability claims are not verified facts."}})
         counters["records"] += 1
         counters["result_bytes"] += len(line.encode("utf-8"))
         if result_type == "HOST" and host:
@@ -727,6 +756,15 @@ class NetworkDiscoveryManager:
                 counters["web_ports"] += 1
             await self._record_service_observation(live, record)
         await self._persist_progress(live)
+
+    async def _experiment(self, live: LiveNetworkTask, record: dict[str, Any]) -> None:
+        from agent.experiment_records import digest
+        try:
+            await self.service.record_experiment(self.run_id, live.agent_id, {**record, **live.experiment_scope,
+                "execution_key": digest([live.agent_id, "task", live.task_id]), "batch_digest": digest(live.task_id)})
+        except Exception as exc:
+            await self.service.append_agent_event(self.run_id, live.agent_id, "experiment_persistence_failed",
+                {"tool": record["tool"], "error": type(exc).__name__})
 
     async def _record_service_observation(
         self, live: LiveNetworkTask, record: dict[str, Any]
@@ -995,11 +1033,12 @@ class NetworkDiscoveryManager:
         cursor: int,
         limit: int,
         filters: dict[str, Any] | None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, int]:
         records: list[dict[str, Any]] = []
         next_cursor = cursor
+        parse_errors = 0
         if not path.exists():
-            return records, next_cursor
+            return records, next_cursor, parse_errors
         with path.open("rb") as source:
             source.seek(min(cursor, path.stat().st_size))
             while len(records) < limit:
@@ -1010,10 +1049,11 @@ class NetworkDiscoveryManager:
                 try:
                     record = json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError):
+                    parse_errors += 1
                     continue
                 if NetworkDiscoveryManager._matches_filter(record, filters):
                     records.append(record)
-        return records, next_cursor
+        return records, next_cursor, parse_errors
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, Any]) -> None:

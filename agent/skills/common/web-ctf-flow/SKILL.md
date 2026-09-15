@@ -1,15 +1,16 @@
 ---
 name: web-ctf-flow
 description: >-
-  页面错误与业务结果分离、认证会话失效、重定向与 Cookie 对照、扫描会话隔离。
+  页面错误与业务结果分离、登录入口预检、认证失效、重定向与 Cookie 对照、扫描会话隔离。
   Diagnose authorized Web CTF stateful workflows when page errors, redirects,
-  cookies and business results disagree, or scanning invalidates a session.
+  cookies and business results disagree, when a login form/API is available, or
+  when scanning invalidates a session.
   Establish controls and the shortest goal check without broad route guessing.
 ---
 
 # Web state and layered diagnosis
 
-Use current-challenge evidence to connect prerequisites, requests, returned state
+Use challenge evidence to connect prerequisites, requests, returned state
 and the goal. A page comment is a lead; it does not prove a hidden route exists.
 
 ## Establish a small state map
@@ -20,6 +21,15 @@ request parsing, authentication, database/result handling, template rendering an
 subsequent business actions; failure in one layer does not establish failure in all.
 Do not require a linear business chain unless its dependencies are evidenced.
 
+## Login entry checkpoint
+
+For an unverified login form/API, keep method, fields, encoding, CSRF and session
+fixed. Use one failure baseline and at most two generic bypass classes:
+boolean-condition and single-result or comment.
+
+Compare status, Location, Set-Cookie, structure and known read-only control. Verify a
+state change, then stop; otherwise record unconfirmed; avoid wordlists, sqlmap or broad scans
+
 ## Compare controls and layers
 
 - Preserve the initial response before redirects and the final response separately.
@@ -29,7 +39,9 @@ Do not require a linear business chain unless its dependencies are evidenced.
   requiring that page to recover. If no such control is known, locate one from
   observed links or source; do not invent an endpoint.
 - For a persistent 5xx, change one relevant variable with a normal/invalid request
-  pair and inspect the affected layer. A failed page can coexist with changed state.
+  pair and inspect the affected layer. The 5xx identifies a failure in one request
+  layer only; check parsing, authentication, session state and downstream business
+  control separately. A failed page can coexist with changed state.
   Repeated refreshes or larger route lists do not identify the failing layer.
 - A 401/403 may reflect identity, authorization or a gateway; a 404 may reflect the
   route or object. Compare a known control before interpreting an unknown request.
@@ -39,6 +51,17 @@ Do not require a linear business chain unless its dependencies are evidenced.
   continuing the current business chain. A guessed data location is not a fact.
   If the next uncertainty is where flag content could reside, search for
   `ctf-flag-locator` to prioritize candidate carriers using current evidence.
+
+## Shortest goal check
+
+After a known read-only control confirms authentication or a new capability, make one
+bounded goal-carrier check before broad enumeration. Rank carriers from current evidence:
+database output or reflection supports a narrow database-backed read; a session or
+business response supports a protected control; file or command capability supports
+the corresponding target-side read. This is a priority hint, not a fixed route: if
+the first check is negative, run one evidence-based distinguishing experiment and
+record the remaining uncertainty. Do not dump a database, scan routes or invoke sqlmap
+solely because SQLi succeeded.
 
 ## Keep scans from changing the control
 

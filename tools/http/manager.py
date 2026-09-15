@@ -85,6 +85,7 @@ class LiveInteraction:
     execution_task: asyncio.Task[None] | None = None
     analysis_task: asyncio.Task[None] | None = None
     journal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    experiment_scope: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentHttpClient:
@@ -574,6 +575,19 @@ class HttpProbeManager:
         estimate_per_response = await self._historical_response_estimate(requests)
         estimated_disk = len(requests) * estimate_per_response
         relative = self.policy.relative_lexical(interaction_dir)
+        live = LiveInteraction(interaction_id, agent_id, requests)
+        live.experiment_scope = await self.service.capture_experiment_scope(self.run_id, agent_id)
+        from agent.experiment_records import digest, request_snapshot
+        await self._persist_experiment(agent_id, {
+            "tool": "http_batch_manifest", "target": requests[0].spec.url if requests else "",
+            **live.experiment_scope,
+            "batch_digest": digest(interaction_id), "input_digest": digest([r.spec.model_dump(mode="json") for r in requests]),
+            "requested_input": {"members": [{"ordinal": r.ordinal, "request": request_snapshot(r.spec.model_dump(mode="json"))} for r in requests]},
+            "executed_input": {"availability": "not_yet_executed"},
+            "output": {"estimated_requests": len(requests), "completed_requests": 0},
+        })
+        self._plan_cache[(agent_id, interaction_id)] = requests
+        self._live[interaction_id] = live
         try:
             work_id = self._work_id(interaction_id, "execution", 1)
             await self.service.create_http_interaction_with_work(
@@ -590,11 +604,10 @@ class HttpProbeManager:
                 estimated_analysis_work=len(requests),
             )
         except Exception:
+            self._drop_interaction_caches(agent_id, interaction_id)
+            self._live.pop(interaction_id, None)
             shutil.rmtree(interaction_dir, ignore_errors=True)
             raise
-        live = LiveInteraction(interaction_id, agent_id, requests)
-        self._plan_cache[(agent_id, interaction_id)] = requests
-        self._live[interaction_id] = live
         await self._wait(live.execution_done, wait_seconds)
         return await self._result_page(
             agent_id, interaction_id, cursor=0, limit=result_limit
@@ -655,6 +668,12 @@ class HttpProbeManager:
                 "validation",
                 "invalid_path_probe_candidate_limit",
                 "max_candidates must be between 1 and 1000",
+            )
+        if profile in {"targeted", "deep"} and not (wordlist_paths or packaged_wordlists):
+            raise self._error(
+                "validation",
+                "path_probe_requires_explicit_scope",
+                "targeted and deep path probes require packaged_wordlists or workspace wordlist_paths",
             )
         preset = PROFILE_PRESETS[profile]
         interaction_id = f"interaction-{uuid4().hex}"
@@ -744,6 +763,24 @@ class HttpProbeManager:
         estimated_disk = request_count * estimate_per_response
         relative = self.policy.relative_lexical(interaction_dir)
         estimated_requests = request_count + engine.calibration_budget()
+        live = LiveInteraction(interaction_id, agent_id, [])
+        live.experiment_scope = await self.service.capture_experiment_scope(self.run_id, agent_id)
+        from agent.experiment_records import digest, request_snapshot
+        members = [{"ordinal": r["ordinal"], "path": r["path"]} for r in
+                   (json.loads(line) for line in requests_path.read_text().splitlines())]
+        await self._persist_experiment(agent_id, {
+            "tool": "path_dictionary_manifest", "target": url, "batch_digest": digest(interaction_id),
+            **live.experiment_scope,
+            "input_digest": digest({"members": members, "options": options.to_plan()}),
+            "requested_input": {"members": members, "expanded_dictionary_sha256": digest(members),
+                "expansion": {k: v for k, v in options.to_plan().items() if k in
+                    {"profile", "extensions", "force_extensions", "max_candidates", "recursion_depth", "exclude_paths"}},
+                "request": request_snapshot(options.to_plan())},
+            "executed_input": {"availability": "not_yet_executed"},
+            "output": {"estimated_requests": request_count, "calibration_budget": estimated_requests - request_count, "completed_requests": 0},
+        })
+        self._plan_cache[(agent_id, interaction_id)] = []
+        self._live[interaction_id] = live
         try:
             work_id = self._work_id(interaction_id, "execution", 1)
             await self.service.create_http_interaction_with_work(
@@ -760,11 +797,10 @@ class HttpProbeManager:
                 estimated_analysis_work=0,
             )
         except Exception:
+            self._drop_interaction_caches(agent_id, interaction_id)
+            self._live.pop(interaction_id, None)
             shutil.rmtree(interaction_dir, ignore_errors=True)
             raise
-        live = LiveInteraction(interaction_id, agent_id, [])
-        self._plan_cache[(agent_id, interaction_id)] = []
-        self._live[interaction_id] = live
         await self._wait(live.execution_done, wait_seconds)
         return await self._result_page(
             agent_id, interaction_id, cursor=0, limit=result_limit
@@ -1273,6 +1309,8 @@ class HttpProbeManager:
             ),
             resource_status="stopped",
         )
+        if live is not None:
+            await self._persist_batch_terminal(live)
         return await self._result_page(agent_id, interaction_id, cursor=0, limit=1)
 
     async def cleanup(self, agent_id: str, *, interaction_id: str) -> dict[str, Any]:
@@ -1432,6 +1470,8 @@ class HttpProbeManager:
                 ),
                 resource_status="interrupted",
             )
+            if live is not None:
+                await self._persist_batch_terminal(live)
         self._live.clear()
         await asyncio.gather(
             self.engine.aclose(),
@@ -1599,8 +1639,6 @@ class HttpProbeManager:
                 completed_requests=completed,
                 response_bytes=response_bytes,
             )
-            live.execution_done.set()
-            live.changed.set()
         except asyncio.CancelledError:
             await self.service.update_http_interaction(
                 self.run_id,
@@ -1610,8 +1648,6 @@ class HttpProbeManager:
                 completed_requests=completed,
                 response_bytes=response_bytes,
             )
-            live.execution_done.set()
-            live.changed.set()
             raise
         except Exception as exc:
             await self.service.update_resource_work(
@@ -1630,9 +1666,23 @@ class HttpProbeManager:
                 completed_requests=completed,
                 response_bytes=response_bytes,
             )
-            live.execution_done.set()
             live.analysis_done.set()
+
+        finally:
+            await self._persist_batch_terminal(live)
+            live.execution_done.set()
             live.changed.set()
+
+    async def _persist_batch_terminal(self, live: LiveInteraction) -> None:
+        from agent.experiment_records import digest
+        row = await self._owned(live.agent_id, live.interaction_id)
+        if row["status"] not in TERMINAL:
+            return
+        await self._persist_experiment(live.agent_id, {
+            "tool": "http_batch_terminal", "batch_digest": digest(live.interaction_id),
+            **live.experiment_scope,
+            "output": {k: row.get(k) for k in ("status", "estimated_requests", "started_requests", "completed_requests")},
+        })
 
     async def _run_path_execution(self, live: LiveInteraction, work_id: str) -> None:
         row = await self._owned(live.agent_id, live.interaction_id)
@@ -1707,6 +1757,7 @@ class HttpProbeManager:
                 body_dir=body_dir,
                 session_cookies=session.get("cookies", []),
                 on_match=on_match,
+                on_response=lambda record: self._append(live, record),
                 on_progress=on_progress,
                 on_estimate=on_estimate,
                 stop_requested=lambda: live.stop_requested,
@@ -1721,6 +1772,7 @@ class HttpProbeManager:
                 completed_requests=completed,
                 response_bytes=body_bytes,
             )
+            await self._persist_batch_terminal(live)
             live.execution_done.set()
             live.changed.set()
             raise
@@ -1741,6 +1793,7 @@ class HttpProbeManager:
                 completed_requests=completed,
                 response_bytes=body_bytes,
             )
+            await self._persist_batch_terminal(live)
             live.execution_done.set()
             live.analysis_done.set()
             live.changed.set()
@@ -1820,6 +1873,7 @@ class HttpProbeManager:
                 response_bytes=result.body_bytes,
             )
         finally:
+            await self._persist_batch_terminal(live)
             live.execution_done.set()
             live.analysis_done.set()
             live.changed.set()
@@ -2559,7 +2613,56 @@ class HttpProbeManager:
                 output.write(encoded)
                 output.flush()
                 os.fsync(output.fileno())
+        if record.get("type") == "experiment_expansion":
+            from agent.experiment_records import digest
+            await self._persist_experiment(live.agent_id, {"tool": "path_dictionary_expansion",
+                **live.experiment_scope, "batch_digest": digest(live.interaction_id),
+                "input_digest": digest(record["members"]),
+                "requested_input": {"members": record["members"], "prefix": record["prefix"]},
+                "executed_input": {"availability": "not_yet_executed"},
+                "output": {"estimated_requests": record["estimated_requests"]}})
+        if record.get("type") in {"response", "experiment_response"} and not (record.get("type") == "response" and record.get("profile")):
+            from agent.experiment_records import digest, observation, request_snapshot, safe_url
+            request = next((r for r in live.requests if r.request_id == record.get("request_id")), None)
+            spec = request.spec.model_dump(mode="json") if request else record.get("requested_input", {})
+            executed = record.get("executed_request") or {"availability": "unknown"}
+            output = observation(record)
+            output["raw_response_retained"] = bool(record.get("body_file"))
+            body = None
+            if record.get("body_file"):
+                path = self._response_dir(live.agent_id, live.interaction_id) / record["body_file"]
+                if path.exists():
+                    with path.open("rb") as stream:
+                        captured = stream.read(65_536)
+                    body = {"text": captured.decode("utf-8", errors="replace"),
+                            "saved_bytes": len(captured), "total_bytes": path.stat().st_size,
+                            "complete": len(captured) == path.stat().st_size and record.get("body_complete", False)}
+                    output["durable_body_complete"] = body["complete"]
+            elif "body_preview" in record:
+                body = {"text": record["body_preview"], "complete": False, "coverage": "preview_only"}
+            await self._persist_experiment(live.agent_id, {
+                "tool": "http_request", "target": safe_url(record.get("initial_url") or spec.get("url") or record.get("final_url", "")),
+                "tool_version": record.get("tool_version", f"httpx/{httpx.__version__}"),
+                **live.experiment_scope,
+                "ordinal": record.get("ordinal"), "batch_digest": digest(live.interaction_id),
+                "phase": record.get("phase", "candidate"),
+                "execution_key": digest([live.agent_id, live.interaction_id, record["request_id"]]) if record.get("request_id") else None,
+                "requested_input": request_snapshot(spec), "executed_input": executed,
+                "input_digest": executed.get("input_digest") or digest(spec or {"path": record.get("path"), "batch": live.interaction_id}),
+                "output": output,
+                "response_body": body,
+                "retention": {"original_resource_is_ephemeral": True,
+                    "durable_body_complete": bool(body and body.get("complete")),
+                    "missing_body": not bool(body), "text_encoding": "utf-8 with replacement; shared text is redacted"},
+            })
         live.changed.set()
+
+    async def _persist_experiment(self, agent_id: str, record: dict[str, Any]) -> None:
+        try:
+            await asyncio.wait_for(self.service.record_experiment(self.run_id, agent_id, record), timeout=5)
+        except Exception as exc:
+            await self.service.append_agent_event(self.run_id, agent_id, "experiment_persistence_failed",
+                {"tool": record["tool"], "error": type(exc).__name__, "input_digest": record.get("input_digest")})
 
     async def _record_unfinished_requests(
         self, live: LiveInteraction, *, outcome: str

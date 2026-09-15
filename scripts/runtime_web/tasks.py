@@ -31,6 +31,7 @@ def task_summaries(connection, run_id):
                 'resource_limits': meta.get('resource_limits', {}),
                 'termination_reason': finishes.get(task_id, {}).get('termination_reason') if kind == 'shell' else None,
                 'resource_usage': finishes.get(task_id, {}).get('resource_usage', {}) if kind == 'shell' else {},
+                'http_summary': finishes.get(task_id, {}).get('http_summary') if kind == 'shell' else None,
                 'started_at': row.get('started_at') or row.get('created_at'),
                 'finished_at': row.get('execution_finished_at', row.get('finished_at')),
                 'analysis_finished_at': row.get('analysis_finished_at'),

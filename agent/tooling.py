@@ -545,10 +545,21 @@ class ToolExecutor:
             item.claims = tuple(spec.access_claims(item.arguments))
         except ValidationError as exc:
             fields = validation_details(exc)
+            reference_error = None
+            if name in {"evidence_read", "report_read"}:
+                from agent.state.references import parse_reference
+                from agent.state.errors import StateError
+                kind = name.removesuffix("_read")
+                ref = value.get(f"{kind}_ref")
+                if isinstance(ref, str):
+                    try:
+                        parse_reference(ref, expected=kind)
+                    except StateError as error:
+                        reference_error = error
             item.result = self._argument_error(
                 name,
                 "schema",
-                "invalid_arguments",
+                reference_error.code if reference_error else "invalid_arguments",
                 "Tool arguments failed schema validation",
                 retry_allowed=True,
                 retry_action="rewrite_arguments",
